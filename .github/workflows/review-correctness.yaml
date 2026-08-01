@@ -105,8 +105,8 @@ jobs:
                   for _ in $(seq 1 "$POLL_ROUNDS"); do
                       settled=true
                       for app in $expected; do
-                          runs=$(gh api --paginate --slurp "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs?per_page=100" \
-                              --jq "[.[].check_runs[] | select(.app.slug == \"$app\")]")
+                          runs=$(gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+                              --jq "[.check_runs[] | select(.app.slug == \"$app\")]" | jq -s 'add // []')
                           total=$(printf '%s' "$runs" | jq 'length')
                           done_count=$(printf '%s' "$runs" | jq '[.[] | select(.status == "completed")] | length')
                           if [ "$total" = "0" ] || [ "$done_count" != "$total" ]; then
@@ -128,11 +128,12 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   name="${ARTIFACT_PREFIX}${{ github.event.pull_request.number }}"
-                  # --slurp collects the pages into one array before the jq
-                  # filter runs; without it the filter runs per page and a
-                  # multi-page history yields several ids.
-                  artifact=$(gh api --paginate --slurp "repos/${{ github.repository }}/actions/artifacts?name=$name&per_page=100" \
-                      --jq '[.[].artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id // empty')
+                  # Pages merge through jq -s before filtering, so a
+                  # multi-page history still yields exactly one id; the
+                  # runner's gh predates --slurp.
+                  artifact=$(gh api --paginate "repos/${{ github.repository }}/actions/artifacts?name=$name&per_page=100" \
+                      --jq '[.artifacts[] | select(.expired == false)]' \
+                      | jq -s -r 'add // [] | sort_by(.created_at) | last | .id // empty')
                   prev_sha=""
                   if [ -n "$artifact" ]; then
                       gh api "repos/${{ github.repository }}/actions/artifacts/$artifact/zip" > prev-verdict.zip \
@@ -161,10 +162,12 @@ jobs:
               run: |
                   mkdir -p .lane
                   lanes=$LANE_BOTS
-                  gh api --paginate --slurp "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                      --jq "[add // [] | .[] | select(.user.login as \$login | $lanes | index(\$login))]" > .lane/inline-comments.json
-                  gh api --paginate --slurp "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                      --jq "[add // [] | .[] | select(.user.login as \$login | $lanes | index(\$login))]" > .lane/issue-comments.json
+                  gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments?per_page=100" \
+                      --jq "[.[] | select(.user.login as \$login | $lanes | index(\$login))]" \
+                      | jq -s 'add // []' > .lane/inline-comments.json
+                  gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
+                      --jq "[.[] | select(.user.login as \$login | $lanes | index(\$login))]" \
+                      | jq -s 'add // []' > .lane/issue-comments.json
                   echo "inline: $(jq 'length' .lane/inline-comments.json), issue: $(jq 'length' .lane/issue-comments.json)"
 
             - id: runeseer

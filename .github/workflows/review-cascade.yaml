@@ -116,10 +116,12 @@ jobs:
                   # comes. A run that already completed clean on this head
                   # before the summon counts: per-head review is idempotent
                   # and re-review would only respend.
+                  # Per-page jq output merged with jq -s: the runner's gh
+                  # predates --slurp.
                   settled() {
-                      runs=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
-                          --jq "[.[].check_runs[] | select(.app.slug == \"$1\")]
-                              | group_by(.name) | map(sort_by(.started_at) | last)")
+                      runs=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+                          --jq "[.check_runs[] | select(.app.slug == \"$1\")]" \
+                          | jq -s "add // [] | group_by(.name) | map(sort_by(.started_at) | last)")
                       total=$(jq 'length' <<<"$runs")
                       clean_count=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $c | ["success", "neutral"] | index($c))] | length' <<<"$runs")
                       [ "$total" != "0" ] && [ "$clean_count" = "$total" ]
