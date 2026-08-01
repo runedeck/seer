@@ -1,30 +1,28 @@
 # seer
 
-The org's review and observation center. Every review lane the runedeck
-ceremony runs — the adjudicating correctness lane, the label cascade that
-walks the funnel, the autofix pair, the first-contribution greeting, the
-issue triage — lives here once, as a reusable workflow, and every
-repository carries only a thin caller pinned at `runedeck/seer@main`.
-The org-wide veto monitor runs here natively and keeps the "Awaiting
-owner review" queue issue.
+> The org's review and observation center. Lane logic lives here once; every repository carries thin callers.
 
-The funnel: a pull request passes cursor, then macroscope, then
-runeseer, each stage summoned only after the previous settles clean, and
-only clean-verdict work reaches the owner. The canonical specification
-lives in the skeleton's `docs/specs/review-ceremony/`; this repository
-is the machinery, not the canon.
+## Lanes
+
+| Workflow | Summoned by | What it does |
+|----------|-------------|--------------|
+| `review-cascade` | bare `review` label | Walks the funnel: posts `bugbot run`, waits for cursor to settle clean, applies `review:macroscope`, waits, applies `review:runeseer`. Stops visibly on findings, a moved head, or a fork after the free lanes. |
+| `review-correctness` | `review:runeseer` label | The adjudicating lane: judges the free lanes' findings, reviews the diff, records a machine-readable verdict, and submits the earned approval on an explicit clean verdict for the live head. Consumes the review labels when its round ends. |
+| `autofix-suggest` | `review:autofix` label | Untrusted half: runs the fixers against the head with no secrets and uploads a patch artifact. |
+| `autofix-comment` | completion of `autofix-suggest` | Trusted half: binds the artifact to the run that built it and posts the patch as a suggestion under runewright. |
+| `congrats` | push to `main` | Greets a contributor's first merged pull request. |
+| `issue-dedup` | issue opened | Flags probable duplicates, referencing only gathered candidates. |
+| `thread-resolver` | push to a pull request | Resolves review threads named by `Resolves-Thread:` trailers, bound to the same pull request. |
+| `veto-monitor` | schedule, runs here | Sweeps the org for pull requests that cleared every lane and wait only on the owner; keeps the "Awaiting owner review" issue current. |
 
 ## Caller contract
 
-Callers own the triggers, the concurrency, and the permissions; bodies
-own the logic and declare the secrets they need explicitly. First-party
-`runedeck/*` references ride `@main` by design — the trust boundary is
-push access to this repository, and its history answers for every lane.
+Callers own the triggers, the concurrency, and the permissions; bodies own the logic and declare the secrets they need explicitly. A repository subscribes to events only through its own workflow files, so each repo carries a stub per lane that delegates with `uses: runedeck/seer/.github/workflows/<lane>.yaml@main`. First-party references ride `@main`: the trust boundary is push access to this repository, and its history answers for every lane.
 
 ## Identities
 
-`runewright` acts (labels, comments, patches, greetings; contents and
-workflows write). `runeseer` reviews (contents read-only; its APPROVE is
-the earned approval). The split is the review-integrity boundary: the
-identity that can write content holds no approval role, and the identity
-that approves cannot write content.
+runewright acts: labels, comments, patches, greetings, with contents and workflows write. runeseer reviews: contents read only, and its APPROVE is the earned approval. The identity that can write content holds no approval role, and the identity that approves cannot write content.
+
+## Canon
+
+The ceremony specification lives in [skeleton](https://github.com/runedeck/skeleton) under `docs/specs/review-ceremony/`, and the lane dashboard configuration in its `docs/guides/review-lanes-configuration.md`. This repository is the machinery, not the canon.
