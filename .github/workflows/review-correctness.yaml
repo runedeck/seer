@@ -7,11 +7,11 @@ on:
     workflow_call:
         secrets:
             RUNESEER_APP_ID:
-                required: true
+                required: false
             RUNESEER_APP_KEY:
-                required: true
+                required: false
             CLAUDE_CODE_OAUTH_TOKEN:
-                required: true
+                required: false
 
 # Single declaration point for the identities, labels, and names this
 # body uses. Job-level if expressions cannot read env, so the guard

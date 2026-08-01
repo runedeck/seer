@@ -9,9 +9,9 @@ on:
     workflow_call:
         secrets:
             RUNEWRIGHT_APP_ID:
-                required: true
+                required: false
             RUNEWRIGHT_APP_KEY:
-                required: true
+                required: false
 
 env:
     OWNER: N4M3Z
