@@ -13,6 +13,10 @@ on:
             RUNEWRIGHT_APP_KEY:
                 required: true
 
+env:
+    OWNER: N4M3Z
+    GREETING: "Your first merged contribution here — welcome, @AUTHOR_LOGIN, and thank you. Every rune in this deck was reviewed the same way yours just was; may it be the first of many."
+
 jobs:
     congrats:
         name: congrats
@@ -35,7 +39,7 @@ jobs:
                   IFS=$'\t' read -r author author_type number \
                       < <(jq -r '[.user.login, .user.type, .number] | @tsv' <<<"$pr")
                   [ "$author_type" = "Bot" ] && { echo "bot author, no greeting"; exit 0; }
-                  [ "$author" = "N4M3Z" ] && { echo "owner, no greeting"; exit 0; }
+                  [ "$author" = "$OWNER" ] && { echo "owner, no greeting"; exit 0; }
                   merged=$(gh api --paginate "repos/$REPO/pulls?state=closed&per_page=100" \
                       --jq "[.[] | select(.user.login == \"$author\" and .merged_at != null)] | length" \
                       | awk '{ total += $1 } END { print total + 0 }')
@@ -66,5 +70,5 @@ jobs:
                   NUMBER: ${{ steps.first.outputs.number }}
               run: |
                   gh api -X POST "repos/${{ github.repository }}/issues/${NUMBER}/comments" \
-                      -f body="Your first merged contribution here — welcome, @${AUTHOR}, and thank you. Every rune in this deck was reviewed the same way yours just was; may it be the first of many." >/dev/null
+                      -f body="${GREETING/AUTHOR_LOGIN/$AUTHOR}" >/dev/null
                   echo "greeted ${AUTHOR} on #${NUMBER}"

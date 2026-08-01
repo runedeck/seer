@@ -20,6 +20,23 @@ on:
             RUNEWRIGHT_APP_KEY:
                 required: true
 
+# Single declaration point for every identity, label, and tunable this
+# body uses. Job-level if expressions cannot read env, so the entry
+# label stays literal in the guard below.
+env:
+    LABEL_ENTRY: review
+    LABEL_MACROSCOPE: "review:macroscope"
+    LABEL_RUNESEER: "review:runeseer"
+    LABEL_COLOR: "5319e7"
+    LABEL_DESCRIPTION: Summons this review lane
+    APP_CURSOR: cursor
+    APP_MACROSCOPE: macroscopeapp
+    BOT_CURSOR: cursor
+    BOT_MACROSCOPE: macroscopeapp
+    SUMMON_COMMENT: bugbot run
+    POLL_SECONDS: 20
+    POLL_ROUNDS: 60
+
 jobs:
     walk:
         name: walk
@@ -48,7 +65,7 @@ jobs:
               run: |
                   consume_entry_label() {
                       GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
-                          "repos/$REPO/issues/$PR/labels/review" >/dev/null 2>&1 || true
+                          "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" >/dev/null 2>&1 || true
                   }
 
                   fail_walk() {
@@ -61,7 +78,7 @@ jobs:
 
                   head_still() {
                       live=$(GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
-                      [ "$live" = "$HEAD_SHA" ] || fail_walk "the head moved from $HEAD_SHA to $live mid-walk; re-apply review on the new head."
+                      [ "$live" = "$HEAD_SHA" ] || fail_walk "the head moved from $HEAD_SHA to $live mid-walk; re-apply $LABEL_ENTRY on the new head."
                   }
 
                   # Reads ride the caller token: runewright's app permissions
@@ -110,24 +127,24 @@ jobs:
 
                   wait_clean() {
                       app=$1; bot=$2; stage=$3
-                      for _ in $(seq 1 60); do
+                      for _ in $(seq 1 "$POLL_ROUNDS"); do
                           if settled "$app"; then
                               head_still
                               open=$(unresolved_by "$bot")
                               [ "$open" = "0" ] && { echo "$stage settled clean"; return 0; }
                               fail_walk "$stage holds $open unresolved findings; the funnel stops here."
                           fi
-                          sleep 20
+                          sleep "$POLL_SECONDS"
                       done
-                      fail_walk "$stage did not settle within 20m; the funnel stops here."
+                      fail_walk "$stage did not settle within the poll budget; the funnel stops here."
                   }
 
                   ensure_label() {
                       encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
                       gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1 \
                           || gh api -X POST "repos/$REPO/labels" \
-                              -f name="$1" -f color="5319e7" \
-                              -f description="Summons this review lane" >/dev/null
+                              -f name="$1" -f color="$LABEL_COLOR" \
+                              -f description="$LABEL_DESCRIPTION" >/dev/null
                       gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
                   }
 
@@ -136,17 +153,17 @@ jobs:
                   # settled on is not re-summoned: per-head review is
                   # idempotent and the comment would only respend.
                   echo "stage 1: cursor"
-                  if settled cursor; then
+                  if settled "$APP_CURSOR"; then
                       echo "cursor already settled on this head; skipping the summon."
                   else
-                      gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="bugbot run" >/dev/null
+                      gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" >/dev/null
                   fi
-                  wait_clean cursor "cursor" "cursor"
+                  wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor"
 
                   echo "stage 2: macroscope"
                   head_still
-                  ensure_label "review:macroscope"
-                  wait_clean macroscopeapp "macroscopeapp" "macroscope"
+                  ensure_label "$LABEL_MACROSCOPE"
+                  wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope"
 
                   # The paid lane cannot run on fork pull requests (its
                   # secrets are stripped there), so their funnel ends clean at
@@ -159,5 +176,5 @@ jobs:
 
                   echo "stage 3: runeseer"
                   head_still
-                  ensure_label "review:runeseer"
+                  ensure_label "$LABEL_RUNESEER"
                   echo "runeseer summoned; its clean verdict earns the approval, and only then does the pull request reach the owner."

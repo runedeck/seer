@@ -13,6 +13,20 @@ on:
             CLAUDE_CODE_OAUTH_TOKEN:
                 required: true
 
+# Single declaration point for the identities, labels, and names this
+# body uses. Job-level if expressions cannot read env, so the guard
+# keeps its literals; the reviewer prompt stays inline until the shared
+# definitions file on the roadmap carries it.
+env:
+    LANE_BOTS: '["macroscopeapp[bot]", "cursor[bot]"]'
+    APPS_EXPECTED: cursor
+    APPS_EXPECTED_SUMMONED: cursor macroscopeapp
+    LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
+    ARTIFACT_PREFIX: runeseer-verdict-pr
+    INSTRUCTION_PATTERN: '(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)'
+    POLL_SECONDS: 20
+    POLL_ROUNDS: 15
+
 jobs:
     correctness:
         name: correctness
@@ -47,7 +61,7 @@ jobs:
               env:
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
               run: |
-                  pattern='(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)'
+                  pattern=$INSTRUCTION_PATTERN
                   git ls-files -z | tr '\0' '\n' | grep -E "$pattern" | while IFS= read -r file; do
                       rm -f "$file"
                   done
@@ -86,9 +100,9 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   MACROSCOPE_SUMMONED: ${{ contains(github.event.pull_request.labels.*.name, 'review:macroscope') }}
               run: |
-                  expected="cursor"
-                  [ "$MACROSCOPE_SUMMONED" = "true" ] && expected="cursor macroscopeapp"
-                  for _ in $(seq 1 15); do
+                  expected="$APPS_EXPECTED"
+                  [ "$MACROSCOPE_SUMMONED" = "true" ] && expected="$APPS_EXPECTED_SUMMONED"
+                  for _ in $(seq 1 "$POLL_ROUNDS"); do
                       settled=true
                       for app in $expected; do
                           runs=$(gh api --paginate --slurp "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs?per_page=100" \
@@ -100,9 +114,9 @@ jobs:
                           fi
                       done
                       [ "$settled" = "true" ] && { echo "other lanes settled"; exit 0; }
-                      sleep 20
+                      sleep "$POLL_SECONDS"
                   done
-                  echo "other lanes absent or still running after 5m; reviewing anyway"
+                  echo "other lanes absent or still running past the poll budget; reviewing anyway"
 
             # Cross-round ledger: the previous round's verdict artifact, when
             # one exists, tells the adjudicator what was already reported and
@@ -113,7 +127,7 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  name="runeseer-verdict-pr${{ github.event.pull_request.number }}"
+                  name="${ARTIFACT_PREFIX}${{ github.event.pull_request.number }}"
                   # --slurp collects the pages into one array before the jq
                   # filter runs; without it the filter runs per page and a
                   # multi-page history yields several ids.
@@ -146,7 +160,7 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   mkdir -p .lane
-                  lanes='["macroscopeapp[bot]", "cursor[bot]"]'
+                  lanes=$LANE_BOTS
                   gh api --paginate --slurp "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments?per_page=100" \
                       --jq "[add // [] | .[] | select(.user.login as \$login | $lanes | index(\$login))]" > .lane/inline-comments.json
                   gh api --paginate --slurp "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
@@ -250,7 +264,7 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  for label in "review" "review%3Amacroscope" "review%3Aruneseer"; do
+                  for label in $LABELS_CONSUMED; do
                       gh api -X DELETE \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$label" \
                           >/dev/null 2>&1 || true
