@@ -1,0 +1,28 @@
+name: Veto Monitor
+
+on:
+    schedule:
+        - cron: "30 6,16 * * *"
+    workflow_dispatch: {}
+
+permissions:
+    contents: read
+
+jobs:
+    monitor:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+            - id: runewright
+              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+              with:
+                  app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
+                  private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
+                  owner: runedeck
+
+            - name: Sweep for pull requests awaiting the owner
+              env:
+                  GH_TOKEN: ${{ steps.runewright.outputs.token }}
+              run: bash .github/scripts/veto-monitor.sh

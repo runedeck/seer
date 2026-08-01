@@ -1,0 +1,91 @@
+name: Autofix Comment
+
+# Reusable body of the trusted autofix half: runs in the base context,
+# downloads the patch the untrusted half produced, and posts it as a
+# suggestion under runewright. It never checks out or executes pull
+# request code — the artifact is data, fenced past its longest backtick
+# run, and the pull request number is bound to the run that built it.
+on:
+    workflow_call:
+        secrets:
+            RUNEWRIGHT_APP_ID:
+                required: true
+            RUNEWRIGHT_APP_KEY:
+                required: true
+
+jobs:
+    # Only pull_request-triggered suggest runs get a trusted comment: for
+    # those, workflow_run.head_sha is the pull request head and binds the
+    # artifact's claimed number to the branch the run actually built. A
+    # dispatched run's head_sha is the dispatched branch tip, which can
+    # never bind — the artifact itself is untrusted, so an unbindable run
+    # posts nothing and the dispatcher pulls the artifact directly.
+    comment:
+        name: comment
+        if: >
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.event == 'pull_request'
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: Download the patch artifact
+              id: patch
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RUN_ID: ${{ github.event.workflow_run.id }}
+              run: |
+                  artifact=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
+                      --jq '.artifacts[] | select(.name == "autofix-patch") | .id' | head -1)
+                  if [ -z "$artifact" ]; then
+                      echo "present=false" >> "$GITHUB_OUTPUT"
+                      echo "no patch artifact: the fixers changed nothing."
+                      exit 0
+                  fi
+                  gh api "repos/${{ github.repository }}/actions/artifacts/$artifact/zip" > autofix.zip
+                  unzip -o autofix.zip autofix.patch pr-number.txt >/dev/null
+                  pr=$(head -1 pr-number.txt | tr -cd '0-9')
+                  [ -n "$pr" ] || { echo "artifact carries no valid pull request number"; exit 1; }
+                  # The artifact is the untrusted suggest run's output: the
+                  # number it names must be the pull request that run actually
+                  # built, or a fork could aim runewright's comment anywhere.
+                  head_sha=$(gh api "repos/${{ github.repository }}/pulls/$pr" --jq '.head.sha' 2>/dev/null || true)
+                  if [ "$head_sha" != "${{ github.event.workflow_run.head_sha }}" ]; then
+                      echo "pull request $pr does not match the run's head commit; refusing to comment."
+                      exit 1
+                  fi
+                  echo "present=true" >> "$GITHUB_OUTPUT"
+                  echo "pr=$pr" >> "$GITHUB_OUTPUT"
+
+            - id: runewright
+              if: steps.patch.outputs.present == 'true'
+              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+              with:
+                  app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
+                  private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
+
+            # The patch is a suggestion for the author to apply and commit
+            # under their own identity; nothing here commits.
+            - name: Comment the suggestion
+              if: steps.patch.outputs.present == 'true'
+              env:
+                  GH_TOKEN: ${{ steps.runewright.outputs.token }}
+                  PR: ${{ steps.patch.outputs.pr }}
+              run: |
+                  lines=$(wc -l < autofix.patch)
+                  if [ "$lines" -le 120 ]; then
+                      # The fence outruns the longest backtick run inside the
+                      # patch, so patch content cannot escape the diff block
+                      # and inject markdown into runewright's comment.
+                      longest=$(grep -o '`\{1,\}' autofix.patch | awk '{ if (length > m) m = length } END { print m + 0 }')
+                      width=$(( longest >= 3 ? longest + 1 : 3 ))
+                      fence=$(printf '%*s' "$width" '' | tr ' ' '`')
+                      {
+                          printf 'Mechanical fixes available; apply with `git apply autofix.patch` and commit as yourself:\n\n%sdiff\n' "$fence"
+                          cat autofix.patch
+                          printf '%s\n' "$fence"
+                      } > comment.md
+                  else
+                      printf 'Mechanical fixes available (%s lines); download the autofix-patch artifact from https://github.com/%s/actions/runs/%s and apply with `git apply autofix.patch`, committing as yourself.\n' \
+                          "$lines" "${{ github.repository }}" "${{ github.event.workflow_run.id }}" > comment.md
+                  fi
+                  gh api -X POST "repos/${{ github.repository }}/issues/${PR}/comments" -F body=@comment.md >/dev/null

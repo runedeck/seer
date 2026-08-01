@@ -1,0 +1,37 @@
+name: Congrats
+
+# Reusable body of the first-contribution greeting. The explicit seer
+# checkout is what single-sources the script: a reusable workflow runs in
+# the caller's repository, where it does not exist.
+on:
+    workflow_call:
+        secrets:
+            RUNEWRIGHT_APP_ID:
+                required: true
+            RUNEWRIGHT_APP_KEY:
+                required: true
+
+jobs:
+    congrats:
+        name: congrats
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  repository: runedeck/seer
+                  ref: main
+
+            - id: runewright
+              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+              with:
+                  app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
+                  private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
+                  owner: runedeck
+
+            - name: Greet a first merged contribution
+              env:
+                  GH_TOKEN: ${{ steps.runewright.outputs.token }}
+                  REPO: ${{ github.repository }}
+                  MERGE_SHA: ${{ github.sha }}
+              run: bash .github/scripts/congrats.sh

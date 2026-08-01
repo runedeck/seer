@@ -1,0 +1,48 @@
+name: Autofix Suggest
+
+# Reusable body of the untrusted autofix half: it checks out and executes
+# pull request code (prek fixers), so callers trigger it on pull_request
+# and it receives no secrets — on fork pull requests GitHub strips them
+# anyway. Its only output is the patch artifact; the trusted half posts.
+on:
+    workflow_call:
+        inputs:
+            pr_number:
+                description: pull request number for dispatched runs
+                required: false
+                type: string
+
+jobs:
+    suggest:
+        name: suggest
+        if: github.event_name != 'pull_request' || github.event.label.name == 'review:autofix'
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr_number) }}
+
+            - name: Run fixers
+              env:
+                  PR: ${{ github.event.pull_request.number || inputs.pr_number }}
+              run: |
+                  pipx install prek 2>/dev/null || pip install prek
+                  prek run --all-files || true
+                  if git diff --quiet; then
+                      echo "changed=false" >> "$GITHUB_ENV"
+                  else
+                      git diff > autofix.patch
+                      printf '%s\n' "$PR" > pr-number.txt
+                      echo "changed=true" >> "$GITHUB_ENV"
+                  fi
+
+            - name: Upload patch
+              if: env.changed == 'true'
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+              with:
+                  name: autofix-patch
+                  path: |
+                      autofix.patch
+                      pr-number.txt
+                  retention-days: 3

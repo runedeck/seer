@@ -1,0 +1,126 @@
+name: Review Cascade
+
+# Reusable body of the funnel walk: cursor first, then macroscope, then
+# runeseer, each stage summoned only after the previous settles clean on
+# an unmoved head. A stage that holds findings — or a head that moves
+# mid-walk — stops the walk and fails this check; runeseer's own verdict
+# gates the review/correctness check, not this one. Callers trigger on
+# pull_request_target labeled: the walk is API-only, checks out nothing,
+# and fork pull requests need the base-context secrets.
+#
+# Cursor has no label trigger, so stage 1 is a runewright `bugbot run`
+# comment; runewright's token also applies the stage labels, because
+# label events created by the workflow token would not trigger the lanes
+# listening for them.
+on:
+    workflow_call:
+        secrets:
+            RUNEWRIGHT_APP_ID:
+                required: true
+            RUNEWRIGHT_APP_KEY:
+                required: true
+
+jobs:
+    walk:
+        name: walk
+        if: github.event.label.name == 'review'
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - id: runewright
+              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+              with:
+                  app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
+                  private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
+
+            - name: Walk the funnel
+              env:
+                  GH_TOKEN: ${{ steps.runewright.outputs.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+              run: |
+                  fail_walk() {
+                      echo "$1"
+                      # Consuming the entry label makes re-applying it restart
+                      # the walk after fixes.
+                      gh api -X DELETE "repos/$REPO/issues/$PR/labels/review" >/dev/null 2>&1 || true
+                      exit 1
+                  }
+
+                  head_still() {
+                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+                      [ "$live" = "$HEAD_SHA" ] || fail_walk "the head moved from $HEAD_SHA to $live mid-walk; re-apply review on the new head."
+                  }
+
+                  unresolved_by() {
+                      cursor="null"
+                      open=0
+                      while :; do
+                          page=$(gh api graphql -f query='query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                              repository(owner: $owner, name: $repo) {
+                                  pullRequest(number: $number) {
+                                      reviewThreads(first: 100, after: $cursor) {
+                                          pageInfo { hasNextPage endCursor }
+                                          nodes { isResolved comments(first: 1) { nodes { author { login } } } }
+                                      }
+                                  }
+                              }
+                          }' -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" -f cursor="$cursor" \
+                              --jq '.data.repository.pullRequest.reviewThreads')
+                          open=$(( open + $(jq "[.nodes[] | select(.isResolved == false) | select(.comments.nodes[0].author.login == \"$1\")] | length" <<<"$page") ))
+                          [ "$(jq -r '.pageInfo.hasNextPage' <<<"$page")" = "true" ] || break
+                          cursor=$(jq -r '.pageInfo.endCursor' <<<"$page")
+                      done
+                      echo "$open"
+                  }
+
+                  # Settled means every run this app made on the head has
+                  # completed acceptably: a failed or cancelled review is a
+                  # broken stage, never a clean one.
+                  settled() {
+                      runs=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" \
+                          --jq "[.check_runs[] | select(.app.slug == \"$1\")]")
+                      total=$(jq 'length' <<<"$runs")
+                      done_count=$(jq '[.[] | select(.status == "completed")] | length' <<<"$runs")
+                      broken=$(jq '[.[] | select(.conclusion as $c | ["failure", "cancelled", "timed_out"] | index($c))] | length' <<<"$runs")
+                      [ "$broken" != "0" ] && fail_walk "$1 concluded $broken run(s) unsuccessfully on this head; the funnel stops here."
+                      [ "$total" != "0" ] && [ "$done_count" = "$total" ]
+                  }
+
+                  wait_clean() {
+                      app=$1; bot=$2; stage=$3
+                      for _ in $(seq 1 60); do
+                          if settled "$app"; then
+                              head_still
+                              open=$(unresolved_by "$bot")
+                              [ "$open" = "0" ] && { echo "$stage settled clean"; return 0; }
+                              fail_walk "$stage holds $open unresolved findings; the funnel stops here."
+                          fi
+                          sleep 20
+                      done
+                      fail_walk "$stage did not settle within 20m; the funnel stops here."
+                  }
+
+                  ensure_label() {
+                      encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
+                      gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1 \
+                          || gh api -X POST "repos/$REPO/labels" \
+                              -f name="$1" -f color="5319e7" \
+                              -f description="Summons this review lane" >/dev/null
+                      gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
+                  }
+
+                  echo "stage 1: cursor"
+                  gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="bugbot run" >/dev/null
+                  wait_clean cursor "cursor[bot]" "cursor"
+
+                  echo "stage 2: macroscope"
+                  head_still
+                  ensure_label "review:macroscope"
+                  wait_clean macroscopeapp "macroscopeapp[bot]" "macroscope"
+
+                  echo "stage 3: runeseer"
+                  head_still
+                  ensure_label "review:runeseer"
+                  echo "runeseer summoned; its clean verdict earns the approval, and only then does the pull request reach the owner."

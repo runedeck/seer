@@ -1,0 +1,98 @@
+name: Thread Resolver
+
+# Reusable body of trailer-driven thread resolution. Callers trigger on
+# pull_request_target synchronize — this body never checks out or
+# executes pull request code, and fork pull requests need the
+# base-context token's pull-requests write.
+on:
+    workflow_call: {}
+
+jobs:
+    resolve:
+        name: resolve
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            # Fix commits name the finding threads they answer with
+            # Resolves-Thread: trailers; resolution then carries an audit
+            # trail per finding instead of a bulk sweep at the end. A trailer
+            # may name the thread node id, a comment id, or a comment URL,
+            # and only threads on this pull request resolve: the trailer is
+            # matched against the pull request's own thread map, never passed
+            # to the API raw.
+            - name: Resolve threads named by pushed commits
+              uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+              with:
+                  script: |
+                      const pull_number = context.payload.pull_request.number;
+                      // Only the commits this push introduced carry live
+                      // trailers: rescanning the whole branch would re-resolve
+                      // threads a reviewer deliberately reopened. The compare
+                      // is paginated; it can fail for fork histories, where
+                      // the full scan is the honest fallback.
+                      let commits;
+                      try {
+                          commits = await github.paginate(github.rest.repos.compareCommitsWithBasehead, {
+                              ...context.repo,
+                              basehead: `${context.payload.before}...${context.payload.after}`,
+                              per_page: 100,
+                          }, response => response.data.commits);
+                      } catch (e) {
+                          core.warning(`push range unavailable (${e.message}); scanning every commit`);
+                          commits = await github.paginate(github.rest.pulls.listCommits,
+                              { ...context.repo, pull_number, per_page: 100 });
+                      }
+                      const references = new Set();
+                      for (const c of commits) {
+                          for (const m of c.commit.message.matchAll(/^Resolves-Thread:\s*(\S+)$/gm)) {
+                              references.add(m[1]);
+                          }
+                      }
+                      if (references.size === 0) return;
+                      const threads = [];
+                      let cursor = null;
+                      do {
+                          const page = await github.graphql(
+                              `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                                  repository(owner: $owner, name: $repo) {
+                                      pullRequest(number: $number) {
+                                          reviewThreads(first: 100, after: $cursor) {
+                                              pageInfo { hasNextPage endCursor }
+                                              nodes {
+                                                  id
+                                                  isResolved
+                                                  comments(first: 50) { nodes { databaseId url } }
+                                              }
+                                          }
+                                      }
+                                  }
+                              }`,
+                              { owner: context.repo.owner, repo: context.repo.repo, number: pull_number, cursor });
+                          const connection = page.repository.pullRequest.reviewThreads;
+                          threads.push(...connection.nodes);
+                          cursor = connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null;
+                      } while (cursor);
+                      const threadsByReference = new Map();
+                      for (const thread of threads) {
+                          threadsByReference.set(thread.id, thread);
+                          for (const comment of thread.comments.nodes) {
+                              threadsByReference.set(String(comment.databaseId), thread);
+                              threadsByReference.set(comment.url, thread);
+                          }
+                      }
+                      for (const reference of references) {
+                          const thread = threadsByReference.get(reference);
+                          if (!thread) {
+                              core.warning(`no thread on this pull request matches ${reference}`);
+                              continue;
+                          }
+                          if (thread.isResolved) continue;
+                          try {
+                              await github.graphql(
+                                  `mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }`,
+                                  { id: thread.id });
+                              core.info(`resolved ${thread.id} (${reference})`);
+                          } catch (e) {
+                              core.warning(`could not resolve ${reference}: ${e.message}`);
+                          }
+                      }
