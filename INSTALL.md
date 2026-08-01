@@ -11,7 +11,7 @@ DONE WHEN: applying the bare `review` label on a ready pull request in a caller 
 TODO:
 
 - [ ] Org secrets exist with All-repositories visibility: `RUNESEER_APP_ID`, `RUNESEER_APP_KEY`, `RUNEWRIGHT_APP_ID`, `RUNEWRIGHT_APP_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`
-- [ ] Both apps are installed on the org: runeseer (contents read, pull requests and issues write), runewright (contents and workflows write, pull requests and issues write)
+- [ ] Both apps are installed on the org: runeseer (contents read AND write, pull requests and issues write), runewright (contents and workflows write, pull requests and issues write)
 - [ ] External reviewers configured per the skeleton's `docs/guides/review-lanes-configuration.md`: cursor mention-only with incremental review, macroscope label-only with drafts and auto-merge off
 - [ ] The target repository carries the caller stubs (scaffolded from the skeleton's `templates/base`)
 - [ ] Ceremony labels exist in the target repository (the first pr-lint run provisions them)
@@ -27,5 +27,18 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN --org runedeck --visibility all --body "<t
 ```
 
 Dashboard state cannot be scripted; follow the guide named above and verify with its procedure: a draft pull request pushed twice summons nothing, and one `review` label runs the funnel in order.
+
+## Requirements and permissions
+
+- Required approvals count only write-access reviewers: an app holding `contents: read` submits APPROVED reviews that satisfy no ruleset. runeseer therefore carries `contents: read and write`, and the write/approve separation is enforced by its workflow's tool allowlist rather than by the permission bit.
+- App permission changes take two acceptances: editing the registration (`organizations/<org>/settings/apps/<app>/permissions`) does nothing until the installation accepts the new scope (`organizations/<org>/settings/installations/<id>`). The installations API shows what is actually live.
+- Nothing is retroactive: reviews and tokens carry the scope in force when they were minted. After a permission change, mint a fresh approval with a new round.
+
+## Operating constraints
+
+- `claude-code-action` refuses `track_progress` on labeled events, and labels are the standard summon: the flag is gated with `github.event.action != 'labeled'` so progress tracking runs everywhere the action supports it.
+- The hosted runner's `gh` predates `--slurp`: paginate with per-page `--jq` arrays merged through `jq -s 'add'`.
+- Round end consumes the review labels, and a failed round consumes them too. To re-summon: convert the pull request to draft, apply the label (the draft guard skips the run, so the label survives), then mark ready, which fires the review under an action every input accepts.
+- Never push after a clean verdict: stale-review dismissal removes the earned approval on any push, so documentation follow-ups ride the next pull request.
 
 EXECUTE NOW: work the TODO list top to bottom, then run the DONE WHEN check on a scratch pull request.
