@@ -16,9 +16,9 @@ on:
     workflow_call:
         secrets:
             RUNEWRIGHT_APP_ID:
-                required: false
+                required: true
             RUNEWRIGHT_APP_KEY:
-                required: false
+                required: true
 
 # Single declaration point for every identity, label, and tunable this
 # body uses. Job-level if expressions cannot read env, so the entry

@@ -9,9 +9,9 @@ on:
     workflow_call:
         secrets:
             RUNEWRIGHT_APP_ID:
-                required: false
+                required: true
             RUNEWRIGHT_APP_KEY:
-                required: false
+                required: true
 
 env:
     ARTIFACT_NAME: autofix-patch

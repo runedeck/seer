@@ -7,11 +7,11 @@ on:
     workflow_call:
         secrets:
             RUNESEER_APP_ID:
-                required: false
+                required: true
             RUNESEER_APP_KEY:
-                required: false
+                required: true
             CLAUDE_CODE_OAUTH_TOKEN:
-                required: false
+                required: true
 
 # Single declaration point for the identities, labels, and names this
 # body uses. Job-level if expressions cannot read env, so the guard
@@ -184,9 +184,9 @@ jobs:
                   github_token: ${{ steps.runeseer.outputs.token }}
                   allowed_bots: "runewright"
                   # The progress comment runs wherever the action supports
-                  # it; only labeled events — the lane's standard summon —
-                  # refuse the flag. The adjudicator runs on opus: the
-                  # judging lane deserves the strongest reviewer.
+                  # it; only labeled events, the standard summon, refuse the
+                  # flag. The adjudicator runs on opus: the judging layer of
+                  # the review cascade gets the strongest reviewer.
                   track_progress: ${{ github.event.action != 'labeled' }}
                   claude_args: |
                       --model opus

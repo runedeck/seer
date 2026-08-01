@@ -28,14 +28,17 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN --org runedeck --visibility all --body "<t
 
 Dashboard state cannot be scripted; follow the guide named above and verify with its procedure: a draft pull request pushed twice summons nothing, and one `review` label runs the funnel in order.
 
-## Wiring truths, each learned from a live failure
+## Requirements and permissions
 
-- **Required approvals count only write-access reviewers.** An app holding `contents: read` submits APPROVED reviews that satisfy no ruleset; runeseer therefore carries `contents: read and write`, and the write/approve separation is enforced by its workflow's tool allowlist rather than by the permission bit.
-- **App permission changes are two acceptances.** Editing the registration (`organizations/<org>/settings/apps/<app>/permissions`) does nothing until the installation accepts the new scope (`organizations/<org>/settings/installations/<id>`); the installations API shows what is actually live.
-- **Nothing is retroactive.** Reviews and tokens carry the scope in force when they were minted; after a permission change, mint a fresh approval with a new round.
-- **`claude-code-action` refuses `track_progress` on labeled events**, and labels are the standard summon: gate the flag with `github.event.action != 'labeled'` so progress tracking runs everywhere the action supports it.
-- **The hosted runner's `gh` predates `--slurp`**: paginate with per-page `--jq` arrays merged through `jq -s 'add'`.
-- **The draft window re-arms a summon.** Round-end consumes the review labels, and a failed round consumes them too; to re-summon, convert the pull request to draft, apply the label (the lane's draft guard skips, so the label survives), then mark ready, which fires the lane under an action every input accepts.
-- **Never push after a clean verdict.** Stale-review dismissal eats the earned approval on any push; documentation follow-ups ride the next pull request.
+- Required approvals count only write-access reviewers: an app holding `contents: read` submits APPROVED reviews that satisfy no ruleset. runeseer therefore carries `contents: read and write`, and the write/approve separation is enforced by its workflow's tool allowlist rather than by the permission bit.
+- App permission changes take two acceptances: editing the registration (`organizations/<org>/settings/apps/<app>/permissions`) does nothing until the installation accepts the new scope (`organizations/<org>/settings/installations/<id>`). The installations API shows what is actually live.
+- Nothing is retroactive: reviews and tokens carry the scope in force when they were minted. After a permission change, mint a fresh approval with a new round.
+
+## Operating constraints
+
+- `claude-code-action` refuses `track_progress` on labeled events, and labels are the standard summon: the flag is gated with `github.event.action != 'labeled'` so progress tracking runs everywhere the action supports it.
+- The hosted runner's `gh` predates `--slurp`: paginate with per-page `--jq` arrays merged through `jq -s 'add'`.
+- Round end consumes the review labels, and a failed round consumes them too. To re-summon: convert the pull request to draft, apply the label (the draft guard skips the run, so the label survives), then mark ready, which fires the review under an action every input accepts.
+- Never push after a clean verdict: stale-review dismissal removes the earned approval on any push, so documentation follow-ups ride the next pull request.
 
 EXECUTE NOW: work the TODO list top to bottom, then run the DONE WHEN check on a scratch pull request.
