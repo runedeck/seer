@@ -183,7 +183,9 @@ jobs:
                   claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
                   github_token: ${{ steps.runeseer.outputs.token }}
                   allowed_bots: "runewright"
-                  track_progress: true
+                  # No progress comment: the action refuses track_progress on
+                  # labeled events, and the label is this lane's standard
+                  # summon. The verdict summary is the round's record.
                   claude_args: |
                       --allowedTools "Read,Write,Grep,Glob,mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*)"
                   prompt: >
