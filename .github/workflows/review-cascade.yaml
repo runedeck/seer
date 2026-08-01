@@ -92,21 +92,20 @@ jobs:
                   }
 
                   # Settled means the LATEST run of each of this app's checks
-                  # on the head has completed acceptably: anything other than
-                  # success or neutral is a broken stage, and a re-run that
-                  # succeeds supersedes the failure it retried. A run that
-                  # already completed on this head before the summon counts —
-                  # per-head review is idempotent and re-review would only
-                  # respend.
+                  # on the head completed as success or neutral: a skipped
+                  # summoned lane reviewed nothing, and a failed one is not
+                  # settled — the walk keeps waiting for the re-run the summon
+                  # provokes, and the timeout is the honest failure if none
+                  # comes. A run that already completed clean on this head
+                  # before the summon counts: per-head review is idempotent
+                  # and re-review would only respend.
                   settled() {
                       runs=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
                           --jq "[.[].check_runs[] | select(.app.slug == \"$1\")]
                               | group_by(.name) | map(sort_by(.started_at) | last)")
                       total=$(jq 'length' <<<"$runs")
-                      done_count=$(jq '[.[] | select(.status == "completed")] | length' <<<"$runs")
-                      broken=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $c | ["success", "neutral", "skipped"] | index($c) | not)] | length' <<<"$runs")
-                      [ "$broken" != "0" ] && fail_walk "$1's latest run concluded unsuccessfully on this head; re-run it or push a fix."
-                      [ "$total" != "0" ] && [ "$done_count" = "$total" ]
+                      clean_count=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $c | ["success", "neutral"] | index($c))] | length' <<<"$runs")
+                      [ "$total" != "0" ] && [ "$clean_count" = "$total" ]
                   }
 
                   wait_clean() {
