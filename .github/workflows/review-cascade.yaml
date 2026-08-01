@@ -23,7 +23,7 @@ on:
 jobs:
     walk:
         name: walk
-        if: github.event.label.name == 'review'
+        if: github.event.label.name == 'review' && github.event.pull_request.draft == false
         runs-on: ubuntu-latest
         timeout-minutes: 45
         steps:
@@ -36,28 +36,44 @@ jobs:
             - name: Walk the funnel
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
+                  # Label deletion runs on the workflow token, deliberately:
+                  # its events trigger no workflows, so consuming a label can
+                  # never cancel an in-flight lane through the callers'
+                  # unlabeled handling.
+                  CALLER_TOKEN: ${{ github.token }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
               run: |
+                  consume_entry_label() {
+                      GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
+                          "repos/$REPO/issues/$PR/labels/review" >/dev/null 2>&1 || true
+                  }
+
                   fail_walk() {
                       echo "$1"
                       # Consuming the entry label makes re-applying it restart
                       # the walk after fixes.
-                      gh api -X DELETE "repos/$REPO/issues/$PR/labels/review" >/dev/null 2>&1 || true
+                      consume_entry_label
                       exit 1
                   }
 
                   head_still() {
-                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+                      live=$(GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
                       [ "$live" = "$HEAD_SHA" ] || fail_walk "the head moved from $HEAD_SHA to $live mid-walk; re-apply review on the new head."
                   }
 
+                  # Reads ride the caller token: runewright's app permissions
+                  # deliberately exclude Checks, and its writes stay scoped to
+                  # comments and label adds.
                   unresolved_by() {
-                      cursor="null"
+                      cursor=""
                       open=0
                       while :; do
-                          page=$(gh api graphql -f query='query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                          cursor_arg=()
+                          [ -n "$cursor" ] && cursor_arg=(-f cursor="$cursor")
+                          page=$(GH_TOKEN=$CALLER_TOKEN gh api graphql -f query='query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
                               repository(owner: $owner, name: $repo) {
                                   pullRequest(number: $number) {
                                       reviewThreads(first: 100, after: $cursor) {
@@ -66,7 +82,7 @@ jobs:
                                       }
                                   }
                               }
-                          }' -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" -f cursor="$cursor" \
+                          }' -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" "${cursor_arg[@]}" \
                               --jq '.data.repository.pullRequest.reviewThreads')
                           open=$(( open + $(jq "[.nodes[] | select(.isResolved == false) | select(.comments.nodes[0].author.login == \"$1\")] | length" <<<"$page") ))
                           [ "$(jq -r '.pageInfo.hasNextPage' <<<"$page")" = "true" ] || break
@@ -75,16 +91,21 @@ jobs:
                       echo "$open"
                   }
 
-                  # Settled means every run this app made on the head has
-                  # completed acceptably: a failed or cancelled review is a
-                  # broken stage, never a clean one.
+                  # Settled means the LATEST run of each of this app's checks
+                  # on the head has completed acceptably: anything other than
+                  # success or neutral is a broken stage, and a re-run that
+                  # succeeds supersedes the failure it retried. A run that
+                  # already completed on this head before the summon counts —
+                  # per-head review is idempotent and re-review would only
+                  # respend.
                   settled() {
-                      runs=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs" \
-                          --jq "[.check_runs[] | select(.app.slug == \"$1\")]")
+                      runs=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate --slurp "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+                          --jq "[.[].check_runs[] | select(.app.slug == \"$1\")]
+                              | group_by(.name) | map(sort_by(.started_at) | last)")
                       total=$(jq 'length' <<<"$runs")
                       done_count=$(jq '[.[] | select(.status == "completed")] | length' <<<"$runs")
-                      broken=$(jq '[.[] | select(.conclusion as $c | ["failure", "cancelled", "timed_out"] | index($c))] | length' <<<"$runs")
-                      [ "$broken" != "0" ] && fail_walk "$1 concluded $broken run(s) unsuccessfully on this head; the funnel stops here."
+                      broken=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $c | ["success", "neutral", "skipped"] | index($c) | not)] | length' <<<"$runs")
+                      [ "$broken" != "0" ] && fail_walk "$1's latest run concluded unsuccessfully on this head; re-run it or push a fix."
                       [ "$total" != "0" ] && [ "$done_count" = "$total" ]
                   }
 
@@ -111,14 +132,31 @@ jobs:
                       gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
                   }
 
+                  # GraphQL bot logins are bare (cursor, macroscopeapp) —
+                  # never the REST-style cursor[bot]. A head cursor already
+                  # settled on is not re-summoned: per-head review is
+                  # idempotent and the comment would only respend.
                   echo "stage 1: cursor"
-                  gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="bugbot run" >/dev/null
-                  wait_clean cursor "cursor[bot]" "cursor"
+                  if settled cursor; then
+                      echo "cursor already settled on this head; skipping the summon."
+                  else
+                      gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="bugbot run" >/dev/null
+                  fi
+                  wait_clean cursor "cursor" "cursor"
 
                   echo "stage 2: macroscope"
                   head_still
                   ensure_label "review:macroscope"
-                  wait_clean macroscopeapp "macroscopeapp[bot]" "macroscope"
+                  wait_clean macroscopeapp "macroscopeapp" "macroscope"
+
+                  # The paid lane cannot run on fork pull requests (its
+                  # secrets are stripped there), so their funnel ends clean at
+                  # the free lanes and the owner reviews next.
+                  if [ "$IS_FORK" = "true" ]; then
+                      consume_entry_label
+                      echo "fork funnel complete: both free lanes settled clean; the owner's review is the remaining gate."
+                      exit 0
+                  fi
 
                   echo "stage 3: runeseer"
                   head_still

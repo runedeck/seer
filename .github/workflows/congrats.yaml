@@ -1,8 +1,10 @@
 name: Congrats
 
-# Reusable body of the first-contribution greeting. The explicit seer
-# checkout is what single-sources the script: a reusable workflow runs in
-# the caller's repository, where it does not exist.
+# Reusable body of the first-contribution greeting. Detection is inlined
+# and runs on the workflow token; the runewright token is minted only
+# when a greeting is actually due. No checkout at all: the body carries
+# its own logic, so callers work whatever seer's visibility becomes and
+# always run the logic of the ref they called.
 on:
     workflow_call:
         secrets:
@@ -17,21 +19,52 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 5
         steps:
-            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-              with:
-                  repository: runedeck/seer
-                  ref: main
+            # Counting walks the pulls list directly: the search index lags
+            # fresh merges, and a lagged count silences the greeting forever.
+            - id: first
+              name: Detect a first merged contribution
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  MERGE_SHA: ${{ github.sha }}
+              run: |
+                  echo "greet=false" >> "$GITHUB_OUTPUT"
+                  pr=$(gh api "repos/$REPO/commits/$MERGE_SHA/pulls" \
+                      --jq '[.[] | select(.merged_at != null)] | first')
+                  [ -n "$pr" ] && [ "$pr" != "null" ] || { echo "no merged PR for this push"; exit 0; }
+                  IFS=$'\t' read -r author author_type number \
+                      < <(jq -r '[.user.login, .user.type, .number] | @tsv' <<<"$pr")
+                  [ "$author_type" = "Bot" ] && { echo "bot author, no greeting"; exit 0; }
+                  [ "$author" = "N4M3Z" ] && { echo "owner, no greeting"; exit 0; }
+                  merged=$(gh api --paginate "repos/$REPO/pulls?state=closed&per_page=100" \
+                      --jq "[.[] | select(.user.login == \"$author\" and .merged_at != null)] | length" \
+                      | awk '{ total += $1 } END { print total + 0 }')
+                  if [ "$merged" -le 1 ]; then
+                      {
+                          echo "greet=true"
+                          echo "author=$author"
+                          echo "number=$number"
+                      } >> "$GITHUB_OUTPUT"
+                      echo "first merged contribution by $author on #$number"
+                  else
+                      echo "$author has $merged merged PRs here, no greeting"
+                  fi
 
             - id: runewright
+              if: steps.first.outputs.greet == 'true'
               uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
               with:
                   app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
                   private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
                   owner: runedeck
 
-            - name: Greet a first merged contribution
+            - name: Greet
+              if: steps.first.outputs.greet == 'true'
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
-                  REPO: ${{ github.repository }}
-                  MERGE_SHA: ${{ github.sha }}
-              run: bash .github/scripts/congrats.sh
+                  AUTHOR: ${{ steps.first.outputs.author }}
+                  NUMBER: ${{ steps.first.outputs.number }}
+              run: |
+                  gh api -X POST "repos/${{ github.repository }}/issues/${NUMBER}/comments" \
+                      -f body="Your first merged contribution here — welcome, @${AUTHOR}, and thank you. Every rune in this deck was reviewed the same way yours just was; may it be the first of many." >/dev/null
+                  echo "greeted ${AUTHOR} on #${NUMBER}"

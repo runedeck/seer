@@ -21,23 +21,38 @@ for repo in $(gh api --paginate orgs/runedeck/repos --jq '.[].name'); do
                 pullRequest(number: $n) {
                     updatedAt
                     mergeable
+                    headRefOid
                     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-                    latestReviews(first: 30) { nodes { author { login } state } }
+                    latestReviews(first: 30) { nodes { author { login } state submittedAt commit { oid } } }
                 }
             }
         }" --jq '.data.repository.pullRequest')
-        IFS=$'\t' read -r rollup mergeable updated runeseer_ok owner_acted < <(jq -r '[
-            (.commits.nodes[0].commit.statusCheckRollup.state // "NONE"),
-            (.mergeable // "UNKNOWN"),
-            .updatedAt,
-            ([.latestReviews.nodes[] | select(.author.login == "runeseer" and .state == "APPROVED")] | length),
-            ([.latestReviews.nodes[] | select(.author.login == "N4M3Z" and (.state == "APPROVED" or .state == "CHANGES_REQUESTED"))] | length)
-        ] | @tsv' <<<"$pr")
+        # The runeseer approval must be bound to the CURRENT head, and only
+        # an owner review submitted after that approval counts as the owner
+        # having spoken — an old review over an old tree answers nothing.
+        IFS=$'\t' read -r rollup mergeable updated runeseer_at < <(jq -r '
+            .headRefOid as $head | [
+                (.commits.nodes[0].commit.statusCheckRollup.state // "NONE"),
+                (.mergeable // "UNKNOWN"),
+                .updatedAt,
+                ([.latestReviews.nodes[]
+                    | select(.author.login == "runeseer" and .state == "APPROVED" and .commit.oid == $head)
+                    | .submittedAt] | last // "")
+            ] | @tsv' <<<"$pr")
+        owner_after=0
+        if [ -n "$runeseer_at" ]; then
+            owner_after=$(jq -r --arg at "$runeseer_at" '
+                [.latestReviews.nodes[]
+                    | select(.author.login == "N4M3Z"
+                        and (.state == "APPROVED" or .state == "CHANGES_REQUESTED")
+                        and .submittedAt > $at)] | length' <<<"$pr")
+        fi
         age=$(hours_since "$updated")
         # Stage four means stage four: green checks, no conflicts, a live
-        # runeseer approval, and the owner's word still unspoken.
+        # runeseer approval of THIS head, and the owner's word unspoken
+        # since that approval.
         if [ "$rollup" = "SUCCESS" ] && [ "$mergeable" != "CONFLICTING" ] \
-            && [ "$runeseer_ok" -ge 1 ] && [ "$owner_acted" = "0" ] && [ "$age" -ge 20 ]; then
+            && [ -n "$runeseer_at" ] && [ "$owner_after" = "0" ] && [ "$age" -ge 20 ]; then
             waiting="$waiting runedeck/$repo#$n(${age}h)"
             last_bump=$(gh api --paginate "$api/issues/$n/comments" \
                 --jq '[.[] | select(.user.login == "runewright[bot]" and (.body | startswith("Awaiting the owner")))] | last | .created_at // empty')

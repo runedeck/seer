@@ -38,6 +38,25 @@ jobs:
                   ref: ${{ github.event.pull_request.head.sha }}
                   fetch-depth: 0
 
+            # The reviewer's instructions load from the base branch: a pull
+            # request must not be able to rewrite the rules it is judged by.
+            # Head-only instruction files are removed, not merely overlaid,
+            # and nested CLAUDE.md/AGENTS.md count. The head's versions stay
+            # reviewable through the diff.
+            - name: Instructions from the base
+              env:
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+              run: |
+                  pattern='(^|/)(CLAUDE|AGENTS)\.md$|^\.claude(/|$)|^\.cursor(/|$)'
+                  git ls-files -z | tr '\0' '\n' | grep -E "$pattern" | while IFS= read -r file; do
+                      rm -f "$file"
+                  done
+                  rm -rf .claude .cursor
+                  git ls-tree -r --name-only "$BASE_SHA" | grep -E "$pattern" | while IFS= read -r file; do
+                      git checkout "$BASE_SHA" -- "$file" 2>/dev/null || true
+                  done
+                  echo "instruction surface pinned to the base branch."
+
             # Prose-only diffs are the conventions lane's territory; the
             # subscription reviews executable surface. Markdown under
             # docs/specs or .github stays in scope, since canon and
@@ -72,8 +91,8 @@ jobs:
                   for _ in $(seq 1 15); do
                       settled=true
                       for app in $expected; do
-                          runs=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" \
-                              --jq "[.check_runs[] | select(.app.slug == \"$app\")]")
+                          runs=$(gh api --paginate --slurp "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+                              --jq "[.[].check_runs[] | select(.app.slug == \"$app\")]")
                           total=$(printf '%s' "$runs" | jq 'length')
                           done_count=$(printf '%s' "$runs" | jq '[.[] | select(.status == "completed")] | length')
                           if [ "$total" = "0" ] || [ "$done_count" != "$total" ]; then
@@ -206,27 +225,27 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; not approving"; exit 0; }
-                  verdict=$(jq -r '.verdict // empty' runeseer-verdict.json)
-                  sha=$(jq -r '.sha // empty' runeseer-verdict.json)
-                  count=$(jq -r '.count // 0' runeseer-verdict.json)
-                  findings=$(jq -r '(.findings // []) | length' runeseer-verdict.json)
                   live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '.head.sha')
-                  echo "verdict=$verdict count=$count findings=$findings sha=$sha head=$HEAD_SHA live=$live"
-                  # Clean means internally consistent clean: a verdict naming
-                  # findings while claiming clean approves nothing.
-                  if [ "$verdict" = "clean" ] && [ "$count" = "0" ] && [ "$findings" = "0" ] \
-                      && [ "$sha" = "$HEAD_SHA" ] && [ "$live" = "$HEAD_SHA" ]; then
+                  # Clean means explicitly, completely clean: every field
+                  # present and exact, no defaults. A partial verdict object
+                  # approves nothing.
+                  if jq -e --arg sha "$HEAD_SHA" '
+                      .verdict == "clean" and .count == 0
+                      and (.findings | type == "array" and length == 0)
+                      and .sha == $sha' runeseer-verdict.json >/dev/null \
+                      && [ "$live" = "$HEAD_SHA" ]; then
                       gh api -X POST "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews" \
                           -f event=APPROVE \
                           -f commit_id="$HEAD_SHA" \
                           -f body="Earned approval: review/correctness returned a clean verdict for ${HEAD_SHA}. Dismissed automatically on any new push."
                   fi
 
-            # A summon is one round: consuming the labels stops a later push
-            # from re-running the paid lane out of funnel order. The next
-            # round starts with a fresh review label.
+            # A summon is one round, even a round the scope stood down:
+            # consuming the labels stops a later push from re-running the
+            # paid lane out of funnel order. The next round starts with a
+            # fresh review label.
             - name: Consume the summons
-              if: always() && steps.scope.outputs.skip != 'true'
+              if: always()
               continue-on-error: true
               env:
                   GH_TOKEN: ${{ github.token }}
@@ -247,18 +266,14 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; the review did not complete"; exit 1; }
-                  verdict=$(jq -r '.verdict // empty' runeseer-verdict.json)
-                  sha=$(jq -r '.sha // empty' runeseer-verdict.json)
-                  count=$(jq -r '.count // 0' runeseer-verdict.json)
-                  findings=$(jq -r '(.findings // []) | length' runeseer-verdict.json)
-                  if [ "$sha" != "$HEAD_SHA" ]; then
-                      echo "verdict judged $sha, not this head $HEAD_SHA; the check stays red."
-                      exit 1
-                  fi
-                  if [ "$verdict" = "clean" ] && [ "$count" = "0" ] && [ "$findings" = "0" ]; then
+                  if jq -e --arg sha "$HEAD_SHA" '
+                      .verdict == "clean" and .count == 0
+                      and (.findings | type == "array" and length == 0)
+                      and .sha == $sha' runeseer-verdict.json >/dev/null; then
                       exit 0
                   fi
-                  echo "review/correctness holds $count unresolved findings; the check stays red until they clear."
+                  echo "the verdict is not an explicit clean for this head; the check stays red."
+                  jq -c '{verdict, count, sha}' runeseer-verdict.json || true
                   exit 1
 
             # Metrics: cost, turns, and finding counts land in the job
