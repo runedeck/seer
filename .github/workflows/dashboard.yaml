@@ -1,4 +1,4 @@
-name: Veto Monitor
+name: Dashboard
 
 on:
     schedule:
@@ -25,4 +25,4 @@ jobs:
             - name: Sweep for pull requests awaiting the owner
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
-              run: bash .github/scripts/veto-monitor.sh
+              run: bash .github/scripts/dashboard.sh
