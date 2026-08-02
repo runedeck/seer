@@ -5,8 +5,10 @@ name: Review Cascade
 # an unmoved head. A stage that holds findings — or a head that moves
 # mid-walk — stops the walk and fails this check; runeseer's own verdict
 # gates the review/correctness check, not this one. Callers trigger on
-# pull_request_target labeled: the walk is API-only, checks out nothing,
-# and fork pull requests need the base-context secrets.
+# pull_request_target opened, ready_for_review, and labeled: every ready
+# pull request walks the funnel once automatically, and the review label
+# re-summons after fixes. The walk is API-only, checks out nothing, and
+# fork pull requests need the base-context secrets.
 #
 # Cursor has no label trigger, so stage 1 is a runewright `bugbot run`
 # comment; runewright's token also applies the stage labels, because
@@ -40,7 +42,7 @@ env:
 jobs:
     walk:
         name: walk
-        if: github.event.label.name == 'review' && github.event.pull_request.draft == false
+        if: github.event.pull_request.draft == false && (github.event.label.name == 'review' || contains(fromJSON('["opened", "ready_for_review"]'), github.event.action))
         runs-on: ubuntu-latest
         timeout-minutes: 45
         steps:
