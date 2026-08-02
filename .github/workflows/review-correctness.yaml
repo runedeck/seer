@@ -210,14 +210,18 @@ jobs:
                       - Never duplicate another lane. A judgment in the summary is adjudication, not a second report.
                       - Post inline comments only for novel runeseer findings of Medium, High, or Critical severity. Put novel Low findings only in the summary Digest.
 
-                      Inline comment format:
+                      Inline comment format (the blank lines are part of the format; markdown folds adjacent lines into one paragraph):
                       ### <specific defect title, at most 8 words>
+
                       **<Critical|High|Medium> Severity**
+
                       <One paragraph of at most 2 sentences and 70 words. State the defect, its concrete failure consequence, and the primary `path:line` anchor.>
+
                       Evidence: <optional semicolon-separated `path:line` anchors>
 
                       Inline comment constraints:
                       - Anchor the comment to the most relevant reviewable changed line and include `path:line` in the body.
+                      - Separate the title, severity, paragraph, and Evidence line with blank lines, or the renderer folds them together.
                       - Prefer one sentence. Use the second only when needed to connect cause and consequence.
                       - The optional Evidence line contains anchors only, with no argument or recap.
                       - Use at most one direct quotation per finding, limited to one source line. Prefer an anchor over a quotation.

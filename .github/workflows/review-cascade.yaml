@@ -29,6 +29,7 @@ env:
     LABEL_ENTRY: review
     LABEL_MACROSCOPE: "review:macroscope"
     LABEL_RUNESEER: "review:runeseer"
+    LABEL_WAIVER: "review:skip"
     LABEL_COLOR: "5319e7"
     LABEL_DESCRIPTION: Summons this review lane
     APP_CURSOR: cursor
@@ -166,8 +167,16 @@ jobs:
 
                   echo "stage 2: macroscope"
                   head_still
-                  ensure_label "$LABEL_MACROSCOPE"
-                  wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope"
+                  # The waiver skips only this stage: the adjudicating lane
+                  # still judges the head, so the required verdict mirror can
+                  # clear without a macroscope round.
+                  if GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/issues/$PR/labels" \
+                      --jq '[.[].name]' | jq -e --arg waiver "$LABEL_WAIVER" 'index($waiver)' >/dev/null; then
+                      echo "$LABEL_WAIVER present; the macroscope stage is waived."
+                  else
+                      ensure_label "$LABEL_MACROSCOPE"
+                      wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope"
+                  fi
 
                   # The paid lane cannot run on fork pull requests (its
                   # secrets are stripped there), so their funnel ends clean at
