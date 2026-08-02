@@ -27,7 +27,9 @@ on:
 # label stays literal in the guard below.
 env:
     LABEL_ENTRY: review
+    LABEL_CURSOR_BLOCKED: "review:cursor-blocked"
     LABEL_MACROSCOPE: "review:macroscope"
+    LABEL_MACROSCOPE_BLOCKED: "review:macroscope-blocked"
     LABEL_RUNESEER: "review:runeseer"
     LABEL_WAIVER: "review:skip"
     LABEL_COLOR: "5319e7"
@@ -36,9 +38,11 @@ env:
     APP_MACROSCOPE: macroscopeapp
     BOT_CURSOR: cursor
     BOT_MACROSCOPE: macroscopeapp
+    REST_BOT_CURSOR: "cursor[bot]"
+    REST_BOT_MACROSCOPE: "macroscopeapp[bot]"
     SUMMON_COMMENT: bugbot run
     POLL_SECONDS: 20
-    POLL_ROUNDS: 60
+    POLL_ROUNDS: 30
 
 jobs:
     walk:
@@ -111,33 +115,95 @@ jobs:
                       echo "$open"
                   }
 
-                  # Settled means the LATEST run of each of this app's checks
-                  # on the head completed as success or neutral: a skipped
-                  # summoned lane reviewed nothing, and a failed one is not
-                  # settled — the walk keeps waiting for the re-run the summon
-                  # provokes, and the timeout is the honest failure if none
-                  # comes. A run that already completed clean on this head
-                  # before the summon counts: per-head review is idempotent
-                  # and re-review would only respend.
-                  # Per-page jq output merged with jq -s: the runner's gh
-                  # predates --slurp.
-                  settled() {
-                      runs=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+                  # Per-page jq output is merged with jq -s because the runner's
+                  # gh predates --slurp.
+                  latest_runs() {
+                      GH_TOKEN=$CALLER_TOKEN gh api --paginate \
+                          "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
                           --jq "[.check_runs[] | select(.app.slug == \"$1\")]" \
-                          | jq -s "add // [] | group_by(.name) | map(sort_by(.started_at) | last)")
+                          | jq -s 'add // [] | group_by(.name) | map(sort_by(.started_at) | last)'
+                  }
+
+                  settled() {
+                      runs=$(latest_runs "$1")
                       total=$(jq 'length' <<<"$runs")
-                      clean_count=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $c | ["success", "neutral"] | index($c))] | length' <<<"$runs")
+                      clean_count=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $conclusion | ["success", "neutral"] | index($conclusion))] | length' <<<"$runs")
                       [ "$total" != "0" ] && [ "$clean_count" = "$total" ]
                   }
 
+                  failed_check() {
+                      runs=$(latest_runs "$1")
+                      jq -r '[.[]
+                          | select(.status == "completed")
+                          | select(.conclusion as $conclusion | ["failure", "cancelled", "timed_out", "action_required", "stale"] | index($conclusion))
+                          | .html_url] | first // empty' <<<"$runs"
+                  }
+
+                  latest_comment_id() {
+                      GH_TOKEN=$CALLER_TOKEN gh api --paginate \
+                          "repos/$REPO/issues/$PR/comments?per_page=100" \
+                          --jq '[.[].id]' | jq -s 'add // [] | max // 0'
+                  }
+
+                  terminal_comment_after() {
+                      comments=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate \
+                          "repos/$REPO/issues/$PR/comments?per_page=100" \
+                          --jq "[.[] | select(.id > $1) | select(.user.login == \"$2\") | select(.body | test(\"couldn.t run|usage limit|billing|quota|credit limit|rate limit\"; \"i\")) | .html_url]" \
+                          | jq -s 'add // []')
+                      jq -r 'first // empty' <<<"$comments"
+                  }
+
+                  blocked() {
+                      GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/issues/$PR/labels" \
+                          --jq "[.[].name] | index(\"$1\") != null" | grep -qx true
+                  }
+
+                  mark_blocked() {
+                      encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
+                      gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1 \
+                          || gh api -X POST "repos/$REPO/labels" \
+                              -f name="$1" -f color="$LABEL_COLOR" \
+                              -f description="Review provider requires intervention" >/dev/null
+                      # The workflow token emits no label event, so this blocker
+                      # cannot re-enter or relaunch the cascade that created it.
+                      GH_TOKEN=$CALLER_TOKEN gh api -X POST \
+                          "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
+                  }
+
+                  clear_label() {
+                      encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
+                      GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
+                          "repos/$REPO/issues/$PR/labels/$encoded" >/dev/null 2>&1 || true
+                  }
+
                   wait_clean() {
-                      app=$1; bot=$2; stage=$3
+                      app=$1; bot=$2; stage=$3; comment_after=${4:-0}; rest_bot=${5:-}; blocker=${6:-}; summon_label=${7:-}
                       for _ in $(seq 1 "$POLL_ROUNDS"); do
                           if settled "$app"; then
+                              [ -z "$blocker" ] || clear_label "$blocker"
                               head_still
                               open=$(unresolved_by "$bot")
                               [ "$open" = "0" ] && { echo "$stage settled clean"; return 0; }
                               fail_walk "$stage holds $open unresolved findings; the funnel stops here."
+                          fi
+                          failure_url=$(failed_check "$app")
+                          if [ -n "$failure_url" ]; then
+                              head_still
+                              open=$(unresolved_by "$bot")
+                              if [ "$open" != "0" ]; then
+                                  fail_walk "$stage holds $open unresolved findings; the funnel stops here."
+                              fi
+                              [ -z "$summon_label" ] || clear_label "$summon_label"
+                              [ -z "$blocker" ] || mark_blocked "$blocker"
+                              fail_walk "$stage reported a terminal provider failure: $failure_url"
+                          fi
+                          if [ -n "$rest_bot" ]; then
+                              failure_url=$(terminal_comment_after "$comment_after" "$rest_bot")
+                              if [ -n "$failure_url" ]; then
+                                  [ -z "$summon_label" ] || clear_label "$summon_label"
+                                  [ -z "$blocker" ] || mark_blocked "$blocker"
+                                  fail_walk "$stage reported a terminal provider failure: $failure_url"
+                              fi
                           fi
                           sleep "$POLL_SECONDS"
                       done
@@ -153,17 +219,20 @@ jobs:
                       gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
                   }
 
-                  # GraphQL bot logins are bare (cursor, macroscopeapp) —
-                  # never the REST-style cursor[bot]. A head cursor already
-                  # settled on is not re-summoned: per-head review is
-                  # idempotent and the comment would only respend.
+                  # GraphQL bot logins are bare (cursor, macroscopeapp); REST
+                  # issue-comment logins carry the [bot] suffix.
                   echo "stage 1: cursor"
+                  cursor_comment_id=0
                   if settled "$APP_CURSOR"; then
                       echo "cursor already settled on this head; skipping the summon."
+                  elif blocked "$LABEL_CURSOR_BLOCKED"; then
+                      fail_walk "$LABEL_CURSOR_BLOCKED is present; clear the provider problem before re-summoning."
                   else
-                      gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" >/dev/null
+                      cursor_comment_id=$(gh api -X POST \
+                          "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id')
                   fi
-                  wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor"
+                  wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor" \
+                      "$cursor_comment_id" "$REST_BOT_CURSOR" "$LABEL_CURSOR_BLOCKED" ""
 
                   echo "stage 2: macroscope"
                   head_still
@@ -174,8 +243,15 @@ jobs:
                       --jq '[.[].name]' | jq -e --arg waiver "$LABEL_WAIVER" 'index($waiver)' >/dev/null; then
                       echo "$LABEL_WAIVER present; the macroscope stage is waived."
                   else
-                      ensure_label "$LABEL_MACROSCOPE"
-                      wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope"
+                      macroscope_comment_id=$(latest_comment_id)
+                      if ! settled "$APP_MACROSCOPE"; then
+                          if blocked "$LABEL_MACROSCOPE_BLOCKED"; then
+                              fail_walk "$LABEL_MACROSCOPE_BLOCKED is present; clear the provider problem before re-summoning."
+                          fi
+                          ensure_label "$LABEL_MACROSCOPE"
+                      fi
+                      wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope" \
+                          "$macroscope_comment_id" "$REST_BOT_MACROSCOPE" "$LABEL_MACROSCOPE_BLOCKED" "$LABEL_MACROSCOPE"
                   fi
 
                   # The paid lane cannot run on fork pull requests (its
