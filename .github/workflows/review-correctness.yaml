@@ -51,6 +51,7 @@ jobs:
               with:
                   ref: ${{ github.event.pull_request.head.sha }}
                   fetch-depth: 0
+                  persist-credentials: false
 
             # The reviewer's instructions load from the base branch: a pull
             # request must not be able to rewrite the rules it is judged by.
