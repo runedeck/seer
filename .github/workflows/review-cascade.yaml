@@ -1,17 +1,16 @@
 name: Review Cascade
 
-# Reusable body of the funnel walk: cursor first, then macroscope, then
-# runeseer, each stage summoned only after the previous settles clean on
-# an unmoved head. A stage that holds findings — or a head that moves
-# mid-walk — stops the walk and fails this check; runeseer's own verdict
-# gates the review/correctness check, not this one. Callers trigger on
-# pull_request_target opened, ready_for_review, and labeled: every ready
-# pull request walks the funnel once automatically, and the review label
-# re-summons after fixes. The walk is API-only, checks out nothing, and
-# fork pull requests need the base-context secrets.
+# Reusable review cascade: cursor first, then macroscope, then runeseer,
+# each stage summoned only after the previous one settles clean on an unmoved
+# head. Findings or a head change stop the cascade and fail this check;
+# runeseer's own verdict gates review/correctness, not this job. Callers trigger
+# on pull_request_target opened, ready_for_review, and labeled: every ready pull
+# request runs the cascade once automatically, and the review label re-summons
+# it after fixes. The cascade is API-only, checks out nothing, and fork pull
+# requests need the base-context secrets.
 #
-# Cursor has no label trigger, so stage 1 is a runewright `bugbot run`
-# comment; runewright's token also applies the stage labels, because
+# Cursor has no label trigger, so stage 1 is a standalone runewright
+# `@cursor review` comment; runewright's token also applies stage labels, because
 # label events created by the workflow token would not trigger the lanes
 # listening for them.
 on:
@@ -27,9 +26,10 @@ on:
 # label stays literal in the guard below.
 env:
     LABEL_ENTRY: review
-    LABEL_CURSOR_BLOCKED: "review:cursor-blocked"
+    LABEL_CURSOR_BLOCKED: "issue:cursor"
     LABEL_MACROSCOPE: "review:macroscope"
-    LABEL_MACROSCOPE_BLOCKED: "review:macroscope-blocked"
+    LABEL_MACROSCOPE_BLOCKED: "issue:macroscope"
+    LABEL_RUNE_BLOCKED: "issue:rune"
     LABEL_RUNESEER: "review:runeseer"
     LABEL_WAIVER: "review:skip"
     LABEL_COLOR: "5319e7"
@@ -45,8 +45,8 @@ env:
     POLL_ROUNDS: 30
 
 jobs:
-    walk:
-        name: walk
+    cascade:
+        name: cascade
         if: github.event.pull_request.draft == false && (github.event.label.name == 'review' || contains(fromJSON('["opened", "ready_for_review"]'), github.event.action))
         runs-on: ubuntu-latest
         timeout-minutes: 45
@@ -57,7 +57,7 @@ jobs:
                   app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
                   private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
 
-            - name: Walk the funnel
+            - name: Run the review cascade
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
                   # Label deletion runs on the workflow token, deliberately:
@@ -75,17 +75,17 @@ jobs:
                           "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" >/dev/null 2>&1 || true
                   }
 
-                  fail_walk() {
+                  fail_cascade() {
                       echo "$1"
                       # Consuming the entry label makes re-applying it restart
-                      # the walk after fixes.
+                      # the cascade after fixes.
                       consume_entry_label
                       exit 1
                   }
 
                   head_still() {
                       live=$(GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
-                      [ "$live" = "$HEAD_SHA" ] || fail_walk "the head moved from $HEAD_SHA to $live mid-walk; re-apply $LABEL_ENTRY on the new head."
+                      [ "$live" = "$HEAD_SHA" ] || fail_cascade "the head moved from $HEAD_SHA to $live during the cascade; re-apply $LABEL_ENTRY on the new head."
                   }
 
                   # Reads ride the caller token: runewright's app permissions
@@ -184,30 +184,30 @@ jobs:
                               head_still
                               open=$(unresolved_by "$bot")
                               [ "$open" = "0" ] && { echo "$stage settled clean"; return 0; }
-                              fail_walk "$stage holds $open unresolved findings; the funnel stops here."
+                              fail_cascade "$stage holds $open unresolved findings; the funnel stops here."
                           fi
                           failure_url=$(failed_check "$app")
                           if [ -n "$failure_url" ]; then
                               head_still
                               open=$(unresolved_by "$bot")
                               if [ "$open" != "0" ]; then
-                                  fail_walk "$stage holds $open unresolved findings; the funnel stops here."
+                                  fail_cascade "$stage holds $open unresolved findings; the funnel stops here."
                               fi
                               [ -z "$summon_label" ] || clear_label "$summon_label"
                               [ -z "$blocker" ] || mark_blocked "$blocker"
-                              fail_walk "$stage reported a terminal provider failure: $failure_url"
+                              fail_cascade "$stage reported a terminal provider failure: $failure_url"
                           fi
                           if [ -n "$rest_bot" ]; then
                               failure_url=$(terminal_comment_after "$comment_after" "$rest_bot")
                               if [ -n "$failure_url" ]; then
                                   [ -z "$summon_label" ] || clear_label "$summon_label"
                                   [ -z "$blocker" ] || mark_blocked "$blocker"
-                                  fail_walk "$stage reported a terminal provider failure: $failure_url"
+                                  fail_cascade "$stage reported a terminal provider failure: $failure_url"
                               fi
                           fi
                           sleep "$POLL_SECONDS"
                       done
-                      fail_walk "$stage did not settle within the poll budget; the funnel stops here."
+                      fail_cascade "$stage did not settle within the poll budget; the funnel stops here."
                   }
 
                   ensure_label() {
@@ -226,7 +226,7 @@ jobs:
                   if settled "$APP_CURSOR"; then
                       echo "cursor already settled on this head; skipping the summon."
                   elif blocked "$LABEL_CURSOR_BLOCKED"; then
-                      fail_walk "$LABEL_CURSOR_BLOCKED is present; clear the provider problem before re-summoning."
+                      fail_cascade "$LABEL_CURSOR_BLOCKED is present; clear the provider problem before re-summoning."
                   else
                       cursor_comment_id=$(gh api -X POST \
                           "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id')
@@ -246,7 +246,7 @@ jobs:
                       macroscope_comment_id=$(latest_comment_id)
                       if ! settled "$APP_MACROSCOPE"; then
                           if blocked "$LABEL_MACROSCOPE_BLOCKED"; then
-                              fail_walk "$LABEL_MACROSCOPE_BLOCKED is present; clear the provider problem before re-summoning."
+                              fail_cascade "$LABEL_MACROSCOPE_BLOCKED is present; clear the provider problem before re-summoning."
                           fi
                           ensure_label "$LABEL_MACROSCOPE"
                       fi
@@ -265,5 +265,8 @@ jobs:
 
                   echo "stage 3: runeseer"
                   head_still
+                  if blocked "$LABEL_RUNE_BLOCKED"; then
+                      fail_cascade "$LABEL_RUNE_BLOCKED is present; clear the provider problem before re-summoning."
+                  fi
                   ensure_label "$LABEL_RUNESEER"
                   echo "runeseer summoned; its clean verdict earns the approval, and only then does the pull request reach the owner."
