@@ -40,7 +40,7 @@ env:
     BOT_MACROSCOPE: macroscopeapp
     REST_BOT_CURSOR: "cursor[bot]"
     REST_BOT_MACROSCOPE: "macroscopeapp[bot]"
-    SUMMON_COMMENT: bugbot run
+    SUMMON_COMMENT: "@cursor review"
     POLL_SECONDS: 20
     POLL_ROUNDS: 30
 
