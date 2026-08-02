@@ -230,13 +230,12 @@ jobs:
                       Summary comment:
                       - Post exactly one summary with `gh pr comment`.
                       - Its first line must be exactly `review/correctness: clean @SHA` or `review/correctness: N findings @SHA`, using the full HEAD SHA and the total unresolved finding count.
-                      - Follow with one line for every non-ledger finding from another lane:
-                        `- <lane> | <confirmed|disputed|already addressed> | <path:line> | <reason, at most 25 words>`
-                      - Keep each judgment on one physical line. Do not add paragraphs beneath it.
-                      - Finish with:
-                        `#### Digest`
-                      - Under Digest, write one line per novel Low runeseer finding:
-                        `- <path:line> | <defect and consequence, at most 25 words>`
+                      - Then a blank line, then `#### Lane judgments`, then one bullet per non-ledger finding from another lane, exactly this shape:
+                        `- **<lane>** <confirmed|disputed|already addressed> (`<path:line>`): <reason, one sentence, at most 25 words.>`
+                      - Bold only the lane name. Wrap every path, label, identifier, and code term in backticks so it renders as a code chip. Never use pipes as separators and never emit tables.
+                      - Keep each judgment to one bullet. Do not add paragraphs beneath it.
+                      - Then a blank line, then `#### Digest`, then one bullet per novel Low runeseer finding:
+                        `- `<path:line>`: <defect and consequence, one sentence, at most 25 words.>`
                       - If there are no novel Low findings, write `- None.`
                       - Do not repeat other-lane or ledger findings in Digest.
 
