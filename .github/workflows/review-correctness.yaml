@@ -22,6 +22,7 @@ env:
     APPS_EXPECTED: cursor
     APPS_EXPECTED_SUMMONED: cursor macroscopeapp
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
+    LABEL_RUNE_BLOCKED: "issue:rune"
     ARTIFACT_PREFIX: runeseer-verdict-pr
     INSTRUCTION_PATTERN: '(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)'
     POLL_SECONDS: 20
@@ -313,6 +314,38 @@ jobs:
                           >/dev/null 2>&1 || true
                   done
                   echo "summons consumed; a new review label starts the next round."
+
+            # A round that produced no verdict is a provider failure, not a
+            # finding: the blocker label stops the cascade from re-summoning
+            # this lane until the problem is fixed. A round that produced a
+            # verdict clears the blocker. The workflow token's label events
+            # trigger nothing, so neither write re-enters the cascade.
+            - name: Provider circuit breaker
+              if: always() && steps.scope.outputs.skip == 'false'
+              continue-on-error: true
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  encoded=$(printf '%s' "$LABEL_RUNE_BLOCKED" | sed 's/:/%3A/')
+                  # Only a schema-complete verdict proves the provider worked;
+                  # a partial file from a mid-review crash keeps the blocker.
+                  if [ -f runeseer-verdict.json ] && jq -e '
+                      (.sha | type == "string" and length > 0)
+                      and (.verdict == "clean" or .verdict == "findings")
+                      and (.count | type == "number")
+                      and (.findings | type == "array")' runeseer-verdict.json >/dev/null 2>&1; then
+                      gh api -X DELETE \
+                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$encoded" \
+                          >/dev/null 2>&1 || true
+                  else
+                      gh api "repos/${{ github.repository }}/labels/$encoded" >/dev/null 2>&1 \
+                          || gh api -X POST "repos/${{ github.repository }}/labels" \
+                              -f name="$LABEL_RUNE_BLOCKED" -f color="d93f0b" \
+                              -f description="Review provider requires intervention" >/dev/null
+                      gh api -X POST \
+                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" \
+                          -f "labels[]=$LABEL_RUNE_BLOCKED" >/dev/null
+                  fi
 
             # The spec's word is binding: a lane holding unresolved findings
             # fails its check. Green means clean for THIS head, never merely
