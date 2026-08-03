@@ -20,6 +20,10 @@ on:
                 required: true
             RUNEWRIGHT_APP_KEY:
                 required: true
+            # Cursor ignores bot-authored trigger comments, so the summon
+            # rides an owner-minted fine-grained token when one is provided.
+            RUNEWRIGHT_GITHUB_TOKEN:
+                required: false
 
 # Single declaration point for every identity, label, and tunable this
 # body uses. Job-level if expressions cannot read env, so the entry
@@ -60,6 +64,10 @@ jobs:
             - name: Run the review cascade
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
+                  # Cursor drops bot-authored trigger comments, so the summon
+                  # prefers the owner-minted token and falls back to runewright
+                  # only where no summoner token is configured.
+                  SUMMON_TOKEN: ${{ secrets.RUNEWRIGHT_GITHUB_TOKEN }}
                   # Label deletion runs on the workflow token, deliberately:
                   # its events trigger no workflows, so consuming a label can
                   # never cancel an in-flight lane through the callers'
@@ -234,7 +242,7 @@ jobs:
                   elif blocked "$LABEL_CURSOR_BLOCKED"; then
                       fail_cascade "$LABEL_CURSOR_BLOCKED is present; clear the provider problem before re-summoning."
                   else
-                      cursor_comment_id=$(gh api -X POST \
+                      cursor_comment_id=$(GH_TOKEN=${SUMMON_TOKEN:-$GH_TOKEN} gh api -X POST \
                           "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id')
                   fi
                   wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor" \
