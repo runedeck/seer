@@ -23,6 +23,8 @@ env:
     APPS_EXPECTED_SUMMONED: cursor macroscopeapp
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
     LABEL_RUNE_BLOCKED: "issue:rune"
+    LABEL_STAGE_CURSOR: "stage%3Acursor"
+    LABEL_STAGE_MACROSCOPE: "stage%3Amacroscope"
     ARTIFACT_PREFIX: runeseer-verdict-pr
     INSTRUCTION_PATTERN: '(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)'
     POLL_SECONDS: 20
@@ -128,6 +130,7 @@ jobs:
               if: steps.scope.outputs.skip == 'false'
               env:
                   GH_TOKEN: ${{ github.token }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
               run: |
                   name="${ARTIFACT_PREFIX}${{ github.event.pull_request.number }}"
                   # Pages merge through jq -s before filtering, so a
@@ -137,10 +140,12 @@ jobs:
                       --jq '[.artifacts[] | select(.expired == false)]' \
                       | jq -s -r 'add // [] | sort_by(.created_at) | last | .id // empty')
                   prev_sha=""
+                  prev_base=""
                   if [ -n "$artifact" ]; then
                       gh api "repos/${{ github.repository }}/actions/artifacts/$artifact/zip" > prev-verdict.zip \
                           && unzip -o prev-verdict.zip runeseer-verdict.json -d .previous-verdict >/dev/null \
-                          && prev_sha=$(jq -r '.sha // empty' .previous-verdict/runeseer-verdict.json) || true
+                          && prev_sha=$(jq -r '.sha // empty' .previous-verdict/runeseer-verdict.json) \
+                          && prev_base=$(jq -r '.base // empty' .previous-verdict/runeseer-verdict.json) || true
                   fi
                   # A ledger from a commit no longer in this history must not
                   # suppress re-reporting: after a rewrite, reintroduced
@@ -149,6 +154,19 @@ jobs:
                       echo "ledger sha $prev_sha is not an ancestor of HEAD; discarding the ledger"
                       rm -rf .previous-verdict
                       prev_sha=""
+                  fi
+                  # A retarget or base advance changes the effective diff
+                  # without a new head commit: the old ledger and the settled
+                  # stages both judged a different change, so both reset.
+                  if [ -n "$prev_sha" ] && [ "$prev_base" != "$BASE_SHA" ]; then
+                      echo "ledger base ${prev_base:-unknown} is not the current base; discarding the ledger and the settled stages"
+                      rm -rf .previous-verdict
+                      prev_sha=""
+                      for stage_label in $LABEL_STAGE_CURSOR $LABEL_STAGE_MACROSCOPE; do
+                          gh api -X DELETE \
+                              "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$stage_label" \
+                              >/dev/null 2>&1 || true
+                      done
                   fi
                   echo "prev_sha=${prev_sha}" >> "$GITHUB_OUTPUT"
                   echo "previous verdict: ${prev_sha:-none}"
@@ -207,7 +225,7 @@ jobs:
                       - For `disputed`, state the concrete code fact that invalidates the finding. For `already addressed`, identify where HEAD fixes it.
                       - Never re-report a finding present in the previous ledger. Do not repeat it in an inline comment or the summary.
                       - Recheck ledger findings against HEAD. Carry each still-unresolved finding into the new verdict JSON; omit it only when HEAD addresses it.
-                      - When the previous verdict SHA is an ancestor of HEAD, focus your independent review on that SHA through HEAD. Read surrounding code as needed to validate behavior.
+                      - When the previous verdict SHA is an ancestor of HEAD, this is a re-round: review ONLY the range from that SHA to HEAD. Report only defects that range introduces or fails to fix. Never report a new finding whose lines that range did not change, however real it looks; a pre-existing condition on unchanged lines is out of scope and at most a `restart` reason.
                       - Review correctness only: logic errors, broken invariants, silent failure modes, security problems, and claims the diff does not uphold.
                       - Never duplicate another lane. A judgment in the summary is adjudication, not a second report.
                       - Post inline comments only for novel runeseer findings of Medium, High, or Critical severity. Put novel Low findings only in the summary Digest.
@@ -244,12 +262,13 @@ jobs:
                       Verdict file:
                       - Write valid JSON to `runeseer-verdict.json` in the workspace root.
                       - Use exactly this schema:
-                        `{"sha":"<full HEAD sha>","verdict":"clean|findings","count":N,"findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"<judgment>"}]}`
+                        `{"sha":"<full HEAD sha>","verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"<judgment>"}]}`
                       - Include every unresolved genuine finding from any lane, including novel Low findings and unresolved findings carried from the ledger.
                       - Exclude disputed and already-addressed findings.
                       - Use `runeseer` as the lane for your own findings. Preserve the originating lane for other findings.
                       - Each `summary` is a factual title of at most 12 words.
                       - `count` must equal the findings array length. Set `verdict` to `clean` only when the array is empty; otherwise set it to `findings`.
+                      - `restart` is almost always `none`. Set `cursor` (full funnel) or `macroscope` (macroscope onward) only when the accumulated change since the earlier stages settled is structurally large or shifts risk they never saw; state the reason as one Digest bullet.
 
                       Style prohibitions:
                       - No throat-clearing, narrative framing, rhetorical questions, rhetorical conclusions, praise, or review-process narration.
@@ -260,6 +279,18 @@ jobs:
                       - Use present tense, concrete nouns, and direct causal language.
 
                       A review that posts nothing is a failed review. Even a clean review must write the verdict file and post the required summary.
+
+            # The verdict binds to the base it was judged against, so a later
+            # retarget invalidates the ledger. The lane writes this, not the
+            # model, so it is never misremembered.
+            - name: Bind verdict to base
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+              run: |
+                  [ -f runeseer-verdict.json ] || exit 0
+                  jq --arg base "$BASE_SHA" '. + {base: $base}' runeseer-verdict.json > runeseer-verdict.bound.json
+                  command mv runeseer-verdict.bound.json runeseer-verdict.json
 
             # The verdict artifact is the machine-readable record: the next
             # round's ledger, and the approval's evidence.
@@ -276,6 +307,8 @@ jobs:
             # artifact rather than comment archaeology. The live head is
             # re-fetched first and the review is pinned to the judged commit,
             # so a push racing the verdict can never collect the approval.
+            # A clean verdict that requests a restart approves nothing: the
+            # restarted stages must settle before the merge gate opens.
             - name: Approve on clean verdict
               if: steps.scope.outputs.skip == 'false'
               env:
@@ -290,6 +323,7 @@ jobs:
                   if jq -e --arg sha "$HEAD_SHA" '
                       .verdict == "clean" and .count == 0
                       and (.findings | type == "array" and length == 0)
+                      and .restart == "none"
                       and .sha == $sha' runeseer-verdict.json >/dev/null \
                       && [ "$live" = "$HEAD_SHA" ]; then
                       gh api -X POST "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews" \
@@ -315,6 +349,48 @@ jobs:
                   done
                   echo "summons consumed; a new review label starts the next round."
 
+            # The adjudicator's requested restart clears the recorded stage
+            # labels, so the next round re-runs the named stage onward. The
+            # workflow token's label events trigger nothing. The clears are
+            # verified: a stage label that survives would silently skip a
+            # stage the adjudicator wanted re-run, so this step fails loudly.
+            - name: Apply requested restart
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  [ -f runeseer-verdict.json ] || exit 0
+                  restart=$(jq -r '.restart // "none"' runeseer-verdict.json)
+                  clear_stage() {
+                      gh api -X DELETE \
+                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$1" \
+                          >/dev/null 2>&1 || true
+                      remaining=$(gh api --paginate \
+                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                          --jq '[.[].name]' | jq -s --arg label "$(printf '%s' "$1" | sed 's/%3A/:/')" \
+                          'add // [] | index($label) != null')
+                      [ "$remaining" = "false" ] \
+                          || { echo "could not clear stage label $1; the restart did not apply"; exit 1; }
+                  }
+                  case "$restart" in
+                      cursor)
+                          clear_stage "$LABEL_STAGE_CURSOR"
+                          clear_stage "$LABEL_STAGE_MACROSCOPE"
+                          echo "restart requested: the next round re-runs the full funnel."
+                          ;;
+                      macroscope)
+                          clear_stage "$LABEL_STAGE_MACROSCOPE"
+                          echo "restart requested: the next round re-runs macroscope onward."
+                          ;;
+                      none)
+                          echo "no restart requested."
+                          ;;
+                      *)
+                          echo "unrecognized restart value: $restart"
+                          exit 1
+                          ;;
+                  esac
+
             # A round that produced no verdict is a provider failure, not a
             # finding: the blocker label stops the cascade from re-summoning
             # this lane until the problem is fixed. A round that produced a
@@ -335,6 +411,7 @@ jobs:
                       (.sha | type == "string" and length > 0)
                       and (.verdict == "clean" or .verdict == "findings")
                       and (.count | type == "number")
+                      and (.restart == "none" or .restart == "cursor" or .restart == "macroscope")
                       and (.findings | type == "array")' runeseer-verdict.json >/dev/null 2>&1; then
                       gh api -X DELETE \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$encoded" \
@@ -361,11 +438,12 @@ jobs:
                   if jq -e --arg sha "$HEAD_SHA" '
                       .verdict == "clean" and .count == 0
                       and (.findings | type == "array" and length == 0)
+                      and .restart == "none"
                       and .sha == $sha' runeseer-verdict.json >/dev/null; then
                       exit 0
                   fi
-                  echo "the verdict is not an explicit clean for this head; the check stays red."
-                  jq -c '{verdict, count, sha}' runeseer-verdict.json || true
+                  echo "the verdict is not an explicit no-restart clean for this head; the check stays red."
+                  jq -c '{verdict, count, sha, restart}' runeseer-verdict.json || true
                   exit 1
 
             # Metrics: cost, turns, and finding counts land in the job
