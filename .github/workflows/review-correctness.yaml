@@ -320,8 +320,10 @@ jobs:
             # this lane until the problem is fixed. A round that produced a
             # verdict clears the blocker. The workflow token's label events
             # trigger nothing, so neither write re-enters the cascade.
+            # A cancelled round (superseded by a push or fresh summon) is not
+            # a provider failure and must not trip the breaker.
             - name: Provider circuit breaker
-              if: always() && steps.scope.outputs.skip == 'false'
+              if: always() && !cancelled() && steps.scope.outputs.skip == 'false'
               continue-on-error: true
               env:
                   GH_TOKEN: ${{ github.token }}
