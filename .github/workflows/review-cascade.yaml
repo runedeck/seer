@@ -74,18 +74,22 @@ jobs:
                   # prefers the owner-minted token and falls back to runewright
                   # only where no summoner token is configured.
                   SUMMON_TOKEN: ${{ secrets.RUNEWRIGHT_GITHUB_TOKEN }}
-                  # Label deletion runs on the workflow token, deliberately:
-                  # its events trigger no workflows, so consuming a label can
-                  # never cancel an in-flight lane through the callers'
-                  # unlabeled handling.
+                  # Reads ride the workflow token; label writes ride
+                  # runewright, because the callers' grants stop at issues and
+                  # pull-request label writes 403 under the workflow token.
                   CALLER_TOKEN: ${{ github.token }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
               run: |
+                  # Label writes ride runewright: the workflow token's caller
+                  # grants stop at issues, and pull-request label writes 403
+                  # under it. Runewright's removals emit unlabeled events no
+                  # caller listens to, and its stage and blocker adds fail the
+                  # cascade and correctness guards, so nothing re-enters.
                   consume_entry_label() {
-                      GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
+                      gh api -X DELETE \
                           "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" >/dev/null 2>&1 || true
                   }
 
@@ -178,15 +182,15 @@ jobs:
                           || gh api -X POST "repos/$REPO/labels" \
                               -f name="$1" -f color="$LABEL_COLOR" \
                               -f description="Review provider requires intervention" >/dev/null
-                      # The workflow token emits no label event, so this blocker
-                      # cannot re-enter or relaunch the cascade that created it.
-                      GH_TOKEN=$CALLER_TOKEN gh api -X POST \
+                      # An issue: label event fails every lane guard, so this
+                      # blocker cannot re-enter or relaunch a cascade.
+                      gh api -X POST \
                           "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
                   }
 
                   clear_label() {
                       encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
-                      GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
+                      gh api -X DELETE \
                           "repos/$REPO/issues/$PR/labels/$encoded" >/dev/null 2>&1 || true
                   }
 
@@ -241,17 +245,17 @@ jobs:
 
                   # Stage labels record settled stages across pushes: fix
                   # rounds return straight to the adjudicator instead of
-                  # respending the whole funnel. The workflow token writes
-                  # them, so no cascade re-enters. Runeseer clears them when a
-                  # delta warrants a fresh pass, and the owner clears them to
-                  # force one.
+                  # respending the whole funnel. A stage: label event fails
+                  # every lane guard, so marking one re-enters nothing.
+                  # Runeseer clears them when a delta warrants a fresh pass,
+                  # and the owner clears them to force one.
                   mark_stage() {
                       encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
                       gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1 \
                           || gh api -X POST "repos/$REPO/labels" \
                               -f name="$1" -f color="0e8a16" \
                               -f description="Stage settled clean; remove to re-run it" >/dev/null
-                      GH_TOKEN=$CALLER_TOKEN gh api -X POST \
+                      gh api -X POST \
                           "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
                   }
 
