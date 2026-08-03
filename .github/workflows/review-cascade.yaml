@@ -135,7 +135,7 @@ jobs:
                       runs=$(latest_runs "$1")
                       jq -r '[.[]
                           | select(.status == "completed")
-                          | select(.conclusion as $conclusion | ["failure", "cancelled", "timed_out", "action_required", "stale"] | index($conclusion))
+                          | select(.conclusion as $conclusion | ["failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"] | index($conclusion))
                           | .html_url] | first // empty' <<<"$runs"
                   }
 
@@ -148,14 +148,14 @@ jobs:
                   terminal_comment_after() {
                       comments=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate \
                           "repos/$REPO/issues/$PR/comments?per_page=100" \
-                          --jq "[.[] | select(.id > $1) | select(.user.login == \"$2\") | select(.body | test(\"couldn.t run|usage limit|billing|quota|credit limit|rate limit\"; \"i\")) | .html_url]" \
+                          --jq "[.[] | select(.id > $1) | select(.user.login == \"$2\") | select(.body | test(\"couldn.t run|unable to run|failed to run|usage or spend limit|hit a usage\"; \"i\")) | .html_url]" \
                           | jq -s 'add // []')
                       jq -r 'first // empty' <<<"$comments"
                   }
 
                   blocked() {
-                      GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/issues/$PR/labels" \
-                          --jq "[.[].name] | index(\"$1\") != null" | grep -qx true
+                      GH_TOKEN=$CALLER_TOKEN gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
+                          --jq "[.[].name]" | jq -s "add // [] | index(\"$1\") != null" | grep -qx true
                   }
 
                   mark_blocked() {
@@ -178,7 +178,9 @@ jobs:
 
                   wait_clean() {
                       app=$1; bot=$2; stage=$3; comment_after=${4:-0}; rest_bot=${5:-}; blocker=${6:-}; summon_label=${7:-}
+                      round=0
                       for _ in $(seq 1 "$POLL_ROUNDS"); do
+                          round=$((round + 1))
                           if settled "$app"; then
                               [ -z "$blocker" ] || clear_label "$blocker"
                               head_still
@@ -186,7 +188,11 @@ jobs:
                               [ "$open" = "0" ] && { echo "$stage settled clean"; return 0; }
                               fail_cascade "$stage holds $open unresolved findings; the funnel stops here."
                           fi
-                          failure_url=$(failed_check "$app")
+                          # A fresh summon needs a few rounds to register its new
+                          # check run; until then a leftover failed run from the
+                          # previous attempt must not trip the breaker.
+                          failure_url=""
+                          [ "$round" -gt 3 ] && failure_url=$(failed_check "$app")
                           if [ -n "$failure_url" ]; then
                               head_still
                               open=$(unresolved_by "$bot")

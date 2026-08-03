@@ -327,7 +327,13 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   encoded=$(printf '%s' "$LABEL_RUNE_BLOCKED" | sed 's/:/%3A/')
-                  if [ -f runeseer-verdict.json ]; then
+                  # Only a schema-complete verdict proves the provider worked;
+                  # a partial file from a mid-review crash keeps the blocker.
+                  if [ -f runeseer-verdict.json ] && jq -e '
+                      (.sha | type == "string" and length > 0)
+                      and (.verdict == "clean" or .verdict == "findings")
+                      and (.count | type == "number")
+                      and (.findings | type == "array")' runeseer-verdict.json >/dev/null 2>&1; then
                       gh api -X DELETE \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$encoded" \
                           >/dev/null 2>&1 || true

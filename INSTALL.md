@@ -6,7 +6,7 @@ Seer needs no build and no deploy of its own; installing it means giving the org
 
 OBJECTIVE: every repository with lane callers can summon a full funnel round.
 
-DONE WHEN: applying the bare `review` label on a ready pull request in a caller repository runs `cascade / walk` green through all three stages, and an unlabeled push summons nothing.
+DONE WHEN: applying the bare `review` label on a ready pull request in a caller repository runs the cascade check green through all three stages, and an unlabeled push summons nothing.
 
 TODO:
 
