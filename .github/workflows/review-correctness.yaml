@@ -258,6 +258,8 @@ jobs:
                         `- `<path:line>`: <defect and consequence, one sentence, at most 25 words.>`
                       - If there are no novel Low findings, write `- None.`
                       - Do not repeat other-lane or ledger findings in Digest.
+                      - When the verdict carries open findings from the ledger, add a blank line, then `#### Carried`, then one bullet per carried finding:
+                        `- `<path:line>`: <its summary title>` — so every finding behind the count is visible in the summary. Omit the section when nothing is carried.
 
                       Verdict file:
                       - Write valid JSON to `runeseer-verdict.json` in the workspace root.
