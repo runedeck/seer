@@ -24,7 +24,7 @@ on:
                 required: true
             RUNEWRIGHT_APP_KEY:
                 required: true
-            # Cursor ignores bot-authored trigger comments, so the summon
+            # Cursor ignores bot-authored trigger comments, so the request
             # rides an owner-minted fine-grained token when one is provided.
             RUNEWRIGHT_GITHUB_TOKEN:
                 required: false
@@ -62,18 +62,36 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 45
         steps:
+            # A queued run keeps its event payload after the labels moved on,
+            # so the live labels decide whether the requested round still stands; a
+            # consumed review label stops the cascade without a failure.
+            - id: live
+              name: Verify the review label is live
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  labels=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
+                  if printf '%s\n' "$labels" | grep -qx review; then
+                      echo "live=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "live=false" >> "$GITHUB_OUTPUT"
+                      echo "no live review label on this pull request; the cascade stands down."
+                  fi
+
             - id: runewright
+              if: steps.live.outputs.live == 'true'
               uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
               with:
                   app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
                   private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
 
             - name: Run the review cascade
+              if: steps.live.outputs.live == 'true'
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
-                  # Cursor drops bot-authored trigger comments, so the summon
+                  # Cursor drops bot-authored trigger comments, so the request
                   # prefers the owner-minted token and falls back to runewright
-                  # only where no summoner token is configured.
+                  # only where no owner-minted token is configured.
                   SUMMON_TOKEN: ${{ secrets.RUNEWRIGHT_GITHUB_TOKEN }}
                   # Reads ride the workflow token; label writes ride
                   # runewright, because the callers' grants stop at issues and
@@ -207,7 +225,7 @@ jobs:
                               [ "$open" = "0" ] && { echo "$stage settled clean"; return 0; }
                               fail_cascade "$stage holds $open unresolved findings; the funnel stops here."
                           fi
-                          # A fresh summon needs a few rounds to register its new
+                          # A freshly applied review label needs a few rounds to register its new
                           # check run; until then a leftover failed run from the
                           # previous attempt must not trip the breaker.
                           failure_url=""
@@ -278,7 +296,7 @@ jobs:
                   else
                       cursor_comment_id=0
                       if settled "$APP_CURSOR"; then
-                          echo "cursor already settled on this head; skipping the summon."
+                          echo "cursor already settled on this head; not asking it again."
                       elif blocked "$LABEL_CURSOR_BLOCKED"; then
                           fail_cascade "$LABEL_CURSOR_BLOCKED is present; clear the provider problem before re-summoning."
                       else
