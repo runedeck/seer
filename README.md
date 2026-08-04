@@ -10,7 +10,7 @@ Seer is the review machinery behind two GitHub Apps: **runeseer**, the reviewing
 | -------------------- | ------------------------------- | ------------------------------------------------------------------------- |
 | `review-cascade`     | bare `review` label             | Runs the cascade: `@cursor review`, cursor settles, `review:macroscope`,   |
 |                      |                                 | settles clean, `review:runeseer`. Findings and moved heads stop it.        |
-|                      |                                 | Provider failures set a persistent lane blocker and stop re-summons.       |
+|                      |                                 | Provider failures set a persistent lane blocker and stop repeat requests.  |
 | `review-correctness` | `review:runeseer` label         | Adjudicates the free lanes' findings, reviews the diff, records a          |
 |                      |                                 | machine-readable verdict, earns the approval on an explicit clean          |
 |                      |                                 | verdict for the live head, and consumes the review labels.                 |

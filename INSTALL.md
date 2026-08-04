@@ -36,7 +36,7 @@ Dashboard state cannot be scripted; follow the guide named above and verify with
 
 ## Operating constraints
 
-- `claude-code-action` refuses `track_progress` on labeled events, and labels are the standard summon: the flag is gated with `github.event.action != 'labeled'` so progress tracking runs everywhere the action supports it.
+- `claude-code-action` refuses `track_progress` on labeled events, and labels are the standard review request: the flag is gated with `github.event.action != 'labeled'` so progress tracking runs everywhere the action supports it.
 - The hosted runner's `gh` predates `--slurp`: paginate with per-page `--jq` arrays merged through `jq -s 'add'`.
 - Round end consumes the review labels, and a failed round consumes them too. To re-summon: convert the pull request to draft, apply the label (the draft guard skips the run, so the label survives), then mark ready, which fires the review under an action every input accepts.
 - Never push after a clean verdict: stale-review dismissal removes the earned approval on any push, so documentation follow-ups ride the next pull request.
