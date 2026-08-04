@@ -263,8 +263,9 @@ jobs:
                       - Write valid JSON to `runeseer-verdict.json` in the workspace root.
                       - Use exactly this schema:
                         `{"sha":"<full HEAD sha>","verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"<judgment>"}]}`
-                      - Include every unresolved genuine finding from any lane, including novel Low findings and unresolved findings carried from the ledger.
-                      - Exclude disputed and already-addressed findings.
+                      - Include every open genuine finding from any lane, including novel Low findings and open findings carried from the ledger.
+                      - A finding is open only while the defect is still present at HEAD. Your Lane judgment decides: `confirmed` findings are open; `disputed` and `already addressed` findings are not, even when their review threads are still unresolved on GitHub, and a ledger entry whose defect the current HEAD fixes is not open either.
+                      - When every lane finding is disputed or already addressed and no novel finding remains, the array is empty, `count` is 0, and the summary first line reads `review/correctness: clean @SHA`.
                       - Use `runeseer` as the lane for your own findings. Preserve the originating lane for other findings.
                       - Each `summary` is a factual title of at most 12 words.
                       - `count` must equal the findings array length. Set `verdict` to `clean` only when the array is empty; otherwise set it to `findings`.
