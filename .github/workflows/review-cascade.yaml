@@ -61,13 +61,31 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 45
         steps:
+            # A queued run keeps its event payload after the labels moved on,
+            # so the live labels decide whether the summon still stands; a
+            # consumed summon stands the walk down without a failure.
+            - id: live
+              name: Verify the summon is live
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  labels=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
+                  if printf '%s\n' "$labels" | grep -qx review; then
+                      echo "live=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "live=false" >> "$GITHUB_OUTPUT"
+                      echo "no live review summon on this pull request; the cascade stands down."
+                  fi
+
             - id: runewright
+              if: steps.live.outputs.live == 'true'
               uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
               with:
                   app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
                   private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
 
             - name: Run the review cascade
+              if: steps.live.outputs.live == 'true'
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
                   # Cursor drops bot-authored trigger comments, so the summon
