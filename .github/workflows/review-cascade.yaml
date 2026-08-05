@@ -41,7 +41,15 @@ env:
     LABEL_RUNESEER: "review:runeseer"
     LABEL_STAGE_CURSOR: "stage:cursor"
     LABEL_STAGE_MACROSCOPE: "stage:macroscope"
-    LABEL_WAIVER: "review:skip"
+    # Two owner overrides per lane, and the difference is what survives.
+    # skip: the lane never runs, so no finding is ever produced. ignore: the
+    # lane runs and reports in full, and its findings stay on the pull
+    # request as a record while losing their power to hold the merge.
+    LABEL_SKIP_CURSOR: "skip:cursor"
+    LABEL_SKIP_MACROSCOPE: "skip:macroscope"
+    LABEL_SKIP_RUNESEER: "skip:runeseer"
+    LABEL_IGNORE_CURSOR: "ignore:cursor"
+    LABEL_IGNORE_MACROSCOPE: "ignore:macroscope"
     LABEL_COLOR: "5319e7"
     LABEL_DESCRIPTION: Summons this review lane
     APP_CURSOR: cursor
@@ -213,8 +221,16 @@ jobs:
                           "repos/$REPO/issues/$PR/labels/$encoded" >/dev/null 2>&1 || true
                   }
 
+                  # An ignored lane reports in full; only its power to stop the
+                  # funnel is withdrawn. A terminal provider failure still
+                  # fails: that is a broken lane, not a judged one, and skip:
+                  # is the override for a lane that should not run at all.
                   wait_clean() {
-                      app=$1; bot=$2; stage=$3; comment_after=${4:-0}; rest_bot=${5:-}; blocker=${6:-}; summon_label=${7:-}; poll_rounds=$8
+                      app=$1; bot=$2; stage=$3; comment_after=${4:-0}; rest_bot=${5:-}; blocker=${6:-}; summon_label=${7:-}; poll_rounds=$8; ignore_label=${9:-}
+                      ignored=false
+                      if [ -n "$ignore_label" ] && blocked "$ignore_label"; then
+                          ignored=true
+                      fi
                       round=0
                       for _ in $(seq 1 "$poll_rounds"); do
                           round=$((round + 1))
@@ -223,6 +239,10 @@ jobs:
                               head_still
                               open=$(unresolved_by "$bot")
                               [ "$open" = "0" ] && { echo "$stage settled clean"; return 0; }
+                              [ "$ignored" = "true" ] && {
+                                  echo "$ignore_label present; $stage holds $open unresolved findings that no longer hold the funnel."
+                                  return 0
+                              }
                               fail_cascade "$stage holds $open unresolved findings; the funnel stops here."
                           fi
                           # A freshly applied review label needs a few rounds to register its new
@@ -233,7 +253,7 @@ jobs:
                           if [ -n "$failure_url" ]; then
                               head_still
                               open=$(unresolved_by "$bot")
-                              if [ "$open" != "0" ]; then
+                              if [ "$open" != "0" ] && [ "$ignored" != "true" ]; then
                                   fail_cascade "$stage holds $open unresolved findings; the funnel stops here."
                               fi
                               [ -z "$summon_label" ] || clear_label "$summon_label"
@@ -250,6 +270,10 @@ jobs:
                           fi
                           sleep "$POLL_SECONDS"
                       done
+                      [ "$ignored" = "true" ] && {
+                          echo "$ignore_label present; $stage did not settle within the poll budget and no longer holds the funnel."
+                          return 0
+                      }
                       fail_cascade "$stage did not settle within the poll budget; the funnel stops here."
                   }
 
@@ -283,15 +307,21 @@ jobs:
                   # respending the provider.
                   verify_stage_threads() {
                       open=$(unresolved_by "$1")
-                      [ "$open" = "0" ] \
-                          || fail_cascade "$2 holds $open unresolved findings; resolve them before the funnel continues."
+                      [ "$open" = "0" ] && return 0
+                      if [ -n "${3:-}" ] && blocked "$3"; then
+                          echo "$3 present; $2 holds $open unresolved findings that no longer hold the funnel."
+                          return 0
+                      fi
+                      fail_cascade "$2 holds $open unresolved findings; resolve them before the funnel continues."
                   }
 
                   # GraphQL bot logins are bare (cursor, macroscopeapp); REST
                   # issue-comment logins carry the [bot] suffix.
                   echo "stage 1: cursor"
-                  if blocked "$LABEL_STAGE_CURSOR"; then
-                      verify_stage_threads "$BOT_CURSOR" "cursor"
+                  if blocked "$LABEL_SKIP_CURSOR"; then
+                      echo "$LABEL_SKIP_CURSOR present; the cursor stage never runs."
+                  elif blocked "$LABEL_STAGE_CURSOR"; then
+                      verify_stage_threads "$BOT_CURSOR" "cursor" "$LABEL_IGNORE_CURSOR"
                       echo "cursor stage already settled; not re-summoned."
                   else
                       cursor_comment_id=0
@@ -310,20 +340,19 @@ jobs:
                                   "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id')
                       fi
                       wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor" \
-                          "$cursor_comment_id" "$REST_BOT_CURSOR" "$LABEL_CURSOR_BLOCKED" "" "$POLL_ROUNDS_CURSOR"
+                          "$cursor_comment_id" "$REST_BOT_CURSOR" "$LABEL_CURSOR_BLOCKED" "" "$POLL_ROUNDS_CURSOR" \
+                          "$LABEL_IGNORE_CURSOR"
                       mark_stage "$LABEL_STAGE_CURSOR"
                   fi
 
                   echo "stage 2: macroscope"
                   head_still
-                  # The waiver skips only this stage: the adjudicating lane
-                  # still judges the head, so the required verdict mirror can
-                  # clear without a macroscope round.
-                  if GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/issues/$PR/labels" \
-                      --jq '[.[].name]' | jq -e --arg waiver "$LABEL_WAIVER" 'index($waiver)' >/dev/null; then
-                      echo "$LABEL_WAIVER present; the macroscope stage is waived."
+                  # Skipping this stage leaves the adjudicating lane judging the
+                  # head, so the required verdict mirror can still clear.
+                  if blocked "$LABEL_SKIP_MACROSCOPE"; then
+                      echo "$LABEL_SKIP_MACROSCOPE present; the macroscope stage never runs."
                   elif blocked "$LABEL_STAGE_MACROSCOPE"; then
-                      verify_stage_threads "$BOT_MACROSCOPE" "macroscope"
+                      verify_stage_threads "$BOT_MACROSCOPE" "macroscope" "$LABEL_IGNORE_MACROSCOPE"
                       echo "macroscope stage already settled; not re-summoned."
                   else
                       macroscope_comment_id=$(latest_comment_id)
@@ -334,7 +363,8 @@ jobs:
                           ensure_label "$LABEL_MACROSCOPE"
                       fi
                       wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope" \
-                          "$macroscope_comment_id" "$REST_BOT_MACROSCOPE" "$LABEL_MACROSCOPE_BLOCKED" "$LABEL_MACROSCOPE" "$POLL_ROUNDS_MACROSCOPE"
+                          "$macroscope_comment_id" "$REST_BOT_MACROSCOPE" "$LABEL_MACROSCOPE_BLOCKED" "$LABEL_MACROSCOPE" "$POLL_ROUNDS_MACROSCOPE" \
+                          "$LABEL_IGNORE_MACROSCOPE"
                       mark_stage "$LABEL_STAGE_MACROSCOPE"
                   fi
 
@@ -349,6 +379,14 @@ jobs:
 
                   echo "stage 3: runeseer"
                   head_still
+                  # The lane's own guard stands it down on skip:runeseer, so
+                  # summoning it would only spend a round to reach the same
+                  # place. ignore:runeseer still summons: its judgment is
+                  # wanted on the record, just not as a gate.
+                  if blocked "$LABEL_SKIP_RUNESEER"; then
+                      echo "$LABEL_SKIP_RUNESEER present; the correctness lane is not summoned."
+                      exit 0
+                  fi
                   if blocked "$LABEL_RUNE_BLOCKED"; then
                       fail_cascade "$LABEL_RUNE_BLOCKED is present; clear the provider problem before re-summoning."
                   fi
