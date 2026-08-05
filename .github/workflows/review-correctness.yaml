@@ -95,7 +95,7 @@ jobs:
                   fi
 
             # The cascade summons this lane only after the free lanes settle,
-            # so this wait is a short guard for direct summons, not the
+            # so this wait is a short guard for directly requested rounds, not the
             # funnel's ordering mechanism.
             - name: Wait for the other lanes
               if: steps.scope.outputs.skip == 'false'
@@ -170,6 +170,17 @@ jobs:
                   fi
                   echo "prev_sha=${prev_sha}" >> "$GITHUB_OUTPUT"
                   echo "previous verdict: ${prev_sha:-none}"
+                  # Each earlier round left one summary comment. Past the
+                  # settled round count the lane stops opening new low-stakes
+                  # findings, so a pull request cannot be held open by an
+                  # endless supply of fresh nitpicks.
+                  set -o pipefail
+                  rounds=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
+                      --jq '[.[] | select(.user.login == "runeseer[bot]") | select(.body | startswith("review/correctness:"))] | length' \
+                      | jq -s 'add // 0') \
+                      || { echo "could not count earlier rounds; treating this as the first"; rounds=0; }
+                  echo "rounds=${rounds}" >> "$GITHUB_OUTPUT"
+                  echo "earlier rounds on this pull request: ${rounds}"
 
             # Only the lane bots' own words reach the model: any other
             # commenter's text is a prompt-injection vector into the
@@ -204,7 +215,7 @@ jobs:
                   github_token: ${{ steps.runeseer.outputs.token }}
                   allowed_bots: "runewright"
                   # The progress comment runs wherever the action supports
-                  # it; only labeled events, the standard summon, refuse the
+                  # it; only labeled events, the review label, refuse the
                   # flag. The adjudicator runs on opus: the judging layer of
                   # the review cascade gets the strongest reviewer.
                   track_progress: ${{ github.event.action != 'labeled' }}
@@ -219,6 +230,13 @@ jobs:
                       - `.lane/issue-comments.json` contains issue-comment findings from those lanes.
                       - `.previous-verdict/runeseer-verdict.json` may contain the previous-round ledger.
                       - The previous verdict SHA is `${{ steps.ledger.outputs.prev_sha }}`.
+                      - This pull request has already had `${{ steps.ledger.outputs.rounds }}` correctness rounds.
+
+                      Convergence rule, binding:
+                      - From the third round onward, open no new finding below High severity. Judge the other lanes' findings and recheck the ledger as usual, but a fresh nitpick of your own at that point holds the pull request open for no gain, and the author has already answered everything you raised.
+                      - Report a novel High or Critical finding at any round: real defects always earn a report.
+                      - A judgment you already made stands. Do not reverse an earlier round's accepted resolution because you now prefer a different trade-off; if an earlier decision looks wrong, say so once in the Digest as a note and leave the verdict clean.
+                      - Never demand the opposite of what an earlier round demanded on the same code.
 
                       Review procedure:
                       - Judge every non-ledger finding from the other lanes against HEAD as `confirmed`, `disputed`, or `already addressed`.
@@ -264,11 +282,15 @@ jobs:
                       Verdict file:
                       - Write valid JSON to `runeseer-verdict.json` in the workspace root.
                       - Use exactly this schema:
-                        `{"sha":"<full HEAD sha>","verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"<judgment>"}]}`
+                        `{"sha":"<full HEAD sha>","verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"<judgment>","comment_id":<optional originating comment database id>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"confirmed|disputed|already addressed","reason":"<judgment sentence>","comment_id":<optional originating comment database id>}]}`
                       - Include every open genuine finding from any lane, including novel Low findings and open findings carried from the ledger.
                       - A finding is open only while the defect is still present at HEAD. Your Lane judgment decides: `confirmed` findings are open; `disputed` and `already addressed` findings are not, even when their review threads are still unresolved on GitHub, and a ledger entry whose defect the current HEAD fixes is not open either.
                       - When every lane finding is disputed or already addressed and no novel finding remains, the array is empty, `count` is 0, and the summary first line reads `review/correctness: clean @SHA`.
                       - Use `runeseer` as the lane for your own findings. Preserve the originating lane for other findings.
+                      - Include every other-lane judgment in `lane_judgments`, including rechecked ledger findings and judgments excluded from `findings`.
+                      - For non-ledger judgments, set `reason` to the same sentence used in the summary comment. For ledger judgments, write the same kind of short factual sentence.
+                      - Copy `comment_id` from the originating entry's `id` in `.lane/inline-comments.json` or `.lane/issue-comments.json`. Omit it only when no originating comment exists.
+                      - Preserve `comment_id` on carried ledger findings when it exists.
                       - Each `summary` is a factual title of at most 12 words.
                       - `count` must equal the findings array length. Set `verdict` to `clean` only when the array is empty; otherwise set it to `findings`.
                       - `restart` is almost always `none`. Set `cursor` (full funnel) or `macroscope` (macroscope onward) only when the accumulated change since the earlier stages settled is structurally large or shifts risk they never saw; state the reason as one Digest bullet.
@@ -294,6 +316,142 @@ jobs:
                   [ -f runeseer-verdict.json ] || exit 0
                   jq --arg base "$BASE_SHA" '. + {base: $base}' runeseer-verdict.json > runeseer-verdict.bound.json
                   command mv runeseer-verdict.bound.json runeseer-verdict.json
+
+            # Other-lane judgments close threads that no longer represent
+            # defects. Confirmed findings stay open for the owner's decision.
+            - name: Apply lane judgments
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  GH_TOKEN: ${{ steps.runeseer.outputs.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+              run: |
+                  set -o pipefail
+                  [ -f runeseer-verdict.json ] || { echo "no verdict file; no lane judgments to apply"; exit 0; }
+                  if ! jq -e '.lane_judgments | type == "array"' runeseer-verdict.json >/dev/null; then
+                      echo "verdict file has no lane_judgments array; review threads remain unchanged"
+                      exit 0
+                  fi
+
+                  thread_query='query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
+                      repository(owner: $owner, name: $repo) {
+                          pullRequest(number: $number) {
+                              reviewThreads(first: 100, after: $endCursor) {
+                                  pageInfo { hasNextPage endCursor }
+                                  nodes {
+                                      id
+                                      isResolved
+                                      path
+                                      line
+                                      originalLine
+                                      comments(first: 1) { nodes { databaseId } }
+                                  }
+                              }
+                          }
+                      }
+                  }'
+                  thread_query_failed=false
+                  if ! threads=$(gh api graphql --paginate -f query="$thread_query" \
+                      -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" \
+                      --jq '[.data.repository.pullRequest.reviewThreads.nodes[]]' \
+                      | jq -s 'add // []'); then
+                      echo "could not query review threads; the runeseer app token may lack pull-request read scope"
+                      threads='[]'
+                      thread_query_failed=true
+                  fi
+
+                  jq -c '.lane_judgments[] | select(.judgment == "disputed" or .judgment == "already addressed")' \
+                      runeseer-verdict.json | while IFS= read -r judgment; do
+                      path=$(jq -r '.path' <<<"$judgment")
+                      line=$(jq -r '.line' <<<"$judgment")
+                      reason=$(jq -r '.reason' <<<"$judgment")
+                      comment_id=$(jq -r '.comment_id // empty' <<<"$judgment")
+                      if [ "$thread_query_failed" = "true" ]; then
+                          echo "could not resolve review thread for $path:$line because the thread query failed"
+                          continue
+                      fi
+                      if [ -z "$comment_id" ]; then
+                          echo "no originating inline comment id for $path:$line; leaving review threads unchanged"
+                          continue
+                      fi
+                      thread=$(jq -c --arg comment_id "$comment_id" '
+                          [.[] | select(
+                              ((.comments.nodes[0].databaseId // "") | tostring) == $comment_id
+                          )] | sort_by(.isResolved) | first // empty' <<<"$threads")
+                      if [ -z "$thread" ]; then
+                          echo "no review thread matched $path:$line${comment_id:+ (comment $comment_id)}"
+                          continue
+                      fi
+                      if [ "$(jq -r '.isResolved' <<<"$thread")" = "true" ]; then
+                          echo "review thread for $path:$line is already resolved; skipping"
+                          continue
+                      fi
+
+                      first_comment_id=$(jq -r '.comments.nodes[0].databaseId // empty' <<<"$thread")
+                      thread_id=$(jq -r '.id' <<<"$thread")
+                      if [ -z "$first_comment_id" ]; then
+                          echo "review thread for $path:$line has no reply target; leaving it unresolved"
+                          continue
+                      fi
+                      if ! reply_error=$(gh api -X POST \
+                          "repos/$REPO/pulls/$PR/comments/$first_comment_id/replies" \
+                          -f body="$reason" 2>&1); then
+                          echo "could not reply to review thread for $path:$line; leaving it unresolved: $reply_error"
+                          continue
+                      fi
+                      if ! resolution=$(gh api graphql \
+                          -f query='mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } } }' \
+                          -f threadId="$thread_id" 2>&1); then
+                          echo "could not resolve review thread for $path:$line; the runeseer app token may lack pull-request write scope: $resolution"
+                          continue
+                      fi
+                      if [ "$(jq -r '.data.resolveReviewThread.thread.isResolved // false' <<<"$resolution")" != "true" ]; then
+                          echo "resolveReviewThread did not resolve $path:$line: $resolution"
+                          continue
+                      fi
+                      echo "resolved review thread for $path:$line after posting its judgment"
+                  done
+
+                  confirmed=$(jq -c '[.lane_judgments[] | select(.judgment == "confirmed")]' runeseer-verdict.json)
+                  [ "$(jq 'length' <<<"$confirmed")" = "0" ] && exit 0
+                  if ! prior_escalations=$(gh api --paginate \
+                      "repos/$REPO/issues/$PR/comments?per_page=100" \
+                      --jq '[.[] | select(.user.login == "runeseer[bot]") | .body]' \
+                      | jq -s 'add // []'); then
+                      echo "could not query prior owner escalations; skipping this escalation to prevent duplicate requests"
+                      exit 0
+                  fi
+                  # An originating comment id is the only identity that both
+                  # survives a reword and separates two findings, so it alone
+                  # carries the dedup marker. A finding without one has no such
+                  # identity: it escalates every round rather than borrowing a
+                  # key that would silently drop it. The schema asks for the id
+                  # on every lane finding, which keeps this path rare.
+                  confirmed=$(jq -c --argjson prior "$prior_escalations" '
+                      def escalation_key:
+                          if .comment_id then ({lane, comment_id} | @base64) else null end;
+                      map(. + {escalation_key: escalation_key})
+                      | map(select(
+                          .escalation_key as $key
+                          | $key == null
+                          or ($prior | any(.[]; contains("<!-- runeseer-escalation:\($key) -->")) | not)
+                      ))' <<<"$confirmed")
+                  [ "$(jq 'length' <<<"$confirmed")" = "0" ] && {
+                      echo "all confirmed findings were already escalated"
+                      exit 0
+                  }
+                  escalation=$(jq -r '
+                      ["@N4M3Z, these confirmed findings need a human decision:", ""]
+                      + (map("- `\(.path):\(.line)`: \(.summary)"
+                          + (if .escalation_key then "\n<!-- runeseer-escalation:\(.escalation_key) -->" else "" end)))
+                      + ["", "Please decide whether each finding should be fixed or accepted."]
+                      | join("\n")' <<<"$confirmed")
+                  if ! escalation_error=$(gh api -X POST "repos/$REPO/issues/$PR/comments" \
+                      -f body="$escalation" 2>&1); then
+                      echo "could not post the confirmed-finding escalation; the runeseer app token may lack issue-comment write scope: $escalation_error"
+                  else
+                      echo "posted one owner escalation for newly confirmed findings"
+                  fi
 
             # The verdict artifact is the machine-readable record: the next
             # round's ledger, and the approval's evidence.
@@ -335,11 +493,11 @@ jobs:
                           -f body="Earned approval: review/correctness returned a clean verdict for ${HEAD_SHA}. Dismissed automatically on any new push."
                   fi
 
-            # A summon is one round, even a round the scope stood down:
+            # A review label requests one round, even when the scope stands down:
             # consuming the labels stops a later push from re-running the
             # paid lane out of funnel order. The next round starts with a
             # fresh review label.
-            - name: Consume the summons
+            - name: Consume the review labels
               if: always()
               continue-on-error: true
               env:
@@ -350,7 +508,7 @@ jobs:
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$label" \
                           >/dev/null 2>&1 || true
                   done
-                  echo "summons consumed; a new review label starts the next round."
+                  echo "review labels consumed; a new review label starts the next round."
 
             # The adjudicator's requested restart clears the recorded stage
             # labels, so the next round re-runs the named stage onward. The
@@ -399,7 +557,7 @@ jobs:
             # this lane until the problem is fixed. A round that produced a
             # verdict clears the blocker. The workflow token's label events
             # trigger nothing, so neither write re-enters the cascade.
-            # A cancelled round (superseded by a push or fresh summon) is not
+            # A cancelled round (superseded by a push or new review label) is not
             # a provider failure and must not trip the breaker.
             - name: Provider circuit breaker
               if: always() && !cancelled() && steps.scope.outputs.skip == 'false'
@@ -415,7 +573,8 @@ jobs:
                       and (.verdict == "clean" or .verdict == "findings")
                       and (.count | type == "number")
                       and (.restart == "none" or .restart == "cursor" or .restart == "macroscope")
-                      and (.findings | type == "array")' runeseer-verdict.json >/dev/null 2>&1; then
+                      and (.findings | type == "array")
+                      and (.lane_judgments | type == "array")' runeseer-verdict.json >/dev/null 2>&1; then
                       gh api -X DELETE \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$encoded" \
                           >/dev/null 2>&1 || true
