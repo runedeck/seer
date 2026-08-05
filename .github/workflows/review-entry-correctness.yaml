@@ -59,6 +59,7 @@ jobs:
     review:
         needs: release
         if: '!cancelled() && github.event.pull_request.draft == false && ((github.event.action == ''labeled'' && github.event.label.name == ''review:runeseer'') || (github.event.action == ''ready_for_review'' && needs.release.outputs.summoned == ''true''))'
+        # A pull request must not modify the reviewer that judges the same head.
         uses: runedeck/seer/.github/workflows/review-correctness.yaml@main
         secrets:
             RUNESEER_APP_ID: ${{ secrets.RUNESEER_APP_ID }}
