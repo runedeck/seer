@@ -325,7 +325,6 @@ jobs:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
-                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   set -o pipefail
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; no lane judgments to apply"; exit 0; }
@@ -422,20 +421,20 @@ jobs:
                       echo "could not query prior owner escalations; skipping this escalation to prevent duplicate requests"
                       exit 0
                   fi
-                  # Every key component outlives a round. A finding with an
-                  # originating comment keys on that comment. One without keys
-                  # on the head instead of on model-authored text, so all such
-                  # findings ride in a single escalation per head: rewording
-                  # cannot re-ping the owner, and none is dropped as a duplicate.
-                  confirmed=$(jq -c --argjson prior "$prior_escalations" --arg head "$HEAD_SHA" '
+                  # An originating comment id is the only identity that both
+                  # survives a reword and separates two findings, so it alone
+                  # carries the dedup marker. A finding without one has no such
+                  # identity: it escalates every round rather than borrowing a
+                  # key that would silently drop it. The schema asks for the id
+                  # on every lane finding, which keeps this path rare.
+                  confirmed=$(jq -c --argjson prior "$prior_escalations" '
                       def escalation_key:
-                          if .comment_id then {lane, comment_id} else {head: $head} end
-                          | @base64;
+                          if .comment_id then ({lane, comment_id} | @base64) else null end;
                       map(. + {escalation_key: escalation_key})
                       | map(select(
                           .escalation_key as $key
-                          | ($prior | any(.[]; contains("<!-- runeseer-escalation:\($key) -->")))
-                          | not
+                          | $key == null
+                          or ($prior | any(.[]; contains("<!-- runeseer-escalation:\($key) -->")) | not)
                       ))' <<<"$confirmed")
                   [ "$(jq 'length' <<<"$confirmed")" = "0" ] && {
                       echo "all confirmed findings were already escalated"
@@ -443,7 +442,8 @@ jobs:
                   }
                   escalation=$(jq -r '
                       ["@N4M3Z, these confirmed findings need a human decision:", ""]
-                      + (map("- `\(.path):\(.line)`: \(.summary)\n<!-- runeseer-escalation:\(.escalation_key) -->"))
+                      + (map("- `\(.path):\(.line)`: \(.summary)"
+                          + (if .escalation_key then "\n<!-- runeseer-escalation:\(.escalation_key) -->" else "" end)))
                       + ["", "Please decide whether each finding should be fixed or accepted."]
                       | join("\n")' <<<"$confirmed")
                   if ! escalation_error=$(gh api -X POST "repos/$REPO/issues/$PR/comments" \
