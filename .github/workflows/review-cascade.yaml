@@ -52,7 +52,8 @@ env:
     REST_BOT_MACROSCOPE: "macroscopeapp[bot]"
     SUMMON_COMMENT: "@cursor review"
     POLL_SECONDS: 20
-    POLL_ROUNDS: 30
+    POLL_ROUNDS_CURSOR: 54
+    POLL_ROUNDS_MACROSCOPE: 30
 
 jobs:
     cascade:
@@ -184,7 +185,7 @@ jobs:
                   terminal_comment_after() {
                       comments=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate \
                           "repos/$REPO/issues/$PR/comments?per_page=100" \
-                          --jq "[.[] | select(.id > $1) | select(.user.login == \"$2\") | select(.body | test(\"couldn.t run|unable to run|failed to run|usage or spend limit|hit a usage\"; \"i\")) | .html_url]" \
+                          --jq "[.[] | select(.id > $1) | select(.user.login == \"$2\") | select(.body | test(\"couldn.t run|unable to run|failed to run|usage limit|spend limit|is paused|usage-based billing\"; \"i\")) | .html_url]" \
                           | jq -s 'add // []')
                       jq -r 'first // empty' <<<"$comments"
                   }
@@ -213,9 +214,9 @@ jobs:
                   }
 
                   wait_clean() {
-                      app=$1; bot=$2; stage=$3; comment_after=${4:-0}; rest_bot=${5:-}; blocker=${6:-}; summon_label=${7:-}
+                      app=$1; bot=$2; stage=$3; comment_after=${4:-0}; rest_bot=${5:-}; blocker=${6:-}; summon_label=${7:-}; poll_rounds=$8
                       round=0
-                      for _ in $(seq 1 "$POLL_ROUNDS"); do
+                      for _ in $(seq 1 "$poll_rounds"); do
                           round=$((round + 1))
                           if settled "$app"; then
                               [ -z "$blocker" ] || clear_label "$blocker"
@@ -299,11 +300,17 @@ jobs:
                       elif blocked "$LABEL_CURSOR_BLOCKED"; then
                           fail_cascade "$LABEL_CURSOR_BLOCKED is present; clear the provider problem before re-summoning."
                       else
+                          # A misconfigured summoner token must not kill the
+                          # walk: fall back to runewright, whose comment Cursor
+                          # ignores but whose failure mode is the poll budget,
+                          # visibly, not a dead cascade.
                           cursor_comment_id=$(GH_TOKEN=${SUMMON_TOKEN:-$GH_TOKEN} gh api -X POST \
-                              "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id')
+                              "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id') \
+                              || cursor_comment_id=$(gh api -X POST \
+                                  "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id')
                       fi
                       wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor" \
-                          "$cursor_comment_id" "$REST_BOT_CURSOR" "$LABEL_CURSOR_BLOCKED" ""
+                          "$cursor_comment_id" "$REST_BOT_CURSOR" "$LABEL_CURSOR_BLOCKED" "" "$POLL_ROUNDS_CURSOR"
                       mark_stage "$LABEL_STAGE_CURSOR"
                   fi
 
@@ -327,7 +334,7 @@ jobs:
                           ensure_label "$LABEL_MACROSCOPE"
                       fi
                       wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope" \
-                          "$macroscope_comment_id" "$REST_BOT_MACROSCOPE" "$LABEL_MACROSCOPE_BLOCKED" "$LABEL_MACROSCOPE"
+                          "$macroscope_comment_id" "$REST_BOT_MACROSCOPE" "$LABEL_MACROSCOPE_BLOCKED" "$LABEL_MACROSCOPE" "$POLL_ROUNDS_MACROSCOPE"
                       mark_stage "$LABEL_STAGE_MACROSCOPE"
                   fi
 

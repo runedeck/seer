@@ -276,13 +276,16 @@ jobs:
                         `- `<path:line>`: <defect and consequence, one sentence, at most 25 words.>`
                       - If there are no novel Low findings, write `- None.`
                       - Do not repeat other-lane or ledger findings in Digest.
+                      - When the verdict carries open findings from the ledger, add a blank line, then `#### Carried`, then one bullet per carried finding:
+                        `- `<path:line>`: <its summary title>` — so every finding behind the count is visible in the summary. Omit the section when nothing is carried.
 
                       Verdict file:
                       - Write valid JSON to `runeseer-verdict.json` in the workspace root.
                       - Use exactly this schema:
                         `{"sha":"<full HEAD sha>","verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"<judgment>","comment_id":<optional originating inline comment database id>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"confirmed|disputed|already addressed","reason":"<judgment sentence>","comment_id":<optional originating inline comment database id>}]}`
-                      - Include every unresolved genuine finding from any lane, including novel Low findings and unresolved findings carried from the ledger.
-                      - Exclude disputed and already-addressed findings.
+                      - Include every open genuine finding from any lane, including novel Low findings and open findings carried from the ledger.
+                      - A finding is open only while the defect is still present at HEAD. Your Lane judgment decides: `confirmed` findings are open; `disputed` and `already addressed` findings are not, even when their review threads are still unresolved on GitHub, and a ledger entry whose defect the current HEAD fixes is not open either.
+                      - When every lane finding is disputed or already addressed and no novel finding remains, the array is empty, `count` is 0, and the summary first line reads `review/correctness: clean @SHA`.
                       - Use `runeseer` as the lane for your own findings. Preserve the originating lane for other findings.
                       - Include every other-lane judgment in `lane_judgments`, including rechecked ledger findings and judgments excluded from `findings`.
                       - For non-ledger judgments, set `reason` to the same sentence used in the summary comment. For ledger judgments, write the same kind of short factual sentence.
@@ -366,8 +369,11 @@ jobs:
                       comment_id=$(jq -r '.comment_id // empty' <<<"$judgment")
                       thread=$(jq -c --arg path "$path" --argjson line "$line" --arg comment_id "$comment_id" '
                           [.[] | select(
-                              ($comment_id != "" and ((.comments.nodes[0].databaseId // "") | tostring) == $comment_id)
-                              or (.path == $path and (.line == $line or .originalLine == $line))
+                              if $comment_id != "" then
+                                  ((.comments.nodes[0].databaseId // "") | tostring) == $comment_id
+                              else
+                                  .path == $path and (.line == $line or .originalLine == $line)
+                              end
                           )] | sort_by(.isResolved) | first // empty' <<<"$threads")
                       if [ -z "$thread" ]; then
                           echo "no review thread matched $path:$line${comment_id:+ (comment $comment_id)}"
