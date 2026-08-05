@@ -414,12 +414,6 @@ jobs:
 
                   confirmed=$(jq -c '[.lane_judgments[] | select(.judgment == "confirmed")]' runeseer-verdict.json)
                   [ "$(jq 'length' <<<"$confirmed")" = "0" ] && exit 0
-                  missing_comment_ids=$(jq -c '[.[] | select(.comment_id == null)]' <<<"$confirmed")
-                  if [ "$(jq 'length' <<<"$missing_comment_ids")" != "0" ]; then
-                      echo "confirmed findings without originating comment ids cannot be escalated safely"
-                  fi
-                  confirmed=$(jq -c '[.[] | select(.comment_id != null)]' <<<"$confirmed")
-                  [ "$(jq 'length' <<<"$confirmed")" = "0" ] && exit 0
                   if ! prior_escalations=$(gh api --paginate \
                       "repos/$REPO/issues/$PR/comments?per_page=100" \
                       --jq '[.[] | select(.user.login == "runeseer[bot]") | .body]' \
@@ -428,7 +422,10 @@ jobs:
                       exit 0
                   fi
                   confirmed=$(jq -c --argjson prior "$prior_escalations" '
-                      def escalation_key: {lane, comment_id} | @base64;
+                      def escalation_key:
+                          if .comment_id then {lane, comment_id}
+                          else {lane, path, line, summary} end
+                          | @base64;
                       map(. + {escalation_key: escalation_key})
                       | map(select(
                           .escalation_key as $key
