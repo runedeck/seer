@@ -326,6 +326,7 @@ jobs:
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
               run: |
+                  set -o pipefail
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; no lane judgments to apply"; exit 0; }
                   if ! jq -e '.lane_judgments | type == "array"' runeseer-verdict.json >/dev/null; then
                       echo "verdict file has no lane_judgments array; review threads remain unchanged"
@@ -421,7 +422,9 @@ jobs:
                       exit 0
                   fi
                   confirmed=$(jq -c --argjson prior "$prior_escalations" '
-                      def escalation_key: {path, line, summary, lane} | @base64;
+                      def escalation_key:
+                          if .comment_id then {lane, comment_id} else {path, line, lane} end
+                          | @base64;
                       map(. + {escalation_key: escalation_key})
                       | map(select(
                           .escalation_key as $key
