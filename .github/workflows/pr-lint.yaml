@@ -76,6 +76,16 @@ jobs:
                               await github.rest.issues.createLabel({ ...context.repo, name, color, description });
                           }
                       }
+                      // Names the per-lane families replaced. Leaving it behind
+                      // would offer an override that no workflow reads.
+                      const retired = ["review:skip"];
+                      for (const name of retired) {
+                          try {
+                              await github.rest.issues.deleteLabel({ ...context.repo, name });
+                          } catch (error) {
+                              if (error.status !== 404) throw error;
+                          }
+                      }
 
     size:
         runs-on: ubuntu-latest
@@ -86,14 +96,9 @@ jobs:
                       const pr = context.payload.pull_request;
                       const changed = pr.additions + pr.deletions;
                       const size = changed < 50 ? "size:small" : changed < 300 ? "size:med" : changed < 1000 ? "size:large" : "size:xlarge";
-                      const { data: labels } = await github.rest.issues.listLabelsOnIssue({
-                          ...context.repo, issue_number: pr.number });
-                      for (const label of labels) {
-                          if (label.name.startsWith("size:") && label.name !== size) {
-                              await github.rest.issues.removeLabel({
-                                  ...context.repo, issue_number: pr.number, name: label.name });
-                          }
-                      }
+                      // The new bucket goes on before the old ones come off, so
+                      // a run cancelled between the two leaves the pull request
+                      // over-labelled rather than carrying no size at all.
                       try {
                           await github.rest.issues.getLabel({ ...context.repo, name: size });
                       } catch {
@@ -103,3 +108,11 @@ jobs:
                       }
                       await github.rest.issues.addLabels({
                           ...context.repo, issue_number: pr.number, labels: [size] });
+                      const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+                          ...context.repo, issue_number: pr.number });
+                      for (const label of labels) {
+                          if (label.name.startsWith("size:") && label.name !== size) {
+                              await github.rest.issues.removeLabel({
+                                  ...context.repo, issue_number: pr.number, name: label.name });
+                          }
+                      }

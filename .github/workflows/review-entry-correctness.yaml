@@ -56,9 +56,11 @@ jobs:
                       echo "the review label was already consumed; the lane stands down."
                   fi
 
+    # skip:runeseer is checked here rather than only inside the lane, so the
+    # lane is never invoked and no runner is spent standing it down.
     review:
         needs: release
-        if: '!cancelled() && github.event.pull_request.draft == false && ((github.event.action == ''labeled'' && github.event.label.name == ''review:runeseer'') || (github.event.action == ''ready_for_review'' && needs.release.outputs.summoned == ''true''))'
+        if: '!cancelled() && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, ''skip:runeseer'') && ((github.event.action == ''labeled'' && github.event.label.name == ''review:runeseer'') || (github.event.action == ''ready_for_review'' && needs.release.outputs.summoned == ''true''))'
         # A pull request must not modify the reviewer that judges the same head.
         uses: runedeck/seer/.github/workflows/review-correctness.yaml@main
         secrets:
@@ -87,6 +89,21 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   set -o pipefail
+                  # The overrides are read first, because they must hold however
+                  # the lane concluded. Gating is exactly what this mirror does,
+                  # so both clear it; they still differ where it counts, in that
+                  # skip: spends nothing and produces no findings while ignore:
+                  # leaves the lane's full record on the pull request. A failed
+                  # label read must not read as an applied override.
+                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
+                      || { echo "could not read the live labels; rerun the check"; exit 1; }
+                  for override in skip:runeseer ignore:runeseer; do
+                      if printf '%s\n' "$labels" | grep -qx "$override"; then
+                          echo "$override present; the owner released this lane's hold on the merge."
+                          exit 0
+                      fi
+                  done
                   if [ "${{ needs.review.result }}" != "success" ] && [ "${{ needs.review.result }}" != "skipped" ]; then
                       echo "the lane concluded: ${{ needs.review.result }}"
                       exit 1
@@ -110,20 +127,6 @@ jobs:
                           exit 1
                       fi
                   fi
-                  # Both owner overrides clear this mirror, because gating is
-                  # exactly what it does. They still differ where it counts:
-                  # skip: spends nothing and produces no findings, while
-                  # ignore: leaves the lane's full record on the pull request.
-                  # A failed label read must not read as an applied override.
-                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
-                      --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
-                      || { echo "could not read the live labels; rerun the check"; exit 1; }
-                  for override in skip:runeseer ignore:runeseer; do
-                      if printf '%s\n' "$labels" | grep -qx "$override"; then
-                          echo "$override present; the owner released this lane's hold on the merge."
-                          exit 0
-                      fi
-                  done
                   # Per-page jq output merges through jq -s: the runner's gh
                   # predates --slurp. pipefail keeps a failed reviews read from
                   # reading as an absent approval.
