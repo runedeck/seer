@@ -349,16 +349,14 @@ jobs:
                           }
                       }
                   }'
+                  thread_query_failed=false
                   if ! threads=$(gh api graphql --paginate -f query="$thread_query" \
                       -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" \
                       --jq '[.data.repository.pullRequest.reviewThreads.nodes[]]' \
                       | jq -s 'add // []'); then
                       echo "could not query review threads; the runeseer app token may lack pull-request read scope"
-                      jq -r '.lane_judgments[]
-                          | select(.judgment == "disputed" or .judgment == "already addressed")
-                          | "could not resolve review thread for \(.path):\(.line) because the thread query failed"' \
-                          runeseer-verdict.json
-                      exit 0
+                      threads='[]'
+                      thread_query_failed=true
                   fi
 
                   jq -c '.lane_judgments[] | select(.judgment == "disputed" or .judgment == "already addressed")' \
@@ -367,13 +365,17 @@ jobs:
                       line=$(jq -r '.line' <<<"$judgment")
                       reason=$(jq -r '.reason' <<<"$judgment")
                       comment_id=$(jq -r '.comment_id // empty' <<<"$judgment")
-                      thread=$(jq -c --arg path "$path" --argjson line "$line" --arg comment_id "$comment_id" '
+                      if [ "$thread_query_failed" = "true" ]; then
+                          echo "could not resolve review thread for $path:$line because the thread query failed"
+                          continue
+                      fi
+                      if [ -z "$comment_id" ]; then
+                          echo "no originating inline comment id for $path:$line; leaving review threads unchanged"
+                          continue
+                      fi
+                      thread=$(jq -c --arg comment_id "$comment_id" '
                           [.[] | select(
-                              if $comment_id != "" then
-                                  ((.comments.nodes[0].databaseId // "") | tostring) == $comment_id
-                              else
-                                  .path == $path and (.line == $line or .originalLine == $line)
-                              end
+                              ((.comments.nodes[0].databaseId // "") | tostring) == $comment_id
                           )] | sort_by(.isResolved) | first // empty' <<<"$threads")
                       if [ -z "$thread" ]; then
                           echo "no review thread matched $path:$line${comment_id:+ (comment $comment_id)}"
@@ -411,16 +413,35 @@ jobs:
 
                   confirmed=$(jq -c '[.lane_judgments[] | select(.judgment == "confirmed")]' runeseer-verdict.json)
                   [ "$(jq 'length' <<<"$confirmed")" = "0" ] && exit 0
+                  if ! prior_escalations=$(gh api --paginate \
+                      "repos/$REPO/issues/$PR/comments?per_page=100" \
+                      --jq '[.[] | select(.user.login == "runeseer[bot]") | .body]' \
+                      | jq -s 'add // []'); then
+                      echo "could not query prior owner escalations; skipping this escalation to prevent duplicate requests"
+                      exit 0
+                  fi
+                  confirmed=$(jq -c --argjson prior "$prior_escalations" '
+                      def escalation_key: {path, line, summary, lane} | @base64;
+                      map(. + {escalation_key: escalation_key})
+                      | map(select(
+                          .escalation_key as $key
+                          | ($prior | any(.[]; contains("<!-- runeseer-escalation:\($key) -->")))
+                          | not
+                      ))' <<<"$confirmed")
+                  [ "$(jq 'length' <<<"$confirmed")" = "0" ] && {
+                      echo "all confirmed findings were already escalated"
+                      exit 0
+                  }
                   escalation=$(jq -r '
                       ["@N4M3Z, these confirmed findings need a human decision:", ""]
-                      + (map("- `\(.path):\(.line)`: \(.summary)"))
+                      + (map("- `\(.path):\(.line)`: \(.summary)\n<!-- runeseer-escalation:\(.escalation_key) -->"))
                       + ["", "Please decide whether each finding should be fixed or accepted."]
                       | join("\n")' <<<"$confirmed")
                   if ! escalation_error=$(gh api -X POST "repos/$REPO/issues/$PR/comments" \
                       -f body="$escalation" 2>&1); then
                       echo "could not post the confirmed-finding escalation; the runeseer app token may lack issue-comment write scope: $escalation_error"
                   else
-                      echo "posted one owner escalation for this round's confirmed findings"
+                      echo "posted one owner escalation for newly confirmed findings"
                   fi
 
             # The verdict artifact is the machine-readable record: the next
