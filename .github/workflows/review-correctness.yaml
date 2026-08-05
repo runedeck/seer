@@ -325,6 +325,7 @@ jobs:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   set -o pipefail
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; no lane judgments to apply"; exit 0; }
@@ -421,10 +422,14 @@ jobs:
                       echo "could not query prior owner escalations; skipping this escalation to prevent duplicate requests"
                       exit 0
                   fi
-                  confirmed=$(jq -c --argjson prior "$prior_escalations" '
+                  # Every key component outlives a round. A finding with an
+                  # originating comment keys on that comment. One without keys
+                  # on the head instead of on model-authored text, so all such
+                  # findings ride in a single escalation per head: rewording
+                  # cannot re-ping the owner, and none is dropped as a duplicate.
+                  confirmed=$(jq -c --argjson prior "$prior_escalations" --arg head "$HEAD_SHA" '
                       def escalation_key:
-                          if .comment_id then {lane, comment_id}
-                          else {lane, path, line, summary} end
+                          if .comment_id then {lane, comment_id} else {head: $head} end
                           | @base64;
                       map(. + {escalation_key: escalation_key})
                       | map(select(
