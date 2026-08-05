@@ -84,6 +84,18 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
+                  set -o pipefail
+                  # skip: stands the lane down before it spends anything, and
+                  # the job still concludes success so the required mirror
+                  # clears. A failed label read must not read as an applied skip.
+                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
+                      || { echo "could not read the live labels; rerun the check"; exit 1; }
+                  if printf '%s\n' "$labels" | grep -qx 'skip:runeseer'; then
+                      echo "skip=true" >> "$GITHUB_OUTPUT"
+                      echo "skip:runeseer present; the correctness lane never runs."
+                      exit 0
+                  fi
                   files=$(gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --name-only)
                   substantive=$(printf '%s\n' "$files" | grep -Ev '\.md$' || true)
                   in_scope_md=$(printf '%s\n' "$files" | grep -E '^(docs/specs/|\.github/).*\.md$' || true)
@@ -594,14 +606,28 @@ jobs:
             - name: Verdict gates the check
               if: steps.scope.outputs.skip == 'false'
               env:
+                  GH_TOKEN: ${{ github.token }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
+                  set -o pipefail
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; the review did not complete"; exit 1; }
                   if jq -e --arg sha "$HEAD_SHA" '
                       .verdict == "clean" and .count == 0
                       and (.findings | type == "array" and length == 0)
                       and .restart == "none"
                       and .sha == $sha' runeseer-verdict.json >/dev/null; then
+                      exit 0
+                  fi
+                  # The verdict, its findings, and its inline comments all
+                  # stand: ignore: withdraws only their power to hold the
+                  # merge, and the record stays on the pull request. A failed
+                  # label read must not read as an applied ignore.
+                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
+                      || { echo "could not read the live labels; rerun the check"; exit 1; }
+                  if printf '%s\n' "$labels" | grep -qx 'ignore:runeseer'; then
+                      echo "ignore:runeseer present; the findings below stand as a record and no longer hold the merge."
+                      jq -c '{verdict, count, sha, restart}' runeseer-verdict.json || true
                       exit 0
                   fi
                   echo "the verdict is not an explicit no-restart clean for this head; the check stays red."
