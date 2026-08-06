@@ -333,14 +333,20 @@ jobs:
                       elif blocked "$LABEL_CURSOR_BLOCKED"; then
                           fail_cascade "$LABEL_CURSOR_BLOCKED is present; clear the provider problem before re-summoning."
                       else
-                          # A misconfigured summoner token must not kill the
-                          # walk: fall back to runewright, whose comment Cursor
-                          # ignores but whose failure mode is the poll budget,
-                          # visibly, not a dead cascade.
-                          cursor_comment_id=$(GH_TOKEN=${SUMMON_TOKEN:-$GH_TOKEN} gh api -X POST \
-                              "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id') \
-                              || cursor_comment_id=$(gh api -X POST \
-                                  "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id')
+                          # Cursor ignores bot-authored comments, so only the
+                          # owner-minted token can actually summon it. Falling
+                          # back to runewright posts a comment Cursor will never
+                          # answer, and the stage then dies of the poll budget
+                          # with a message blaming the lane for a token fault.
+                          # Naming the fault here costs seconds instead.
+                          if ! cursor_comment_id=$(GH_TOKEN=${SUMMON_TOKEN:-$GH_TOKEN} gh api -X POST \
+                              "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id' 2>&1); then
+                              summon_error=$cursor_comment_id
+                              if [ -n "$SUMMON_TOKEN" ]; then
+                                  fail_cascade "the summon token cannot comment on $REPO, so Cursor can never be asked: $summon_error. Grant RUNEWRIGHT_GITHUB_TOKEN access to this repository, or apply $LABEL_SKIP_CURSOR to stand the stage down."
+                              fi
+                              fail_cascade "no summon token is configured and the workflow token cannot comment on $REPO: $summon_error. Configure RUNEWRIGHT_GITHUB_TOKEN, or apply $LABEL_SKIP_CURSOR to stand the stage down."
+                          fi
                       fi
                       if wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor" \
                           "$cursor_comment_id" "$REST_BOT_CURSOR" "$LABEL_CURSOR_BLOCKED" "" "$POLL_ROUNDS_CURSOR" \
