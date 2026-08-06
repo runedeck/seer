@@ -225,8 +225,14 @@ jobs:
                   # funnel is withdrawn. A terminal provider failure still
                   # fails: that is a broken lane, not a judged one, and skip:
                   # is the override for a lane that should not run at all.
+                  # Callers read stage_unsettled rather than a return code:
+                  # wrapping this call in `if` would disable errexit for its
+                  # whole body, so a failed API read inside would stop aborting
+                  # and could report a stage settled that never was.
+                  stage_unsettled=false
                   wait_clean() {
                       app=$1; bot=$2; stage=$3; comment_after=${4:-0}; rest_bot=${5:-}; blocker=${6:-}; summon_label=${7:-}; poll_rounds=$8; ignore_label=${9:-}
+                      stage_unsettled=false
                       ignored=false
                       if [ -n "$ignore_label" ] && blocked "$ignore_label"; then
                           ignored=true
@@ -271,11 +277,12 @@ jobs:
                           sleep "$POLL_SECONDS"
                       done
                       # A lane that never reported has settled nothing, so the
-                      # caller must not record a stage label for it. Returning 2
+                      # caller must not record a stage label for it. This
                       # releases the funnel without claiming settled work.
                       [ "$ignored" = "true" ] && {
                           echo "$ignore_label present; $stage did not settle within the poll budget and no longer holds the funnel."
-                          return 2
+                          stage_unsettled=true
+                          return 0
                       }
                       fail_cascade "$stage did not settle within the poll budget; the funnel stops here."
                   }
@@ -339,20 +346,21 @@ jobs:
                           # answer, and the stage then dies of the poll budget
                           # with a message blaming the lane for a token fault.
                           # Naming the fault here costs seconds instead.
-                          if ! cursor_comment_id=$(GH_TOKEN=${SUMMON_TOKEN:-$GH_TOKEN} gh api -X POST \
+                          # Posting as a bot succeeds and still gets ignored, so
+                          # an absent token has to be caught before the request,
+                          # not by its result.
+                          if [ -z "$SUMMON_TOKEN" ]; then
+                              fail_cascade "no summon token is configured, and Cursor ignores bot-authored comments, so this stage could only wait out its poll budget. Configure RUNEWRIGHT_GITHUB_TOKEN, or apply $LABEL_SKIP_CURSOR to stand the stage down."
+                          fi
+                          if ! cursor_comment_id=$(GH_TOKEN=$SUMMON_TOKEN gh api -X POST \
                               "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id' 2>&1); then
-                              summon_error=$cursor_comment_id
-                              if [ -n "$SUMMON_TOKEN" ]; then
-                                  fail_cascade "the summon token cannot comment on $REPO, so Cursor can never be asked: $summon_error. Grant RUNEWRIGHT_GITHUB_TOKEN access to this repository, or apply $LABEL_SKIP_CURSOR to stand the stage down."
-                              fi
-                              fail_cascade "no summon token is configured and the workflow token cannot comment on $REPO: $summon_error. Configure RUNEWRIGHT_GITHUB_TOKEN, or apply $LABEL_SKIP_CURSOR to stand the stage down."
+                              fail_cascade "the summon token cannot comment on $REPO, so Cursor can never be asked: $cursor_comment_id. Grant RUNEWRIGHT_GITHUB_TOKEN access to this repository, or apply $LABEL_SKIP_CURSOR to stand the stage down."
                           fi
                       fi
-                      if wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor" \
+                      wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor" \
                           "$cursor_comment_id" "$REST_BOT_CURSOR" "$LABEL_CURSOR_BLOCKED" "" "$POLL_ROUNDS_CURSOR" \
-                          "$LABEL_IGNORE_CURSOR"; then
-                          mark_stage "$LABEL_STAGE_CURSOR"
-                      fi
+                          "$LABEL_IGNORE_CURSOR"
+                      [ "$stage_unsettled" = "true" ] || mark_stage "$LABEL_STAGE_CURSOR"
                   fi
 
                   echo "stage 2: macroscope"
@@ -372,11 +380,10 @@ jobs:
                           fi
                           ensure_label "$LABEL_MACROSCOPE"
                       fi
-                      if wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope" \
+                      wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope" \
                           "$macroscope_comment_id" "$REST_BOT_MACROSCOPE" "$LABEL_MACROSCOPE_BLOCKED" "$LABEL_MACROSCOPE" "$POLL_ROUNDS_MACROSCOPE" \
-                          "$LABEL_IGNORE_MACROSCOPE"; then
-                          mark_stage "$LABEL_STAGE_MACROSCOPE"
-                      fi
+                          "$LABEL_IGNORE_MACROSCOPE"
+                      [ "$stage_unsettled" = "true" ] || mark_stage "$LABEL_STAGE_MACROSCOPE"
                   fi
 
                   # The paid lane cannot run on fork pull requests (its
