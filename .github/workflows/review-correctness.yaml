@@ -337,6 +337,7 @@ jobs:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   set -o pipefail
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; no lane judgments to apply"; exit 0; }
@@ -356,7 +357,7 @@ jobs:
                                       path
                                       line
                                       originalLine
-                                      comments(first: 1) { nodes { databaseId } }
+                                      comments(first: 1) { nodes { databaseId author { login } } }
                                   }
                               }
                           }
@@ -423,6 +424,42 @@ jobs:
                       fi
                       echo "resolved review thread for $path:$line after posting its judgment"
                   done
+
+                  # The lane's own findings close the same way it closes other
+                  # lanes'. A thread this lane opened whose finding is absent
+                  # from the verdict for this head describes a defect that is
+                  # gone; leaving it open holds the merge over work already
+                  # done, and no one else can judge a runeseer finding.
+                  if [ "$thread_query_failed" = "true" ]; then
+                      echo "could not close this lane's own resolved threads because the thread query failed"
+                  else
+                      still_open=$(jq -c '[.findings[]? | select(.lane == "runeseer") | .comment_id // empty]' runeseer-verdict.json)
+                      jq -c '.[] | select(.isResolved == false)
+                          | select((.comments.nodes[0].author.login // "") == "runeseer[bot]")' <<<"$threads" \
+                          | while IFS= read -r own_thread; do
+                          own_comment_id=$(jq -r '.comments.nodes[0].databaseId // empty' <<<"$own_thread")
+                          [ -n "$own_comment_id" ] || continue
+                          if jq -e --argjson id "$own_comment_id" 'index($id) != null' <<<"$still_open" >/dev/null; then
+                              continue
+                          fi
+                          own_path=$(jq -r '.path' <<<"$own_thread")
+                          own_line=$(jq -r '.line // .originalLine // 0' <<<"$own_thread")
+                          own_thread_id=$(jq -r '.id' <<<"$own_thread")
+                          if ! own_reply=$(gh api -X POST \
+                              "repos/$REPO/pulls/$PR/comments/$own_comment_id/replies" \
+                              -f body="This finding is no longer present at $HEAD_SHA." 2>&1); then
+                              echo "could not reply to this lane's thread for $own_path:$own_line; leaving it unresolved: $own_reply"
+                              continue
+                          fi
+                          if ! own_resolution=$(gh api graphql \
+                              -f query='mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } } }' \
+                              -f threadId="$own_thread_id" 2>&1); then
+                              echo "could not resolve this lane's thread for $own_path:$own_line: $own_resolution"
+                              continue
+                          fi
+                          echo "resolved this lane's own thread for $own_path:$own_line; its finding is absent from this head's verdict"
+                      done
+                  fi
 
                   confirmed=$(jq -c '[.lane_judgments[] | select(.judgment == "confirmed")]' runeseer-verdict.json)
                   [ "$(jq 'length' <<<"$confirmed")" = "0" ] && exit 0
