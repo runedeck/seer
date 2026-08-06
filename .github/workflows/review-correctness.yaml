@@ -425,29 +425,30 @@ jobs:
                       echo "resolved review thread for $path:$line after posting its judgment"
                   done
 
-                  # The lane's own findings close the same way it closes other
-                  # lanes'. A thread this lane opened whose finding is absent
-                  # from the verdict for this head describes a defect that is
-                  # gone; leaving it open holds the merge over work already
-                  # done, and no one else can judge a runeseer finding.
+                  # A clean verdict is the one statement that every finding this
+                  # lane raised is gone, so it is the only safe moment to close
+                  # the lane's own threads. Per-finding matching cannot do it:
+                  # a novel runeseer finding has no originating comment to carry
+                  # an id, so an open finding would look absent and its thread
+                  # would close over a live defect. A verdict with any finding
+                  # leaves every own thread alone.
                   if [ "$thread_query_failed" = "true" ]; then
-                      echo "could not close this lane's own resolved threads because the thread query failed"
+                      echo "could not close this lane's own threads because the thread query failed"
+                  elif ! jq -e '.verdict == "clean" and .count == 0
+                      and (.findings | type == "array" and length == 0)' runeseer-verdict.json >/dev/null; then
+                      echo "this head still carries findings; this lane's own threads stay open"
                   else
-                      still_open=$(jq -c '[.findings[]? | select(.lane == "runeseer") | .comment_id // empty]' runeseer-verdict.json)
                       jq -c '.[] | select(.isResolved == false)
                           | select((.comments.nodes[0].author.login // "") == "runeseer[bot]")' <<<"$threads" \
                           | while IFS= read -r own_thread; do
                           own_comment_id=$(jq -r '.comments.nodes[0].databaseId // empty' <<<"$own_thread")
                           [ -n "$own_comment_id" ] || continue
-                          if jq -e --argjson id "$own_comment_id" 'index($id) != null' <<<"$still_open" >/dev/null; then
-                              continue
-                          fi
                           own_path=$(jq -r '.path' <<<"$own_thread")
                           own_line=$(jq -r '.line // .originalLine // 0' <<<"$own_thread")
                           own_thread_id=$(jq -r '.id' <<<"$own_thread")
                           if ! own_reply=$(gh api -X POST \
                               "repos/$REPO/pulls/$PR/comments/$own_comment_id/replies" \
-                              -f body="This finding is no longer present at $HEAD_SHA." 2>&1); then
+                              -f body="This finding is no longer present at $HEAD_SHA, which this lane judged clean." 2>&1); then
                               echo "could not reply to this lane's thread for $own_path:$own_line; leaving it unresolved: $own_reply"
                               continue
                           fi
@@ -457,7 +458,11 @@ jobs:
                               echo "could not resolve this lane's thread for $own_path:$own_line: $own_resolution"
                               continue
                           fi
-                          echo "resolved this lane's own thread for $own_path:$own_line; its finding is absent from this head's verdict"
+                          if [ "$(jq -r '.data.resolveReviewThread.thread.isResolved // false' <<<"$own_resolution")" != "true" ]; then
+                              echo "resolveReviewThread did not resolve this lane's thread for $own_path:$own_line: $own_resolution"
+                              continue
+                          fi
+                          echo "resolved this lane's own thread for $own_path:$own_line; this head judged clean"
                       done
                   fi
 
