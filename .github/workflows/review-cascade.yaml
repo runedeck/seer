@@ -169,10 +169,16 @@ jobs:
                           | jq -s 'add // [] | group_by(.name) | map(sort_by(.started_at) | last)'
                   }
 
+                  # A lane that declines one of its own checks reports it
+                  # skipped, which is a decision rather than a fault, so it
+                  # counts as clean here. Real faults are failed_check's
+                  # territory, and a lane whose every check skips has still
+                  # concluded. Omitting skipped strands a lane forever: its
+                  # stage can only ever wait out the poll budget.
                   settled() {
                       runs=$(latest_runs "$1")
                       total=$(jq 'length' <<<"$runs")
-                      clean_count=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $conclusion | ["success", "neutral"] | index($conclusion))] | length' <<<"$runs")
+                      clean_count=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $conclusion | ["success", "neutral", "skipped"] | index($conclusion))] | length' <<<"$runs")
                       [ "$total" != "0" ] && [ "$clean_count" = "$total" ]
                   }
 
