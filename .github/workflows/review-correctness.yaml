@@ -26,7 +26,7 @@ env:
     LABEL_STAGE_CURSOR: "stage%3Acursor"
     LABEL_STAGE_MACROSCOPE: "stage%3Amacroscope"
     ARTIFACT_PREFIX: runeseer-verdict-pr
-    INSTRUCTION_PATTERN: '(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)'
+    INSTRUCTION_PATTERN: '(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)|(^|/)copilot-instructions\.md$|^\.mcp\.json$|^\.rune$'
     POLL_SECONDS: 20
     POLL_ROUNDS: 15
 

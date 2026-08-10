@@ -78,6 +78,11 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
+                  if [ "${{ github.event.action }}" = "opened" ]; then
+                      echo "live=true" >> "$GITHUB_OUTPUT"
+                      echo "a newly opened pull request runs its first cascade without a label."
+                      exit 0
+                  fi
                   labels=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
                   if printf '%s\n' "$labels" | grep -qx review; then
                       echo "live=true" >> "$GITHUB_OUTPUT"
