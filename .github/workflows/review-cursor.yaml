@@ -2,11 +2,12 @@ name: Review Cursor
 
 # Reusable single-lane summon: consume the review:cursor label and post the
 # owner-voiced `@cursor review` trigger comment on the pull request. Cursor
-# drops bot-authored trigger comments, so the request prefers the
-# owner-minted token and falls back to runewright only where no owner-minted
-# token is configured. The lane summons and stands down: Cursor's review
-# lands on its own schedule and no verdict gates on it, unlike the cascade,
-# which polls the round to completion as its first stage.
+# drops bot-authored trigger comments, so the summon rides the owner-minted
+# token and fails loudly when it is missing; a runewright-posted mention
+# would die silently with the one-shot label already consumed. The lane
+# summons and stands down: Cursor's review lands on its own schedule and no
+# verdict gates on it, unlike the cascade, which polls the round to
+# completion as its first stage.
 on:
     workflow_call:
         secrets:
@@ -15,7 +16,7 @@ on:
             RUNEWRIGHT_APP_KEY:
                 required: true
             RUNEWRIGHT_GITHUB_TOKEN:
-                required: false
+                required: true
 
 env:
     SUMMON_COMMENT: "@cursor review"
@@ -54,17 +55,23 @@ jobs:
               if: steps.live.outputs.live == 'true'
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
-                  # Cursor drops bot-authored trigger comments, so the request
-                  # prefers the owner-minted token and falls back to runewright
-                  # only where no owner-minted token is configured.
+                  # Cursor drops bot-authored trigger comments; only the
+                  # owner-minted token can voice a summon Cursor acts on.
                   SUMMON_TOKEN: ${{ secrets.RUNEWRIGHT_GITHUB_TOKEN }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
               run: |
                   set -o pipefail
+                  # An empty owner token means the summon would be a dead bot
+                  # mention: fail before touching the label so it stays live
+                  # for a retry once the secret is configured.
+                  if [ -z "$SUMMON_TOKEN" ]; then
+                      echo "RUNEWRIGHT_GITHUB_TOKEN is empty; Cursor ignores bot-authored mentions, so the summon stands down with the label intact."
+                      exit 1
+                  fi
                   # The label is a one-round token: consume it before posting,
                   # so a failed post reads as a missing summon comment rather
                   # than a stale label that re-fires later.
                   gh api -X DELETE "repos/$REPO/issues/$PR/labels/review%3Acursor" >/dev/null
-                  GH_TOKEN=${SUMMON_TOKEN:-$GH_TOKEN} gh api -X POST \
+                  GH_TOKEN=$SUMMON_TOKEN gh api -X POST \
                       "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id'
