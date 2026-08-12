@@ -115,13 +115,18 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
               run: |
-                  # Label writes ride runewright: the workflow token's caller
-                  # grants stop at issues, and pull-request label writes 403
-                  # under it. Runewright's removals emit unlabeled events no
-                  # caller listens to, and its stage and blocker adds fail the
-                  # cascade and correctness guards, so nothing re-enters.
+                  # The entry label is consumed with the caller's workflow
+                  # token: label removal is an issues-API call the callers'
+                  # issues: write grant covers, and workflow-token events do
+                  # not propagate, so the removal cannot enter the caller's
+                  # concurrency group and cancel the running cascade. A
+                  # runewright removal emits a real unlabeled event, and the
+                  # caller's cancel-in-progress matches unlabeled review,
+                  # which cancelled the cascade at its own consumption moment.
+                  # Stage and blocker adds stay on runewright, because those
+                  # labels must emit events for the lanes listening to them.
                   consume_entry_label() {
-                      gh api -X DELETE \
+                      GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
                           "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" >/dev/null 2>&1 || true
                   }
 
