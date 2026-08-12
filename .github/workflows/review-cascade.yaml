@@ -17,6 +17,10 @@ name: Review Cascade
 # `@cursor review` comment; runewright's token also applies stage labels, because
 # label events created by the workflow token would not trigger the lanes
 # listening for them.
+#
+# Callers must grant issues: write. The entry-label consumption rides their
+# workflow token so the removal cannot cancel the running cascade; without
+# the grant, consumption warns and falls back to runewright.
 on:
     workflow_call:
         secrets:
@@ -123,10 +127,23 @@ jobs:
                   # runewright removal emits a real unlabeled event, and the
                   # caller's cancel-in-progress matches unlabeled review,
                   # which cancelled the cascade at its own consumption moment.
+                  # A 404 means the label is already gone and consumption is
+                  # idempotent; any other refusal (a caller missing the
+                  # issues: write grant) warns visibly and falls back to
+                  # runewright so the one-round-token contract still holds.
                   # Stage and blocker adds stay on runewright, because those
                   # labels must emit events for the lanes listening to them.
                   consume_entry_label() {
-                      GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
+                      local consume_error
+                      if consume_error=$(GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
+                          "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" 2>&1 >/dev/null); then
+                          return 0
+                      fi
+                      case "$consume_error" in
+                          *"HTTP 404"*) return 0 ;;
+                      esac
+                      echo "::warning::entry-label consumption failed under the workflow token ($consume_error); grant issues: write in the caller. Falling back to runewright, whose unlabeled event may cancel this run at its exit."
+                      gh api -X DELETE \
                           "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" >/dev/null 2>&1 || true
                   }
 
