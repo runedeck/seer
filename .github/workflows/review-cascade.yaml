@@ -18,9 +18,9 @@ name: Review Cascade
 # label events created by the workflow token would not trigger the lanes
 # listening for them.
 #
-# Callers must grant issues: write. The entry-label consumption rides their
-# workflow token so the removal cannot cancel the running cascade; without
-# the grant, consumption warns and falls back to runewright.
+# Callers must grant issues: write. The cascade removes the entry label
+# with the caller's workflow token. If the grant is missing, the cascade
+# warns and uses runewright instead.
 on:
     workflow_call:
         secrets:
@@ -119,20 +119,16 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
               run: |
-                  # The entry label is consumed with the caller's workflow
-                  # token: label removal is an issues-API call the callers'
-                  # issues: write grant covers, and workflow-token events do
-                  # not propagate, so the removal cannot enter the caller's
-                  # concurrency group and cancel the running cascade. A
-                  # runewright removal emits a real unlabeled event, and the
-                  # caller's cancel-in-progress matches unlabeled review,
-                  # which cancelled the cascade at its own consumption moment.
-                  # A 404 means the label is already gone and consumption is
-                  # idempotent; any other refusal (a caller missing the
-                  # issues: write grant) warns visibly and falls back to
-                  # runewright so the one-round-token contract still holds.
-                  # Stage and blocker adds stay on runewright, because those
-                  # labels must emit events for the lanes listening to them.
+                  # Remove the entry label with the caller's workflow token.
+                  # Workflow-token events do not start workflows, so the
+                  # removal cannot cancel the running cascade. A runewright
+                  # removal emits a real unlabeled event; the caller's cancel
+                  # rule matches that event and cancels this run.
+                  # A 404 means the label is already gone; that is success.
+                  # Any other error means the caller does not grant
+                  # issues: write; then warn and use runewright instead.
+                  # Stage and blocker labels stay on runewright, because the
+                  # lanes need their events.
                   consume_entry_label() {
                       local consume_error
                       if consume_error=$(GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
@@ -142,7 +138,7 @@ jobs:
                       case "$consume_error" in
                           *"HTTP 404"*) return 0 ;;
                       esac
-                      echo "::warning::entry-label consumption failed under the workflow token ($consume_error); grant issues: write in the caller. Falling back to runewright, whose unlabeled event may cancel this run at its exit."
+                      echo "::warning::could not remove the review label with the workflow token ($consume_error). Grant issues: write in the caller. Using runewright instead; its unlabeled event can cancel this run."
                       gh api -X DELETE \
                           "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" >/dev/null 2>&1 || true
                   }
