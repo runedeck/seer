@@ -1,0 +1,70 @@
+name: Review Cursor
+
+# Reusable single-lane summon: consume the review:cursor label and post the
+# owner-voiced `@cursor review` trigger comment on the pull request. Cursor
+# drops bot-authored trigger comments, so the request prefers the
+# owner-minted token and falls back to runewright only where no owner-minted
+# token is configured. The lane summons and stands down: Cursor's review
+# lands on its own schedule and no verdict gates on it, unlike the cascade,
+# which polls the round to completion as its first stage.
+on:
+    workflow_call:
+        secrets:
+            RUNEWRIGHT_APP_ID:
+                required: true
+            RUNEWRIGHT_APP_KEY:
+                required: true
+            RUNEWRIGHT_GITHUB_TOKEN:
+                required: false
+
+env:
+    SUMMON_COMMENT: "@cursor review"
+
+jobs:
+    summon:
+        name: summon
+        if: github.event.pull_request.draft == false
+        runs-on: ubuntu-latest
+        timeout-minutes: 3
+        steps:
+            # A queued run keeps its event payload after the labels moved on,
+            # so the live labels decide whether the requested round still
+            # stands; a consumed lane label stops the summon without a failure.
+            - id: live
+              name: Verify the lane label is live
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  labels=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
+                  if printf '%s\n' "$labels" | grep -qx 'review:cursor'; then
+                      echo "live=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "live=false" >> "$GITHUB_OUTPUT"
+                      echo "no live review:cursor label on this pull request; the summon stands down."
+                  fi
+
+            - id: runewright
+              if: steps.live.outputs.live == 'true'
+              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+              with:
+                  app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
+                  private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
+
+            - name: Consume the label and post the summon
+              if: steps.live.outputs.live == 'true'
+              env:
+                  GH_TOKEN: ${{ steps.runewright.outputs.token }}
+                  # Cursor drops bot-authored trigger comments, so the request
+                  # prefers the owner-minted token and falls back to runewright
+                  # only where no owner-minted token is configured.
+                  SUMMON_TOKEN: ${{ secrets.RUNEWRIGHT_GITHUB_TOKEN }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+              run: |
+                  set -o pipefail
+                  # The label is a one-round token: consume it before posting,
+                  # so a failed post reads as a missing summon comment rather
+                  # than a stale label that re-fires later.
+                  gh api -X DELETE "repos/$REPO/issues/$PR/labels/review%3Acursor" >/dev/null
+                  GH_TOKEN=${SUMMON_TOKEN:-$GH_TOKEN} gh api -X POST \
+                      "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id'
