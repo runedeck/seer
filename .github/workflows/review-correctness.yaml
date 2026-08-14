@@ -26,7 +26,7 @@ env:
     RUNESEER_PROVIDER_FAILURE_MESSAGE: |
         ### Runeseer is paused — review provider unavailable
 
-        Runeseer could not complete this review. Claude usage may be exhausted, or the provider returned an error.
+        Runeseer could not produce a valid verdict. Claude usage may be exhausted, the provider may have failed, or the review output may be incomplete.
 
         An owner can restore Claude usage or wait for the limit to reset.
 
@@ -672,15 +672,8 @@ jobs:
                       fi
 
                       run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                      if ! job_url=$(gh api --paginate \
-                          "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
-                          --jq '[.jobs[] | select(.name == "review / correctness")]' \
-                          | jq -s -r 'add // [] | first // empty | .html_url // ""'); then
-                          job_url=""
-                      fi
-                      [ -n "$job_url" ] || job_url="$run_url"
                       body=$(printf '%s\n\n[Open the failed workflow](%s)\n\n%s' \
-                          "$RUNESEER_PROVIDER_FAILURE_MESSAGE" "$job_url" "$marker")
+                          "$RUNESEER_PROVIDER_FAILURE_MESSAGE" "$run_url" "$marker")
                       if ! GH_TOKEN="$RUNESEER_TOKEN" gh api -X POST \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
                           -f body="$body" >/dev/null; then
