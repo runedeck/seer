@@ -39,6 +39,7 @@ Dashboard state cannot be scripted; follow the guide named above and verify with
 - `claude-code-action` refuses `track_progress` on labeled events, and labels are the standard review request: the flag is gated with `github.event.action != 'labeled'` so progress tracking runs everywhere the action supports it.
 - The hosted runner's `gh` predates `--slurp`: paginate with per-page `--jq` arrays merged through `jq -s 'add'`.
 - Round end consumes the review labels, and a failed round consumes them too. To re-summon: convert the pull request to draft, apply the label (the draft guard skips the run, so the label survives), then mark ready, which fires the review under an action every input accepts.
+- A correctness round without a valid verdict posts one exact-head Runeseer pause notice. `issue:rune` remains the authoritative blocker. The notice links the failed workflow and never copies provider output. Inspect Actions logs for the cause. A successful current-head round removes the blocker.
 - Never push after a clean verdict: stale-review dismissal removes the earned approval on any push, so documentation follow-ups ride the next pull request.
 
 EXECUTE NOW: work the TODO list top to bottom, then run the DONE WHEN check on a scratch pull request.
