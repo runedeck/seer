@@ -35,7 +35,10 @@ jobs:
                   echo "greet=false" >> "$GITHUB_OUTPUT"
                   pr=$(gh api "repos/$REPO/commits/$MERGE_SHA/pulls" \
                       --jq '[.[] | select(.merged_at != null)] | first')
-                  [ -n "$pr" ] && [ "$pr" != "null" ] || { echo "no merged PR for this push"; exit 0; }
+                  if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+                      echo "no merged PR for this push"
+                      exit 0
+                  fi
                   IFS=$'\t' read -r author author_type number \
                       < <(jq -r '[.user.login, .user.type, .number] | @tsv' <<<"$pr")
                   [ "$author_type" = "Bot" ] && { echo "bot author, no greeting"; exit 0; }
