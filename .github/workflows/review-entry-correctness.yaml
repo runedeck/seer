@@ -13,7 +13,7 @@ name: Review Correctness Entry
 # explicitly and strips its instruction surfaces before the model reads it.
 on:
     pull_request_target:
-        types: [labeled, unlabeled, ready_for_review]
+        types: [labeled, unlabeled, ready_for_review, edited]
 
 permissions:
     contents: read
@@ -91,19 +91,35 @@ jobs:
             - env:
                   GH_TOKEN: ${{ github.token }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
               run: |
                   set -o pipefail
                   # A red mirror names what it saw: the lane job, and the verdict
                   # when one exists for this head. A missing verdict marks a lane
                   # fault rather than a judgment, and each case states its retry.
+                  verdict_comments() {
+                      gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
+                          --jq '[.[] | select(.user.login == "runeseer[bot]") | select(.body | contains("<!-- runeseer-verdict sha=" + env.HEAD_SHA + " base=" + env.BASE_SHA + " round="))]' \
+                          | jq -s 'add // []'
+                  }
+                  latest_machine_verdict() {
+                      verdict_comments | jq -r '
+                          [.[]
+                              | . as $comment
+                              | try (.body | capture("round=(?<round>[0-9]+) verdict=(?<verdict>clean|findings)( restart=(?<restart>none|cursor|macroscope))? -->")) catch null
+                              | select(. != null)
+                              | {round: (.round | tonumber), verdict, restart: (.restart // "none"), updated_at: $comment.updated_at, id: $comment.id}]
+                          | sort_by(.round, .updated_at, .id)
+                          | last // {}
+                          | "\(.verdict // ""):\(.restart // "")"'
+                  }
                   explain_lane_failure() {
                       conclusion="$1"
                       job_url=$(gh api --paginate "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
                           --jq '[.jobs[] | select(.name == "review / correctness")]' \
                           | jq -s -r 'add // [] | first // empty | .html_url // ""') || job_url=""
-                      verdict_line=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                          --jq '[.[] | select(.user.login == "runeseer[bot]") | select(.body | startswith("review/correctness:")) | select(.body | contains(env.HEAD_SHA))]' \
-                          | jq -s -r 'add // [] | last // empty | "\(.body | split("\n") | first) (\(.html_url))"') || verdict_line=""
+                      verdict_line=$(verdict_comments \
+                          | jq -r 'last // empty | "\(.body | split("\n") | map(select(startswith("**"))) | first // (.body | split("\n") | first)) (\(.html_url))"') || verdict_line=""
                       echo "the lane concluded: $conclusion"
                       [ -n "$job_url" ] && echo "lane job: $job_url"
                       if [ -n "$verdict_line" ]; then
@@ -113,11 +129,7 @@ jobs:
                           echo "no verdict exists for this head: the lane faulted before judging; rerun this workflow or apply review:runeseer for a fresh round"
                       fi
                   }
-                  # The overrides are read first, because they must hold however
-                  # the lane concluded. Gating is exactly what this mirror does,
-                  # so both clear it; they still differ where it counts, in that
-                  # skip: spends nothing and produces no findings while ignore:
-                  # leaves the lane's full record on the pull request. A failed
+                  # Read live overrides before the mirror decides. A failed
                   # label read must not read as an applied override.
                   labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
                       --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
@@ -128,6 +140,12 @@ jobs:
                       echo "skip:runeseer present; this lane is out of scope for this pull request."
                       exit 0
                   fi
+                  # ignore:runeseer cannot hide a failed current round. It can
+                  # release only a prior judgment when no new round ran.
+                  if [ "${{ needs.review.result }}" != "success" ] && [ "${{ needs.review.result }}" != "skipped" ]; then
+                      explain_lane_failure "${{ needs.review.result }}"
+                      exit 1
+                  fi
                   # ignore: releases a judged lane, never a broken one. Every
                   # completed round posts exactly one summary whose first line
                   # carries the head it judged, and it posts that summary
@@ -137,19 +155,13 @@ jobs:
                   # inline or approves, so a round of carried or Low findings
                   # leaves none.
                   if printf '%s\n' "$labels" | grep -qx 'ignore:runeseer'; then
-                      judged=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                          --jq '[.[] | select(.user.login == "runeseer[bot]") | select(.body | startswith("review/correctness:")) | select(.body | contains(env.HEAD_SHA))]' \
-                          | jq -s -r 'add // [] | length') \
+                      judged=$(verdict_comments | jq -r 'length') \
                           || { echo "could not read the pull request comments; rerun the check"; exit 1; }
                       if [ "$judged" != "0" ]; then
                           echo "ignore:runeseer present and this head carries a Runeseer verdict summary; the owner accepted its findings."
                           exit 0
                       fi
                       echo "ignore:runeseer present, but no Runeseer verdict exists for this head; a lane that never judged is broken, not ignored."
-                      exit 1
-                  fi
-                  if [ "${{ needs.review.result }}" != "success" ] && [ "${{ needs.review.result }}" != "skipped" ]; then
-                      explain_lane_failure "${{ needs.review.result }}"
                       exit 1
                   fi
                   # A reusable workflow whose inner job skips its guard still
@@ -178,9 +190,17 @@ jobs:
                       --jq '[.[] | select(.user.login == "runeseer[bot]" and .commit_id == env.HEAD_SHA)]' \
                       | jq -s -r 'add // [] | sort_by(.submitted_at) | last | .state // ""') \
                       || { echo "could not read the pull request reviews; rerun the check"; exit 1; }
-                  if [ "$latest_state" = "APPROVED" ]; then
-                      echo "Runeseer's latest review approves this head."
+                  machine_verdict=$(latest_machine_verdict) \
+                      || { echo "could not read the current Runeseer verdict; rerun the check"; exit 1; }
+                  live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv') \
+                      || { echo "could not read the live pull request; rerun the check"; exit 1; }
+                  if [ "$live" != "$HEAD_SHA"$'\t'"$BASE_SHA" ]; then
+                      echo "the pull request head or base changed; start a new review round"
+                      exit 1
+                  fi
+                  if [ "$latest_state" = "APPROVED" ] && [ "$machine_verdict" = "clean:none" ]; then
+                      echo "Runeseer's latest review approves this head and current base."
                       exit 0
                   fi
-                  echo "no standing Runeseer approval for this head; apply the review label to start a round"
+                  echo "no standing clean Runeseer verdict for this head and base; apply the review label to start a round"
                   exit 1
