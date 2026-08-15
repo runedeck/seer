@@ -25,6 +25,14 @@ env:
     APPS_EXPECTED_SUMMONED: cursor macroscopeapp
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
     LABEL_RUNE_BLOCKED: "issue:rune"
+    RUNESEER_PROVIDER_FAILURE_MESSAGE: |
+        ### Runeseer is paused — review provider unavailable
+
+        Runeseer could not produce a valid verdict. Claude usage may be exhausted, the provider may have failed, or the review output may be incomplete.
+
+        An owner can restore Claude usage or wait for the limit to reset.
+
+        Rerun the failed workflow only when the pull request head is unchanged. Otherwise, clear `issue:rune` after recovery and request a new round.
     LABEL_STAGE_CURSOR: "stage%3Acursor"
     LABEL_STAGE_MACROSCOPE: "stage%3Amacroscope"
     ARTIFACT_PREFIX: runeseer-verdict-pr
@@ -851,6 +859,7 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  RUNESEER_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
               run: |
                   set -o pipefail
@@ -884,6 +893,36 @@ jobs:
                       gh api -X POST \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" \
                           -f "labels[]=$LABEL_RUNE_BLOCKED" >/dev/null
+                      if [ -z "$RUNESEER_TOKEN" ]; then
+                          echo "::warning::Runeseer app token is unavailable. The provider failure notice was not posted"
+                          exit 0
+                      fi
+
+                      # A fixed message explains the failure without copying
+                      # provider output or pull request text into the comment.
+                      marker="<!-- runeseer-provider-failure:$HEAD_SHA -->"
+                      if ! comments=$(gh api --paginate \
+                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
+                          --jq '[.[] | select(.user.login == "runeseer[bot]") | .body]' \
+                          | jq -s 'add // []'); then
+                          echo "::warning::could not read Runeseer comments. The provider failure notice was not posted"
+                          exit 0
+                      fi
+                      if jq -e --arg marker "$marker" 'any(.[]; contains($marker))' <<<"$comments" >/dev/null; then
+                          echo "the provider failure notice already exists for $HEAD_SHA"
+                          exit 0
+                      fi
+
+                      run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                      body=$(printf '%s\n\n[Open the failed workflow](%s)\n\n%s' \
+                          "$RUNESEER_PROVIDER_FAILURE_MESSAGE" "$run_url" "$marker")
+                      if ! GH_TOKEN="$RUNESEER_TOKEN" gh api -X POST \
+                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+                          -f body="$body" >/dev/null; then
+                          echo "::warning::could not post the Runeseer provider failure notice"
+                      else
+                          echo "posted one provider failure notice for $HEAD_SHA"
+                      fi
                   fi
 
             # The spec's word is binding: a lane holding unresolved findings
