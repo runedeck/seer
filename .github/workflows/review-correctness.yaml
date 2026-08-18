@@ -320,13 +320,61 @@ jobs:
                   sudo install -o root -g root -m 0444 "$lane_tmp"/*.json "$RUNESEER_LANES/"
                   echo "inline: $(jq 'length' "$lane_tmp/inline-comments.json"), issue: $(jq 'length' "$lane_tmp/issue-comments.json")"
 
+            # A dead or exhausted credential fails inside the action in under
+            # a second, at zero cost, with the error text hidden. One direct
+            # API call classifies the credential before the paid round spends
+            # anything, and the class feeds the circuit breaker's diagnosis.
+            - id: preflight
+              name: Preflight the review credential
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+              run: |
+                  response=$(mktemp)
+                  status=$(curl -sS -o "$response" -w '%{http_code}' \
+                      --max-time 30 \
+                      https://api.anthropic.com/v1/messages \
+                      -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" \
+                      -H "anthropic-beta: oauth-2025-04-20" \
+                      -H "anthropic-version: 2023-06-01" \
+                      -H "content-type: application/json" \
+                      -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"ok"}]}') \
+                      || status=network
+                  case "$status" in
+                      200|400)
+                          # A 400 means authentication passed and only the
+                          # request shape was rejected: the credential works.
+                          fault=none ;;
+                      401|403) fault=credential ;;
+                      429) fault=rate-limit ;;
+                      5*) fault=provider ;;
+                      network) fault=network ;;
+                      *) fault=unknown ;;
+                  esac
+                  echo "fault=$fault" >> "$GITHUB_OUTPUT"
+                  command rm -f "$response"
+                  if [ "$fault" = "none" ]; then
+                      echo "credential preflight passed (HTTP $status)"
+                      exit 0
+                  fi
+                  {
+                      echo "## Runeseer credential preflight failed"
+                      echo ""
+                      echo "HTTP status: \`$status\` — fault class: \`$fault\`"
+                      echo ""
+                      echo "The paid round did not start. Restore the Claude credential or wait for the limit to reset, then apply \`review:runeseer\` for a fresh round."
+                  } >> "$GITHUB_STEP_SUMMARY"
+                  echo "the review credential preflight failed: HTTP $status, class $fault"
+                  exit 1
+
             - id: runeseer
               uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
               with:
                   app-id: ${{ secrets.RUNESEER_APP_ID }}
                   private-key: ${{ secrets.RUNESEER_APP_KEY }}
 
-            - if: steps.scope.outputs.skip == 'false'
+            - id: review
+              if: steps.scope.outputs.skip == 'false'
               uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
               with:
                   claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -435,6 +483,29 @@ jobs:
                       - Use present tense, concrete nouns, and direct causal language.
 
                       A review that writes no result is a failed review. Even a clean review must write both required files.
+
+            # The action hides its full output so tool results cannot leak
+            # secrets into public logs. On failure, print only the terminal
+            # result record: it carries the provider's rejection reason and
+            # never contains tool output.
+            - name: Explain a failed review
+              if: failure() && steps.scope.outputs.skip == 'false'
+              run: |
+                  exec_log="${{ steps.review.outputs.execution_file }}"
+                  [ -n "$exec_log" ] || exec_log=/home/runner/work/_temp/claude-execution-output.json
+                  [ -f "$exec_log" ] || { echo "no execution record exists for this round"; exit 0; }
+                  record=$(jq -c '[.[] | select(.type == "result")] | last // {}
+                      | {subtype, is_error, num_turns, duration_ms, total_cost_usd,
+                         result: ((.result // "") | tostring | .[0:600])}' \
+                      "$exec_log" 2>/dev/null) || { echo "the execution record did not parse"; exit 0; }
+                  echo "terminal result record: $record"
+                  {
+                      echo "## Review round failed"
+                      echo ""
+                      echo '```json'
+                      echo "$record"
+                      echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
 
             # Bind each new Runeseer inline comment to the machine findings.
             # The model cannot modify this root-owned evidence.
@@ -886,6 +957,15 @@ jobs:
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$encoded" \
                           >/dev/null 2>&1 || true
                   else
+                      # The preflight's class turns a bare issue:rune into a
+                      # diagnosis: credential, rate-limit, provider, or unknown.
+                      fault="${{ steps.preflight.outputs.fault }}"
+                      echo "provider fault class: ${fault:-unknown}"
+                      {
+                          echo "## Runeseer provider fault"
+                          echo ""
+                          echo "Fault class: \`${fault:-unknown}\`"
+                      } >> "$GITHUB_STEP_SUMMARY"
                       gh api "repos/${{ github.repository }}/labels/$encoded" >/dev/null 2>&1 \
                           || gh api -X POST "repos/${{ github.repository }}/labels" \
                               -f name="$LABEL_RUNE_BLOCKED" -f color="d93f0b" \
@@ -937,6 +1017,17 @@ jobs:
               run: |
                   set -o pipefail
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; the review did not complete"; exit 1; }
+                  # A verdict is only judgable when the round did real model
+                  # work: a terminal record with an error, or one below a
+                  # minimal turn count, cannot have produced a real review.
+                  exec_log="${{ steps.review.outputs.execution_file }}"
+                  [ -n "$exec_log" ] || exec_log=/home/runner/work/_temp/claude-execution-output.json
+                  if [ -f "$exec_log" ]; then
+                      jq -e '[.[] | select(.type == "result")] | last
+                          | (.is_error == false) and ((.num_turns // 0) >= 3)' \
+                          "$exec_log" >/dev/null 2>&1 \
+                          || { echo "the execution record does not show a plausible completed review; the check stays red"; exit 1; }
+                  fi
                   live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv')
                   if [ "$live" != "$HEAD_SHA"$'\t'"$BASE_SHA" ]; then
                       echo "the pull request head or base changed; this stale verdict cannot clear the check."
