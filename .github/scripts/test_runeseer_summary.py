@@ -315,6 +315,23 @@ class SummaryTests(unittest.TestCase):
         ]
         self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, comments), data)
 
+    def test_runeseer_ledger_judgment_skips_lane_bindings(self):
+        data = verdict()
+        data["lane_judgments"] = [
+            {
+                "path": "install-tools",
+                "line": 227,
+                "summary": "Per-skill schema never runs",
+                "lane": "runeseer",
+                "judgment": "already addressed",
+                "severity": "high",
+                "reason": "HEAD validates every entrypoint against its nearest schema.",
+                "comment_id": 99,
+            }
+        ]
+        comments = []
+        self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, comments), data)
+
     def test_issue_comments_must_be_acknowledged(self):
         comments = [{"id": 7, "user": {"login": "cursor[bot]"}}]
         with self.assertRaises(SUMMARY.SummaryError):

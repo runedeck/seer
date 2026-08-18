@@ -103,6 +103,11 @@ def validate_lane_bindings(
 
     judged_ids: set[int] = set()
     for judgment in judgments:
+        # Ledger rechecks judge Runeseer's own earlier findings. Those
+        # comments live outside the external lane files, so the external
+        # binding rules below cannot apply to them.
+        if judgment.get("lane") == "runeseer":
+            continue
         comment_id = judgment["comment_id"]
         if comment_id in judged_ids:
             raise SummaryError("Each lane comment can have only one judgment.")
@@ -289,7 +294,7 @@ def validate_verdict(
         if type(item.get("line")) is not int or item["line"] < 0:
             raise SummaryError("Each lane judgment needs a nonnegative line number.")
         validate_plain_text(item.get("summary"), "Each lane judgment summary")
-        if item.get("lane") not in set(LANE_LOGINS.values()):
+        if item.get("lane") not in set(LANE_LOGINS.values()) | {"runeseer"}:
             raise SummaryError("Each lane judgment needs a known source lane.")
         comment_id = item.get("comment_id")
         if type(comment_id) is not int or comment_id < 1:
