@@ -120,6 +120,31 @@ jobs:
                       echo "skip=false" >> "$GITHUB_OUTPUT"
                   fi
 
+            # A review label requests exactly one round. Consuming the summon
+            # labels here, before any paid work, survives the cancellation
+            # that skipped the late cleanup step and left a stale summon to
+            # start an unwanted round on the next event. A faulted round
+            # blocks with issue:rune, and a fresh summon is the owner's
+            # explicit retry, so the same step clears the blocker without a
+            # second manual label edit.
+            - name: Consume the review labels
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  for label in $LABELS_CONSUMED; do
+                      gh api -X DELETE \
+                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$label" \
+                          >/dev/null 2>&1 || true
+                  done
+                  echo "review labels consumed; a new review label starts the next round."
+                  if [ "${{ steps.scope.outputs.skip }}" = "false" ]; then
+                      encoded=$(printf '%s' "$LABEL_RUNE_BLOCKED" | sed 's/:/%3A/')
+                      gh api -X DELETE \
+                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$encoded" \
+                          >/dev/null 2>&1 || true
+                      echo "provider blocker cleared; this summon is the owner's retry."
+                  fi
+
             # Fetch trusted formatter code once, before the paid review starts.
             # Later steps reuse this exact reusable-workflow revision.
             - name: Fetch the review formatter
@@ -786,23 +811,6 @@ jobs:
                           -f commit_id="$HEAD_SHA" \
                           -f body="Earned approval: review/correctness returned a clean verdict for ${HEAD_SHA}. Dismissed automatically on any new push."
                   fi
-
-            # A review label requests one round, even when the scope stands down:
-            # consuming the labels stops a later push from re-running the
-            # paid lane out of funnel order. The next round starts with a
-            # fresh review label.
-            - name: Consume the review labels
-              if: always()
-              continue-on-error: true
-              env:
-                  GH_TOKEN: ${{ github.token }}
-              run: |
-                  for label in $LABELS_CONSUMED; do
-                      gh api -X DELETE \
-                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$label" \
-                          >/dev/null 2>&1 || true
-                  done
-                  echo "review labels consumed; a new review label starts the next round."
 
             # The adjudicator's requested restart clears the recorded stage
             # labels, so the next round re-runs the named stage onward. The
