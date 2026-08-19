@@ -355,6 +355,50 @@ class SummaryTests(unittest.TestCase):
         ]
         self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, comments), data)
 
+    def test_runeseer_ledger_judgment_skips_lane_bindings(self):
+        data = verdict()
+        data["lane_judgments"] = [
+            {
+                "path": "install-tools",
+                "line": 227,
+                "summary": "Per-skill schema never runs",
+                "lane": "runeseer",
+                "judgment": "already addressed",
+                "severity": "high",
+                "reason": "HEAD validates every entrypoint against its nearest schema.",
+                "comment_id": 99,
+            }
+        ]
+        comments = []
+        self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, comments), data)
+
+    def test_confirmed_runeseer_recheck_keeps_open_finding_valid(self):
+        data = verdict(
+            findings=[
+                {
+                    "path": "install-tools",
+                    "line": 227,
+                    "summary": "Setup omits its executable path",
+                    "lane": "runeseer",
+                    "judgment": "confirmed",
+                    "severity": "medium",
+                }
+            ]
+        )
+        data["lane_judgments"] = [
+            {
+                "path": "install-tools",
+                "line": 227,
+                "summary": "Setup omits its executable path",
+                "lane": "runeseer",
+                "judgment": "confirmed",
+                "severity": "medium",
+                "reason": "The defect is still present at HEAD.",
+                "comment_id": 99,
+            }
+        ]
+        self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, []), data)
+
     def test_issue_comments_must_be_acknowledged(self):
         comments = [{"id": 7, "user": {"login": "cursor[bot]"}}]
         with self.assertRaises(SUMMARY.SummaryError):

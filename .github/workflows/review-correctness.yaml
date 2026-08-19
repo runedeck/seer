@@ -22,7 +22,6 @@ env:
     LANE_GRAPHQL_LOGINS: '["macroscopeapp", "cursor", "macroscopeapp[bot]", "cursor[bot]"]'
     RUNESEER_GRAPHQL_LOGINS: '["runeseer", "runeseer[bot]"]'
     APPS_EXPECTED: cursor
-    APPS_EXPECTED_SUMMONED: cursor macroscopeapp
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
     LABEL_RUNE_BLOCKED: "issue:rune"
     RUNESEER_PROVIDER_FAILURE_GUIDANCE: |
@@ -142,10 +141,14 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  CURSOR_SKIPPED: ${{ contains(github.event.pull_request.labels.*.name, 'skip:cursor') }}
                   MACROSCOPE_SUMMONED: ${{ contains(github.event.pull_request.labels.*.name, 'review:macroscope') }}
               run: |
-                  expected="$APPS_EXPECTED"
-                  [ "$MACROSCOPE_SUMMONED" = "true" ] && expected="$APPS_EXPECTED_SUMMONED"
+                  expected=""
+                  [ "$CURSOR_SKIPPED" != "true" ] && expected="$APPS_EXPECTED"
+                  if [ "$MACROSCOPE_SUMMONED" = "true" ]; then
+                      expected="${expected:+$expected }macroscopeapp"
+                  fi
                   for _ in $(seq 1 "$POLL_ROUNDS"); do
                       settled=true
                       for app in $expected; do
@@ -364,14 +367,16 @@ jobs:
 
                       Convergence rule, binding:
                       - From the third round onward, open no new finding below High severity. Judge the other lanes' findings and recheck the ledger as usual, but a fresh nitpick of your own at that point holds the pull request open for no gain, and the author has already answered everything you raised.
-                      - Report a novel High or Critical finding at any round: real defects always earn a report.
+                      - During the first ten turns, report each novel High or Critical finding.
                       - A judgment you already made stands. Do not reverse an earlier round's accepted resolution because you now prefer a different trade-off. If an earlier decision looks wrong, add one plain summary note and leave the verdict clean.
                       - Never demand the opposite of what an earlier round demanded on the same code.
 
                       Defensive posture, binding:
                       - Use your turns efficiently. Write both required files as soon as you can decide the verdict, then stop. A round that ends without the files wastes every token it spent.
                       - Spend your first ten turns on the diff, the lane findings, and the ledger. After ten turns, stop exploration and write the files with what you have.
-                      - From round 10 onward, adjudicate only: recheck the ledger and judge the other lanes' findings. Open no novel finding below Critical severity. Keep the human summary to the verdict line plus one sentence.
+                      - After turn 10, recheck the ledger and judge the other lanes' findings.
+                      - At that point, open a novel finding only at Critical severity.
+                      - Keep the human summary to the verdict line plus one sentence.
                       - Post a novel finding only when you can name the concrete code fact behind it. When you are not certain, verify with the read tools first or leave the finding out.
 
                       Review procedure:
