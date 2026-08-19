@@ -103,6 +103,11 @@ def validate_lane_bindings(
 
     judged_ids: set[int] = set()
     for judgment in judgments:
+        # Ledger rechecks judge Runeseer's own earlier findings. Those
+        # comments live outside the external lane files, so the external
+        # binding rules below cannot apply to them.
+        if judgment.get("lane") == "runeseer":
+            continue
         comment_id = judgment["comment_id"]
         if comment_id in judged_ids:
             raise SummaryError("Each lane comment can have only one judgment.")
@@ -289,7 +294,7 @@ def validate_verdict(
         if type(item.get("line")) is not int or item["line"] < 0:
             raise SummaryError("Each lane judgment needs a nonnegative line number.")
         validate_plain_text(item.get("summary"), "Each lane judgment summary")
-        if item.get("lane") not in set(LANE_LOGINS.values()):
+        if item.get("lane") not in set(LANE_LOGINS.values()) | {"runeseer"}:
             raise SummaryError("Each lane judgment needs a known source lane.")
         comment_id = item.get("comment_id")
         if type(comment_id) is not int or comment_id < 1:
@@ -320,7 +325,9 @@ def validate_verdict(
             item.get("comment_id"),
         ): item
         for item in judgments
-        if item.get("judgment") == "confirmed" and item.get("severity") != "low"
+        if item.get("judgment") == "confirmed"
+        and item.get("severity") != "low"
+        and item.get("lane") != "runeseer"
     }
     if confirmed.keys() != lane_findings.keys():
         raise SummaryError(
@@ -334,6 +341,27 @@ def validate_verdict(
         ):
             raise SummaryError(
                 "Each lane finding must preserve its judgment summary and severity."
+            )
+    own_findings = {
+        (item.get("path"), item.get("line"), item.get("summary")): item
+        for item in findings
+        if item.get("lane") == "runeseer"
+    }
+    confirmed_own = {
+        (item.get("path"), item.get("line"), item.get("summary")): item
+        for item in judgments
+        if item.get("lane") == "runeseer"
+        and item.get("judgment") == "confirmed"
+        and item.get("severity") != "low"
+    }
+    if not confirmed_own.keys() <= own_findings.keys():
+        raise SummaryError(
+            "Each confirmed Runeseer judgment must remain an open Runeseer finding."
+        )
+    for key, judgment in confirmed_own.items():
+        if own_findings[key]["severity"] != judgment["severity"]:
+            raise SummaryError(
+                "Each Runeseer finding must preserve its judgment severity."
             )
     expected_verdict = "clean" if not findings else "findings"
     if verdict["verdict"] != expected_verdict:
