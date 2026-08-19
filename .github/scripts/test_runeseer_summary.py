@@ -399,6 +399,23 @@ class SummaryTests(unittest.TestCase):
         ]
         self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, []), data)
 
+    def test_confirmed_runeseer_recheck_must_remain_open(self):
+        data = verdict()
+        data["lane_judgments"] = [
+            {
+                "path": "install-tools",
+                "line": 227,
+                "summary": "Setup omits its executable path",
+                "lane": "runeseer",
+                "judgment": "confirmed",
+                "severity": "medium",
+                "reason": "The defect is still present at HEAD.",
+                "comment_id": 99,
+            }
+        ]
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.validate_verdict(data, SHA, 1, [])
+
     def test_issue_comments_must_be_acknowledged(self):
         comments = [{"id": 7, "user": {"login": "cursor[bot]"}}]
         with self.assertRaises(SUMMARY.SummaryError):
