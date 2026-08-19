@@ -325,7 +325,9 @@ def validate_verdict(
             item.get("comment_id"),
         ): item
         for item in judgments
-        if item.get("judgment") == "confirmed" and item.get("severity") != "low"
+        if item.get("judgment") == "confirmed"
+        and item.get("severity") != "low"
+        and item.get("lane") != "runeseer"
     }
     if confirmed.keys() != lane_findings.keys():
         raise SummaryError(
