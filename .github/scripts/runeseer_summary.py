@@ -342,6 +342,27 @@ def validate_verdict(
             raise SummaryError(
                 "Each lane finding must preserve its judgment summary and severity."
             )
+    own_findings = {
+        (item.get("path"), item.get("line"), item.get("summary")): item
+        for item in findings
+        if item.get("lane") == "runeseer"
+    }
+    confirmed_own = {
+        (item.get("path"), item.get("line"), item.get("summary")): item
+        for item in judgments
+        if item.get("lane") == "runeseer"
+        and item.get("judgment") == "confirmed"
+        and item.get("severity") != "low"
+    }
+    if not confirmed_own.keys() <= own_findings.keys():
+        raise SummaryError(
+            "Each confirmed Runeseer judgment must remain an open Runeseer finding."
+        )
+    for key, judgment in confirmed_own.items():
+        if own_findings[key]["severity"] != judgment["severity"]:
+            raise SummaryError(
+                "Each Runeseer finding must preserve its judgment severity."
+            )
     expected_verdict = "clean" if not findings else "findings"
     if verdict["verdict"] != expected_verdict:
         raise SummaryError("The verdict value does not match the findings array.")
