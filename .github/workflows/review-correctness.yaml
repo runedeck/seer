@@ -25,10 +25,8 @@ env:
     APPS_EXPECTED_SUMMONED: cursor macroscopeapp
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
     LABEL_RUNE_BLOCKED: "issue:rune"
-    RUNESEER_PROVIDER_FAILURE_MESSAGE: |
-        ### Runeseer is paused — review provider unavailable
-
-        Runeseer could not produce a valid verdict. Claude usage may be exhausted, the provider may have failed, or the review output may be incomplete.
+    RUNESEER_PROVIDER_FAILURE_GUIDANCE: |
+        The possible causes are exhausted Claude usage, a provider failure, or incomplete review output.
 
         An owner can restore Claude usage or wait for the limit to reset.
 
@@ -339,8 +337,12 @@ jobs:
                   # flag. The adjudicator runs on opus: the judging layer of
                   # the review cascade gets the strongest reviewer.
                   track_progress: ${{ github.event.action != 'labeled' }}
+                  # The turn cap is a hard stop against a runaway review loop:
+                  # a normal round finishes well inside it, and the prompt's
+                  # turn-efficiency rule keeps a capped round still valid.
                   claude_args: |
                       --model opus
+                      --max-turns 40
                       --allowedTools "Read,Write,Grep,Glob,mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*)"
                   prompt: |
                       You are runeseer, the adjudicating correctness reviewer. Write with the terse, factual register of Cursor Bugbot and Macroscope. Output rules below are binding.
@@ -365,6 +367,12 @@ jobs:
                       - Report a novel High or Critical finding at any round: real defects always earn a report.
                       - A judgment you already made stands. Do not reverse an earlier round's accepted resolution because you now prefer a different trade-off. If an earlier decision looks wrong, add one plain summary note and leave the verdict clean.
                       - Never demand the opposite of what an earlier round demanded on the same code.
+
+                      Defensive posture, binding:
+                      - Use your turns efficiently. Write both required files as soon as you can decide the verdict, then stop. A round that ends without the files wastes every token it spent.
+                      - Spend your first ten turns on the diff, the lane findings, and the ledger. After ten turns, stop exploration and write the files with what you have.
+                      - From round 10 onward, adjudicate only: recheck the ledger and judge the other lanes' findings. Open no novel finding below Critical severity. Keep the human summary to the verdict line plus one sentence.
+                      - Post a novel finding only when you can name the concrete code fact behind it. When you are not certain, verify with the read tools first or leave the finding out.
 
                       Review procedure:
                       - Judge every non-ledger finding from the other lanes against HEAD as `confirmed`, `disputed`, or `already addressed`.
@@ -874,7 +882,8 @@ jobs:
                           --jq '[.[] | select(.user.login == "runeseer[bot]") | select(.body | contains(env.MARKER))] | length > 0' \
                           | jq -s 'any') || published=false
                   fi
-                  if [ "$published" = "true" ] && python3 "$RUNESEER_FORMATTER" validate-verdict \
+                  verdict_valid=false
+                  if python3 "$RUNESEER_FORMATTER" validate-verdict \
                       --verdict runeseer-verdict.json \
                       --sha "$HEAD_SHA" \
                       --round "$REVIEW_ROUND" \
@@ -882,6 +891,21 @@ jobs:
                       --lane-comments "$RUNESEER_LANES/issue-comments.json" \
                       --runeseer-comments "$RUNESEER_LANES/runeseer-new-comments.json" \
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" >/dev/null 2>&1; then
+                      verdict_valid=true
+                  fi
+                  # Name the real fault in fixed words. No provider output or
+                  # pull request text reaches the comment.
+                  if [ ! -f runeseer-verdict.json ]; then
+                      fault_title="the provider produced no verdict"
+                      fault_detail="The round ended without a verdict file. The provider did not complete the review."
+                  elif [ "$verdict_valid" != "true" ]; then
+                      fault_title="the verdict failed validation"
+                      fault_detail="The provider produced a verdict. The verdict did not validate for this head and round."
+                  else
+                      fault_title="the summary was not published"
+                      fault_detail="The verdict validated. The summary comment did not reach the pull request."
+                  fi
+                  if [ "$published" = "true" ] && [ "$verdict_valid" = "true" ]; then
                       gh api -X DELETE \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$encoded" \
                           >/dev/null 2>&1 || true
@@ -914,8 +938,8 @@ jobs:
                       fi
 
                       run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                      body=$(printf '%s\n\n[Open the failed workflow](%s)\n\n%s' \
-                          "$RUNESEER_PROVIDER_FAILURE_MESSAGE" "$run_url" "$marker")
+                      body=$(printf '### Runeseer is paused — %s\n\n%s\n\n%s\n[Open the failed workflow](%s)\n\n%s' \
+                          "$fault_title" "$fault_detail" "$RUNESEER_PROVIDER_FAILURE_GUIDANCE" "$run_url" "$marker")
                       if ! GH_TOKEN="$RUNESEER_TOKEN" gh api -X POST \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
                           -f body="$body" >/dev/null; then
