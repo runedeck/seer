@@ -103,6 +103,71 @@ def load_previous_findings(path: Path | None) -> list[dict[str, Any]]:
     return findings
 
 
+def load_runeseer_records(path: Path | None) -> list[dict[str, Any]] | None:
+    if path is None:
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise SummaryError(f"Could not read {path}: {error}") from error
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SummaryError(
+                f"Runeseer finding line {line_number} must contain valid JSON."
+            ) from error
+        if not isinstance(record, dict):
+            raise SummaryError(
+                f"Runeseer finding line {line_number} must contain an object."
+            )
+        records.append(record)
+    return records
+
+
+def runeseer_record_key(record: dict[str, Any]) -> tuple[str, int, str]:
+    message = record.get("message")
+    if not isinstance(message, str) or not message:
+        raise SummaryError("Each Runeseer finding record needs a message.")
+    match = re.match(r"^\*\*(Critical|High|Medium)\*\* — ", message)
+    if match is None:
+        raise SummaryError("Each Runeseer finding message needs a severity prefix.")
+    severity = match.group(1).lower()
+    expected_level = "WARNING" if severity == "medium" else "ERROR"
+    if record.get("severity") != expected_level:
+        raise SummaryError("Each Runeseer finding severity must match its message.")
+    location = record.get("location")
+    location = location if isinstance(location, dict) else {}
+    path = location.get("path")
+    range_value = location.get("range")
+    range_value = range_value if isinstance(range_value, dict) else {}
+    start = range_value.get("start")
+    start = start if isinstance(start, dict) else {}
+    line = start.get("line")
+    validate_plain_text(path, "Each Runeseer finding path")
+    if type(line) is not int or line < 0:
+        raise SummaryError("Each Runeseer finding needs a nonnegative line number.")
+    return path, line, severity
+
+
+def validate_runeseer_records(
+    findings: list[dict[str, Any]], records: list[dict[str, Any]]
+) -> None:
+    finding_keys = sorted(
+        (finding["path"], finding["line"], finding["severity"])
+        for finding in findings
+        if finding["lane"] == "runeseer"
+    )
+    record_keys = sorted(runeseer_record_key(record) for record in records)
+    if finding_keys != record_keys:
+        raise SummaryError(
+            "The Runeseer verdict and finding records must contain the same findings."
+        )
+
+
 def validate_lane_bindings(
     judgments: list[dict[str, Any]],
     lane_comments: list[dict[str, Any]],
@@ -169,14 +234,12 @@ def validate_runeseer_bindings(
     findings: list[dict[str, Any]],
     comments: list[dict[str, Any]],
     previous_findings: list[dict[str, Any]],
+    allow_unposted: bool = False,
 ) -> None:
-    """Bind each novel Runeseer finding to the inline comment the workflow posted for it.
+    """Bind each posted Runeseer comment to one machine finding.
 
-    The model writes the findings file; reviewdog posts it after the session. The model
-    therefore cannot know comment IDs, so this step assigns them, matching by anchor and
-    severity against the root-owned list of new Runeseer comments. Every invariant the
-    model-supplied IDs used to carry still holds: every new comment needs an open finding,
-    every finding needs new or carried evidence, and anchors and severities must agree.
+    Reviewdog can filter a record outside the diff context. The summary keeps that finding
+    visible and blocking when the validated findings file proves that the model emitted it.
     """
     sources: dict[int, dict[str, Any]] = {}
     for comment in comments:
@@ -218,6 +281,8 @@ def validate_runeseer_bindings(
             if comment_key(comment) == anchor
         ]
         if not matches:
+            if allow_unposted:
+                continue
             raise SummaryError(
                 "Each new Runeseer finding needs a posted inline comment at its anchor."
             )
@@ -306,6 +371,7 @@ def validate_verdict(
     lane_comments: list[dict[str, Any]] | None = None,
     runeseer_comments: list[dict[str, Any]] | None = None,
     previous_findings: list[dict[str, Any]] | None = None,
+    runeseer_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(verdict, dict):
         raise SummaryError("The verdict must be a JSON object.")
@@ -389,8 +455,15 @@ def validate_verdict(
         validate_plain_text(item.get("reason"), "Each lane judgment reason")
     if lane_comments is not None:
         validate_lane_bindings(judgments, lane_comments, nonfinding_issue_ids)
+    if runeseer_records is not None:
+        validate_runeseer_records(findings, runeseer_records)
     if runeseer_comments is not None:
-        validate_runeseer_bindings(findings, runeseer_comments, previous_findings or [])
+        validate_runeseer_bindings(
+            findings,
+            runeseer_comments,
+            previous_findings or [],
+            allow_unposted=runeseer_records is not None,
+        )
     finding_keys = [
         (item.get("lane"), item.get("path"), item.get("line"), item.get("comment_id"))
         for item in findings
@@ -492,8 +565,26 @@ def validate_summary(summary: str, verdict: dict[str, Any]) -> str:
     if bullet_count > 3:
         raise SummaryError("The review summary must contain at most three bullets.")
     if prose_word_count(summary) > 80:
-        raise SummaryError("The review summary must contain at most 80 words.")
+        summary = normalized_summary(verdict)
     return summary
+
+
+def normalized_summary(verdict: dict[str, Any]) -> str:
+    state = (
+        "findings" if verdict["findings"] or verdict["restart"] != "none" else "clean"
+    )
+    parts: list[str] = []
+    count = len(verdict["findings"])
+    if count == 1:
+        parts.append("The review found one blocking correctness defect.")
+    elif count > 1:
+        parts.append(f"The review found {count} blocking correctness defects.")
+    else:
+        parts.append("The review found no blocking correctness defects.")
+    if verdict["restart"] != "none":
+        reviewer = verdict["restart"].capitalize()
+        parts.append(f"The workflow requires another {reviewer} review before approval.")
+    return f"{VERDICT_PREFIXES[state]} {' '.join(parts)}"
 
 
 def open_count_text(count: int) -> str:
@@ -545,6 +636,7 @@ def format_review(
     runeseer_comment_paths: list[Path] | None = None,
     previous_verdict_path: Path | None = None,
     session_stats: str = "",
+    runeseer_findings_path: Path | None = None,
 ) -> str:
     verdict = validate_verdict(
         load_json(verdict_path),
@@ -553,6 +645,7 @@ def format_review(
         load_lane_comments(lane_comment_paths),
         load_lane_comments(runeseer_comment_paths),
         load_previous_findings(previous_verdict_path),
+        load_runeseer_records(runeseer_findings_path),
     )
     try:
         summary_text = summary_path.read_text(encoding="utf-8")
@@ -756,6 +849,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--lane-comments", type=Path, action="append")
     validate_parser.add_argument("--runeseer-comments", type=Path, action="append")
     validate_parser.add_argument("--previous-verdict", type=Path)
+    validate_parser.add_argument("--runeseer-findings", type=Path)
 
     format_parser = commands.add_parser("format")
     format_parser.add_argument("--verdict", type=Path, required=True)
@@ -766,6 +860,7 @@ def build_parser() -> argparse.ArgumentParser:
     format_parser.add_argument("--lane-comments", type=Path, action="append")
     format_parser.add_argument("--runeseer-comments", type=Path, action="append")
     format_parser.add_argument("--previous-verdict", type=Path)
+    format_parser.add_argument("--runeseer-findings", type=Path)
     format_parser.add_argument("--session-stats", default="")
     format_parser.add_argument("--output", type=Path)
 
@@ -804,6 +899,7 @@ def main() -> int:
                 load_lane_comments(arguments.lane_comments),
                 load_lane_comments(arguments.runeseer_comments),
                 load_previous_findings(arguments.previous_verdict),
+                load_runeseer_records(arguments.runeseer_findings),
             )
             return 0
         if arguments.command == "format":
@@ -817,6 +913,7 @@ def main() -> int:
                 arguments.runeseer_comments,
                 arguments.previous_verdict,
                 arguments.session_stats,
+                arguments.runeseer_findings,
             )
             write_output(body, arguments.output)
             return 0

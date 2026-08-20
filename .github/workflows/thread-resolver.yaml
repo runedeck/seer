@@ -5,14 +5,32 @@ name: Thread Resolver
 # executes pull request code, and fork pull requests need the
 # base-context token's pull-requests write.
 on:
-    workflow_call: {}
+    workflow_call:
+        secrets:
+            RUNESEER_APP_ID:
+                required: false
+            RUNESEER_APP_KEY:
+                required: false
 
 jobs:
     resolve:
         name: resolve
         runs-on: ubuntu-latest
         timeout-minutes: 5
+        env:
+            HAS_RUNESEER_CREDENTIALS: ${{ secrets.RUNESEER_APP_ID != '' && secrets.RUNESEER_APP_KEY != '' }}
         steps:
+            # The workflow token cannot resolve threads that Runeseer created.
+            # Callers must pass both secrets to resolve those threads.
+            # The fallback keeps older callers operational during rollout.
+            - id: runeseer
+              name: Mint the Runeseer token
+              if: env.HAS_RUNESEER_CREDENTIALS == 'true'
+              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+              with:
+                  app-id: ${{ secrets.RUNESEER_APP_ID }}
+                  private-key: ${{ secrets.RUNESEER_APP_KEY }}
+
             # Fix commits name the finding threads they answer with
             # Resolves-Thread: trailers; resolution then carries an audit
             # trail per finding instead of a bulk sweep at the end. A trailer
@@ -22,7 +40,10 @@ jobs:
             # to the API raw.
             - name: Resolve threads named by pushed commits
               uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+              env:
+                  RUNESEER_TOKEN_ACTIVE: ${{ steps.runeseer.outputs.token != '' }}
               with:
+                  github-token: ${{ steps.runeseer.outputs.token || github.token }}
                   script: |
                       const pull_number = context.payload.pull_request.number;
                       // Only the commits this push introduced carry live
@@ -93,6 +114,9 @@ jobs:
                                   { id: thread.id });
                               core.info(`resolved ${thread.id} (${reference})`);
                           } catch (e) {
-                              core.warning(`could not resolve ${reference}: ${e.message}`);
+                              const guidance = process.env.RUNESEER_TOKEN_ACTIVE === 'true'
+                                  ? ''
+                                  : ' Pass the Runeseer App secrets from the caller.';
+                              core.warning(`could not resolve ${reference}: ${e.message}.${guidance}`);
                           }
                       }
