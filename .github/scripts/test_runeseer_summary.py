@@ -53,6 +53,18 @@ class SummaryTests(unittest.TestCase):
                 RUN_URL,
             )
 
+    def test_findings_message_normalizes_terminal_punctuation_and_spaces(self):
+        self.assertEqual(
+            SUMMARY.parse_runeseer_message(
+                "**Medium** — The setup omits its executable path.  \n- evidence"
+            ),
+            ("medium", "The setup omits its executable path"),
+        )
+
+    def test_findings_message_rejects_blank_summary(self):
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.parse_runeseer_message("**Medium** —    ")
+
     def test_clean_summary_has_markers_and_footer(self):
         body = self.format_case(
             verdict(),
@@ -172,10 +184,13 @@ class SummaryTests(unittest.TestCase):
                 "**Looks good.** The change is correct. <!-- runeseer-verdict -->",
             )
 
-    def test_summary_enforces_word_limit(self):
+    def test_overlong_summary_uses_fixed_summary(self):
         words = " ".join(f"word{number}" for number in range(81))
-        with self.assertRaises(SUMMARY.SummaryError):
-            self.format_case(verdict(), f"**Looks good.** {words}")
+        body = self.format_case(verdict(), f"**Looks good.** {words}")
+        self.assertIn(
+            "**Looks good.** The review found no open correctness defects.", body
+        )
+        self.assertNotIn("word80", body)
 
     def test_count_must_equal_findings_length(self):
         data = verdict()
@@ -444,7 +459,7 @@ class SummaryTests(unittest.TestCase):
         finding = {
             "path": "install-tools",
             "line": 227,
-            "summary": "Setup omits executable path",
+            "summary": "The setup omits its executable path",
             "lane": "runeseer",
             "judgment": "confirmed",
             "severity": "medium",
@@ -467,7 +482,12 @@ class SummaryTests(unittest.TestCase):
     def test_new_runeseer_comment_must_match_anchor_and_severity(self):
         for field, value in (
             ("line", 228),
-            ("body", self.reviewdog_body("**High** — Wrong severity.", "🚫")),
+            (
+                "body",
+                self.reviewdog_body(
+                    "**High** — The setup omits its executable path.", "🚫"
+                ),
+            ),
         ):
             with self.subTest(field=field):
                 finding = self.own_finding(comment_id=11)
@@ -477,6 +497,17 @@ class SummaryTests(unittest.TestCase):
                     SUMMARY.validate_verdict(
                         verdict(findings=[finding]), SHA, 1, None, [comment]
                     )
+
+    def test_new_runeseer_comment_must_match_summary(self):
+        finding = self.own_finding(comment_id=11)
+        comment = self.posted_comment(11)
+        comment["body"] = self.reviewdog_body(
+            "**Medium** — The setup writes the wrong executable path."
+        )
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.validate_verdict(
+                verdict(findings=[finding]), SHA, 1, None, [comment]
+            )
 
     def test_reviewdog_comment_needs_the_exact_runeseer_wrapper(self):
         body = self.reviewdog_body(
@@ -500,7 +531,7 @@ class SummaryTests(unittest.TestCase):
         return {
             "path": "install-tools",
             "line": 227,
-            "summary": "Setup omits executable path",
+            "summary": "The setup omits its executable path",
             "lane": "runeseer",
             "judgment": "confirmed",
             "severity": "medium",
@@ -524,6 +555,129 @@ class SummaryTests(unittest.TestCase):
         SUMMARY.validate_verdict(verdict(findings=[finding]), SHA, 1, None,
                                  [self.posted_comment(11)])
         self.assertEqual(finding["comment_id"], 11)
+
+    def test_draft_validation_requires_matching_findings(self):
+        finding = self.own_finding()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            verdict_path = root / "verdict.json"
+            summary_path = root / "summary.md"
+            findings_path = root / "findings.rdjsonl"
+            lanes_path = root / "lanes.json"
+            verdict_path.write_text(
+                json.dumps(verdict(findings=[finding])), encoding="utf-8"
+            )
+            summary_path.write_text(
+                "**Request changes.** The setup omits its executable path.",
+                encoding="utf-8",
+            )
+            findings_path.write_text(
+                json.dumps(self.finding_record()) + "\n", encoding="utf-8"
+            )
+            lanes_path.write_text("[]", encoding="utf-8")
+
+            SUMMARY.validate_draft(
+                verdict_path,
+                summary_path,
+                findings_path,
+                SHA,
+                1,
+                [lanes_path],
+            )
+
+            wrong_message = self.finding_record()
+            wrong_message["message"] = (
+                "**Medium** — The setup writes the wrong executable path."
+            )
+            findings_path.write_text(
+                json.dumps(wrong_message) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                SUMMARY.SummaryError,
+                "must match every open Runeseer finding exactly",
+            ):
+                SUMMARY.validate_draft(
+                    verdict_path,
+                    summary_path,
+                    findings_path,
+                    SHA,
+                    1,
+                    [lanes_path],
+                )
+
+            findings_path.write_text("", encoding="utf-8")
+            with self.assertRaises(SUMMARY.SummaryError):
+                SUMMARY.validate_draft(
+                    verdict_path,
+                    summary_path,
+                    findings_path,
+                    SHA,
+                    1,
+                    [lanes_path],
+                )
+
+            verdict_path.write_text(json.dumps(verdict()), encoding="utf-8")
+            summary_path.write_text("**Looks good.** Nothing blocks.", encoding="utf-8")
+            findings_path.write_text(
+                json.dumps(self.finding_record()) + "\n", encoding="utf-8"
+            )
+            with self.assertRaises(SUMMARY.SummaryError):
+                SUMMARY.validate_draft(
+                    verdict_path,
+                    summary_path,
+                    findings_path,
+                    SHA,
+                    1,
+                    [lanes_path],
+                )
+
+    def test_findings_file_rejects_unpostable_fields(self):
+        finding = self.own_finding()
+        data = verdict(findings=[finding])
+        named_record = self.finding_record()
+        named_record["source"] = {"name": "runeseer"}
+        SUMMARY.validate_findings_file(data, [named_record])
+        for field in ("line", "source"):
+            with self.subTest(field=field):
+                record = self.finding_record()
+                if field == "line":
+                    record["location"]["range"]["start"]["line"] = 0
+                else:
+                    record["source"] = {"name": "other"}
+                with self.assertRaises(SUMMARY.SummaryError):
+                    SUMMARY.validate_findings_file(data, [record])
+
+    def test_novel_runeseer_findings_stop_at_reviewdog_limit(self):
+        findings = []
+        for line in range(1, 32):
+            finding = self.own_finding()
+            finding["line"] = line
+            finding["summary"] = f"Finding {line}"
+            findings.append(finding)
+
+        accepted = verdict(findings=findings[:30])
+        self.assertEqual(SUMMARY.validate_verdict(accepted, SHA, 1), accepted)
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "at most 30 novel"):
+            SUMMARY.validate_verdict(verdict(findings=findings), SHA, 1)
+
+    def test_novel_runeseer_findings_can_share_an_anchor(self):
+        first = self.own_finding()
+        second = self.own_finding()
+        second["summary"] = "The setup omits its binary name"
+        data = verdict(findings=[first, second])
+
+        self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1), data)
+
+    @staticmethod
+    def finding_record():
+        return {
+            "message": "**Medium** — The setup omits its executable path.",
+            "location": {
+                "path": "install-tools",
+                "range": {"start": {"line": 227}},
+            },
+            "severity": "WARNING",
+        }
 
     def test_a_novel_finding_without_a_posted_comment_is_rejected(self):
         with self.assertRaises(SUMMARY.SummaryError):

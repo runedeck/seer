@@ -44,8 +44,8 @@ jobs:
                   sudo apt-get install -y shellcheck
                   shellcheck -S warning .github/scripts/*.sh
 
-            - name: Test review summary formatter
-              run: python3 .github/scripts/test_runeseer_summary.py
+            - name: Test review contracts
+              run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
             - name: Actionlint workflows
               run: |
