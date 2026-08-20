@@ -205,6 +205,9 @@ jobs:
                           || ! unzip -o candidate-verdict.zip runeseer-verdict.json -d .candidate-verdict >/dev/null; then
                           continue
                       fi
+                      # The raw findings the previous round emitted. Older artifacts lack the
+                      # file; the round then runs without verbatim wording, nothing worse.
+                      unzip -o candidate-verdict.zip runeseer-findings.rdjsonl -d .candidate-verdict >/dev/null 2>&1 || true
                       candidate_sha=$(jq -r '.sha // empty' .candidate-verdict/runeseer-verdict.json)
                       candidate_base=$(jq -r '.base // empty' .candidate-verdict/runeseer-verdict.json)
                       candidate_round=$(jq -r '.round // empty' .candidate-verdict/runeseer-verdict.json)
@@ -254,6 +257,11 @@ jobs:
                       sudo install -o root -g root -m 0444 \
                           .previous-verdict/runeseer-verdict.json \
                           "$RUNESEER_LANES/previous-verdict.json"
+                      if [ -f .previous-verdict/runeseer-findings.rdjsonl ]; then
+                          sudo install -o root -g root -m 0444 \
+                              .previous-verdict/runeseer-findings.rdjsonl \
+                              "$RUNESEER_LANES/previous-findings.rdjsonl"
+                      fi
                   fi
                   command rm -rf .candidate-verdict .previous-verdict candidate-verdict.zip
                   # A base change invalidates settled free-lane stages. Clear them
@@ -327,14 +335,13 @@ jobs:
                   app-id: ${{ secrets.RUNESEER_APP_ID }}
                   private-key: ${{ secrets.RUNESEER_APP_KEY }}
 
-            - if: steps.scope.outputs.skip == 'false'
+            - id: adjudicate
+              if: steps.scope.outputs.skip == 'false'
               uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
               with:
                   claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
                   github_token: ${{ steps.runeseer.outputs.token }}
                   allowed_bots: "runewright"
-                  # Immediate posts return stable comment IDs for verdict binding.
-                  classify_inline_comments: "false"
                   # The progress comment runs wherever the action supports
                   # it; only labeled events, the review label, refuse the
                   # flag. The adjudicator runs on opus: the judging layer of
@@ -346,7 +353,7 @@ jobs:
                   claude_args: |
                       --model opus
                       --max-turns 40
-                      --allowedTools "Read,Write,Grep,Glob,mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*)"
+                      --allowedTools "Read,Write,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*)"
                   prompt: |
                       You are runeseer, the adjudicating correctness reviewer. Write with the terse, factual register of Cursor Bugbot and Macroscope. Output rules below are binding.
 
@@ -354,6 +361,7 @@ jobs:
                       - `/usr/local/share/runeseer-lanes/inline-comments.json` contains inline findings from `macroscopeapp[bot]` and `cursor[bot]`.
                       - `/usr/local/share/runeseer-lanes/issue-comments.json` contains issue-comment findings from those lanes.
                       - `/usr/local/share/runeseer-lanes/previous-verdict.json` may contain the previous-round ledger.
+                      - `/usr/local/share/runeseer-lanes/previous-findings.rdjsonl` may contain the exact findings-file lines the previous round emitted.
                       - The previous verdict SHA is `${{ steps.ledger.outputs.prev_sha }}`.
                       - This is correctness round `${{ steps.ledger.outputs.round }}`.
                       - This pull request has already completed `${{ steps.ledger.outputs.earlier_rounds }}` correctness rounds.
@@ -372,7 +380,7 @@ jobs:
                       - Never demand the opposite of what an earlier round demanded on the same code.
 
                       Defensive posture, binding:
-                      - Use your turns efficiently. Write both required files as soon as you can decide the verdict, then stop. A round that ends without the files wastes every token it spent.
+                      - Use your turns efficiently. Write all three required files as soon as you can decide the verdict, then stop. A round that ends without the files wastes every token it spent.
                       - Spend your first ten turns on the diff, the lane findings, and the ledger. After ten turns, stop exploration and write the files with what you have.
                       - After turn 10, recheck the ledger and judge the other lanes' findings.
                       - At that point, open a novel finding only at Critical severity.
@@ -382,28 +390,35 @@ jobs:
                       Review procedure:
                       - Judge every non-ledger finding from the other lanes against HEAD as `confirmed`, `disputed`, or `already addressed`.
                       - For `disputed`, state the concrete code fact that invalidates the finding. For `already addressed`, identify where HEAD fixes it.
-                      - Never re-report a finding present in the previous ledger. Do not repeat it in an inline comment or the summary.
+                      - Never re-report a ledger finding in the summary. Do repeat every still-open Runeseer finding in the findings file, copying its line from `previous-findings.rdjsonl` unchanged: the posting step deduplicates identical findings and removes the comments of findings that no longer hold. Never reconstruct a carried finding's text from a posted comment; posted bodies carry rendering the deduplication would treat as a new finding.
                       - Recheck ledger findings against HEAD. Carry each still-unresolved finding into the new verdict JSON; omit it only when HEAD addresses it.
                       - When the previous verdict SHA is an ancestor of HEAD, this is a re-round: review ONLY the range from that SHA to HEAD. Report only defects that range introduces or fails to fix. Never report a new finding whose lines that range did not change, however real it looks; a pre-existing condition on unchanged lines is out of scope and at most a `restart` reason.
                       - Review correctness only: logic errors, broken invariants, silent failure modes, security problems, and claims the diff does not uphold.
                       - Never duplicate another lane. A judgment in the summary is adjudication, not a second report.
-                      - Post inline comments only for novel runeseer findings of Medium, High, or Critical severity. Put novel Low notes only in the human summary.
+                      - Record runeseer findings of Medium, High, or Critical severity in the findings file. Put novel Low notes only in the human summary.
                       - Do not include Low notes in `findings` or `count`.
 
-                      Inline comment format:
+                      Findings file:
+                      - Write `runeseer-findings.rdjsonl` in the workspace root. You post nothing yourself; the workflow posts each line as an inline comment after the session.
+                      - One JSON object per line, rdjsonl shape: `{"message": "<comment body>", "location": {"path": "<path>", "range": {"start": {"line": <line>}}}, "severity": "ERROR|WARNING|INFO"}`.
+                      - `severity` maps from the prefix: Critical and High are ERROR, Medium is WARNING.
+                      - Write the file even when no findings remain; an empty file states that.
+                      - When the fix is mechanical, attach it as a structured suggestion on the same line: `"suggestions": [{"range": {"start": {"line": <first>}, "end": {"line": <last>}}, "text": "<replacement lines>"}]`. Give the exact replacement text and the exact line range it replaces; the posting step renders the one-click suggestion. Attach a suggestion only when you are certain the replacement is complete and correct.
+
+                      Message format, for every findings-file line:
                       **<Critical|High|Medium>** — <One sentence that states the defect and its concrete consequence.>
 
                       - `<path:line>` <optional evidence fact, one line.>
                       - `<path:line>` <optional second evidence fact, one line.>
 
-                      Inline comment constraints:
-                      - Anchor the comment to the most relevant reviewable changed line.
+                      Message constraints:
+                      - Anchor the finding to the most relevant reviewable changed line.
                       - Use one sentence for the defect and consequence.
                       - Use at most two one-line evidence bullets.
-                      - Post one finding per comment.
+                      - Record one finding per line.
                       - Do not use a heading, a separate Severity line, a reasoning narrative, a hedge, or a generic recommendation.
                       - Use at most one direct quotation per finding, limited to one source line. Prefer an anchor over a quotation.
-                      - Do not post an inline comment for a finding already reported by another lane or the ledger.
+                      - Do not record a finding already reported by another lane.
 
                       Human summary file:
                       - Write `runeseer-summary.md` in the workspace root. Do not publish the summary yourself.
@@ -431,9 +446,8 @@ jobs:
                       - For every judgment, write a short factual `reason` for machine use. The human summary can translate or omit it.
                       - Copy `lane`, `path`, and `comment_id` from the originating lane comment. Copy `line`, or `original_line` when `line` is null. The workflow rejects an omitted inline comment or a mismatched identity.
                       - Copy `comment_id` from the originating entry's `id` in the trusted lane files. Every lane judgment needs this ID.
-                      - Set `confirmed` to `true` on every inline-comment tool call.
-                      - Copy the returned inline comment ID into every novel Runeseer finding.
-                      - The workflow rejects an unrecorded Runeseer comment.
+                      - Set `comment_id` to null on every novel Runeseer finding: the workflow posts the findings file after the session and binds each finding to its comment by anchor and severity.
+                      - The workflow rejects a Runeseer finding without a matching findings-file line.
                       - Preserve `comment_id` on carried ledger findings when it exists.
                       - Each `summary` is a factual title of at most 12 words.
                       - `count` must equal the findings array length. Set `verdict` to `clean` only when the array is empty; otherwise set it to `findings`.
@@ -447,7 +461,41 @@ jobs:
                       - Do not write phrases such as "either way", "the comment stops short of", or "the PR does not hold together".
                       - Use present tense, concrete nouns, and direct causal language.
 
-                      A review that writes no result is a failed review. Even a clean review must write both required files.
+                      A review that writes no result is a failed review. Even a clean review must write all three required files.
+
+            # The model writes findings. Reviewdog anchors positions and identifies
+            # repeated findings by fingerprint. It removes comments for absent
+            # findings. It keeps comments that have replies.
+            - name: Install reviewdog
+              if: steps.scope.outputs.skip == 'false'
+              # The pinned setup action verifies the selected release checksum.
+              uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+              with:
+                  reviewdog_version: v0.21.0
+
+            - name: Post findings through reviewdog
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  REVIEWDOG_GITHUB_API_TOKEN: ${{ steps.runeseer.outputs.token }}
+                  EXECUTION_FILE: ${{ steps.adjudicate.outputs.execution_file }}
+              run: |
+                  set -o pipefail
+                  # A truncated session has not looked at everything, and posting its partial file
+                  # would remove the marked comments of every finding the file omits. Only a
+                  # cleanly finished session posts; a failed action never reaches this step.
+                  if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+                      subtype=$(jq -r '[.[] | select(.type == "result")] | last | .subtype // "unknown"' "$EXECUTION_FILE")
+                      if [ "$subtype" != "success" ]; then
+                          echo "not posting findings: the session ended with $subtype; open comments stay"
+                          exit 0
+                      fi
+                  fi
+                  [ -f runeseer-findings.rdjsonl ] \
+                      || { echo "the session finished without writing runeseer-findings.rdjsonl"; exit 1; }
+                  reviewdog -f=rdjsonl -name=runeseer \
+                      -reporter=github-pr-review -filter-mode=diff_context -fail-level=none -tee \
+                      < runeseer-findings.rdjsonl
+                  echo "posted $(wc -l < runeseer-findings.rdjsonl | tr -d ' ') finding line(s)"
 
             # Bind each new Runeseer inline comment to the machine findings.
             # The model cannot modify this root-owned evidence.
@@ -513,6 +561,7 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
                   RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+                  EXECUTION_FILE: ${{ steps.adjudicate.outputs.execution_file }}
               run: |
                   set -o pipefail
                   live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv')
@@ -520,7 +569,23 @@ jobs:
                       echo "the pull request changed after this round started; this stale round publishes no judgment"
                       exit 1
                   }
+                  # The same accounting the GitLab-side reviewer appends: cost, duration, turns.
+                  # Absent stats keep the footer short rather than failing the publish.
+                  session_stats=""
+                  if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ]; then
+                      session_stats=$(jq -r '
+                          [.[] | select(.type == "result")] | last
+                          | if . == null then "" else
+                              (.duration_ms / 1000 | round) as $seconds
+                              |
+                              "$" + (.total_cost_usd * 100 | round / 100 | tostring)
+                              + " · " + (($seconds / 60 | floor | tostring) + "m"
+                              + ($seconds % 60 | tostring) + "s")
+                              + " · " + (.num_turns | tostring) + " turns"
+                            end' "$EXECUTION_FILE" 2>/dev/null || echo "")
+                  fi
                   python3 "$RUNESEER_FORMATTER" format \
+                      --session-stats "$session_stats" \
                       --verdict runeseer-verdict.json \
                       --summary runeseer-summary.md \
                       --sha "$HEAD_SHA" \
@@ -767,6 +832,7 @@ jobs:
                   path: |
                       runeseer-verdict.json
                       runeseer-review.md
+                      runeseer-findings.rdjsonl
                   retention-days: 30
                   if-no-files-found: warn
 
