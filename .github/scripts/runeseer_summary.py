@@ -146,24 +146,32 @@ def validate_runeseer_bindings(
     comments: list[dict[str, Any]],
     previous_findings: list[dict[str, Any]],
 ) -> None:
+    """Bind each novel Runeseer finding to the inline comment the workflow posted for it.
+
+    The model writes the findings file; reviewdog posts it after the session. The model
+    therefore cannot know comment IDs, so this step assigns them, matching by anchor and
+    severity against the root-owned list of new Runeseer comments. Every invariant the
+    model-supplied IDs used to carry still holds: every new comment needs an open finding,
+    every finding needs new or carried evidence, and anchors and severities must agree.
+    """
+    severity_pattern = re.compile(r"^\*\*(Critical|High|Medium)\*\*")
     sources: dict[int, dict[str, Any]] = {}
     for comment in comments:
         comment_id = comment.get("id")
         if type(comment_id) is int and comment.get("in_reply_to_id") is None:
             sources[comment_id] = comment
 
+    def comment_key(comment: dict[str, Any]) -> tuple[Any, Any, Any]:
+        severity = severity_pattern.match(comment.get("body", ""))
+        return (
+            comment.get("path"),
+            comment.get("line") or comment.get("original_line"),
+            severity.group(1).lower() if severity else None,
+        )
+
     own_findings = [
         finding for finding in findings if finding.get("lane") == "runeseer"
     ]
-    finding_ids = {
-        finding["comment_id"]
-        for finding in own_findings
-        if finding.get("comment_id") is not None
-    }
-    missing = set(sources) - finding_ids
-    if missing:
-        raise SummaryError("Every new Runeseer inline comment needs an open finding.")
-
     previous_own = [
         finding for finding in previous_findings if finding.get("lane") == "runeseer"
     ]
@@ -176,11 +184,57 @@ def validate_runeseer_bindings(
         (finding.get("path"), finding.get("line"), finding.get("summary"))
         for finding in previous_own
     }
+
+    unclaimed = dict(sources)
+    for finding in own_findings:
+        if finding.get("comment_id") is not None:
+            continue
+        anchor = (finding.get("path"), finding.get("line"), finding.get("severity"))
+        matches = [
+            comment_id
+            for comment_id, comment in unclaimed.items()
+            if comment_key(comment) == anchor
+        ]
+        if not matches:
+            carried = (finding.get("path"), finding.get("line"), finding.get("summary"))
+            if carried in previous_keys:
+                continue
+            raise SummaryError(
+                "Each new Runeseer finding needs a posted inline comment at its anchor."
+            )
+        if len(matches) > 1:
+            raise SummaryError(
+                "Each new Runeseer finding needs exactly one posted inline comment."
+            )
+        finding["comment_id"] = matches[0]
+        del unclaimed[matches[0]]
+
+    # A carried finding can gain a fresh comment once: legacy comments carry no dedup marker,
+    # so the first post-migration round re-posts still-open findings under markers. The fresh
+    # comment becomes the finding's evidence; the legacy comment stays for its thread.
     for finding in own_findings:
         comment_id = finding.get("comment_id")
-        key = (finding.get("path"), finding.get("line"), finding.get("summary"))
-        if comment_id is None and key not in previous_keys:
-            raise SummaryError("Each new Runeseer finding needs its inline comment ID.")
+        if comment_id is None or comment_id in sources:
+            continue
+        anchor = (finding.get("path"), finding.get("line"), finding.get("severity"))
+        matches = [
+            candidate
+            for candidate, comment in unclaimed.items()
+            if comment_key(comment) == anchor
+        ]
+        if len(matches) == 1:
+            finding["comment_id"] = matches[0]
+            del unclaimed[matches[0]]
+
+    finding_ids = {
+        finding["comment_id"]
+        for finding in own_findings
+        if finding.get("comment_id") is not None
+    }
+    if set(sources) - finding_ids:
+        raise SummaryError("Every new Runeseer inline comment needs an open finding.")
+    for finding in own_findings:
+        comment_id = finding.get("comment_id")
         if (
             comment_id is not None
             and comment_id not in sources
@@ -188,21 +242,6 @@ def validate_runeseer_bindings(
         ):
             raise SummaryError(
                 "Each Runeseer finding ID needs new or carried evidence."
-            )
-
-    severity_pattern = re.compile(r"^\*\*(Critical|High|Medium)\*\*")
-    for comment_id in set(sources) & finding_ids:
-        comment = sources[comment_id]
-        finding = next(
-            item for item in findings if item.get("comment_id") == comment_id
-        )
-        source_line = comment.get("line") or comment.get("original_line")
-        if finding["path"] != comment.get("path") or finding["line"] != source_line:
-            raise SummaryError("Each Runeseer finding must preserve its inline anchor.")
-        severity = severity_pattern.match(comment.get("body", ""))
-        if severity is None or finding["severity"] != severity.group(1).lower():
-            raise SummaryError(
-                "Each Runeseer finding must preserve its inline severity."
             )
 
 
@@ -459,6 +498,7 @@ def format_review(
     lane_comment_paths: list[Path] | None = None,
     runeseer_comment_paths: list[Path] | None = None,
     previous_verdict_path: Path | None = None,
+    session_stats: str = "",
 ) -> str:
     verdict = validate_verdict(
         load_json(verdict_path),
@@ -473,13 +513,14 @@ def format_review(
     except OSError as error:
         raise SummaryError(f"Could not read {summary_path}: {error}") from error
     summary = validate_summary(summary_text, verdict)
-    footer = " · ".join(
-        (
-            open_count_text(len(verdict["findings"])),
-            f"Reviewed `{expected_sha[:8]}`",
-            f"[review run]({run_url})",
-        )
-    )
+    footer_parts = [
+        open_count_text(len(verdict["findings"])),
+        f"Reviewed `{expected_sha[:8]}`",
+        f"[review run]({run_url})",
+    ]
+    if session_stats:
+        footer_parts.append(validate_plain_text(session_stats, "session stats"))
+    footer = " · ".join(footer_parts)
     lines = [
         SUMMARY_MARKER,
         VERDICT_MARKER.format(
@@ -673,6 +714,7 @@ def build_parser() -> argparse.ArgumentParser:
     format_parser.add_argument("--lane-comments", type=Path, action="append")
     format_parser.add_argument("--runeseer-comments", type=Path, action="append")
     format_parser.add_argument("--previous-verdict", type=Path)
+    format_parser.add_argument("--session-stats", default="")
     format_parser.add_argument("--output", type=Path)
 
     publish_parser = commands.add_parser("publish")
@@ -722,6 +764,7 @@ def main() -> int:
                 arguments.lane_comments,
                 arguments.runeseer_comments,
                 arguments.previous_verdict,
+                arguments.session_stats,
             )
             write_output(body, arguments.output)
             return 0

@@ -460,6 +460,58 @@ class SummaryTests(unittest.TestCase):
         ]
         self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, None, comments), data)
 
+    @staticmethod
+    def own_finding(comment_id=None):
+        return {
+            "path": "install-tools",
+            "line": 227,
+            "summary": "Setup omits executable path",
+            "lane": "runeseer",
+            "judgment": "confirmed",
+            "severity": "medium",
+            "comment_id": comment_id,
+        }
+
+    @staticmethod
+    def posted_comment(comment_id):
+        return {
+            "id": comment_id,
+            "user": {"login": "runeseer[bot]"},
+            "path": "install-tools",
+            "line": 227,
+            "body": "**Medium** — The setup omits its executable path.",
+        }
+
+    def test_binding_fills_the_comment_id_by_anchor(self):
+        finding = self.own_finding()
+        SUMMARY.validate_verdict(verdict(findings=[finding]), SHA, 1, None,
+                                 [self.posted_comment(11)])
+        self.assertEqual(finding["comment_id"], 11)
+
+    def test_a_novel_finding_without_a_posted_comment_is_rejected(self):
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.validate_verdict(verdict(findings=[self.own_finding()]), SHA, 1, None, [])
+
+    def test_an_ambiguous_anchor_binding_is_rejected(self):
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.validate_verdict(verdict(findings=[self.own_finding()]), SHA, 1, None,
+                                     [self.posted_comment(11), self.posted_comment(12)])
+
+    def test_a_carried_finding_rebinds_to_a_fresh_marked_comment(self):
+        finding = self.own_finding(comment_id=999)
+        SUMMARY.validate_verdict(verdict(findings=[finding]), SHA, 1, None,
+                                 [self.posted_comment(12)], [self.own_finding(comment_id=999)])
+        self.assertEqual(finding["comment_id"], 12)
+
+    def test_the_footer_carries_session_stats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "verdict.json").write_text(json.dumps(verdict()), encoding="utf-8")
+            (root / "summary.md").write_text("**Looks good.** Nothing blocks.", encoding="utf-8")
+            body = SUMMARY.format_review(root / "verdict.json", root / "summary.md", SHA, 1,
+                                         RUN_URL, session_stats="$1.23 · 1m35s · 24 turns")
+        self.assertIn(" · $1.23 · 1m35s · 24 turns", body)
+
     def test_runeseer_finding_needs_new_or_carried_evidence(self):
         finding = {
             "path": "install-tools",
