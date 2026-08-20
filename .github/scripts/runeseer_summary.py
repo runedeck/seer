@@ -559,6 +559,12 @@ def format_review(
     except OSError as error:
         raise SummaryError(f"Could not read {summary_path}: {error}") from error
     summary = validate_summary(summary_text, verdict)
+    try:
+        verdict_path.write_text(
+            json.dumps(verdict, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError as error:
+        raise SummaryError(f"Could not save {verdict_path}: {error}") from error
     footer_parts = [
         open_count_text(len(verdict["findings"])),
         f"Reviewed `{expected_sha[:8]}`",

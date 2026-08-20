@@ -435,17 +435,22 @@ jobs:
                       Verdict file:
                       - Write valid JSON to `runeseer-verdict.json` in the workspace root.
                       - Use exactly this schema:
-                        `{"sha":"<full HEAD sha>","round":${{ steps.ledger.outputs.round }},"verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","nonfinding_issue_comment_ids":[123],"findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"confirmed","severity":"medium|high|critical","comment_id":<originating comment database id for a posted inline finding>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"<lane>","judgment":"confirmed|disputed|already addressed","severity":"low|medium|high|critical","reason":"<judgment sentence>","comment_id":<originating comment database id>}]}`
+                        `{"sha":"<full HEAD sha>","round":${{ steps.ledger.outputs.round }},"verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","nonfinding_issue_comment_ids":[123],"findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope","judgment":"confirmed","severity":"medium|high|critical","comment_id":<originating comment database id for a posted inline finding>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope","judgment":"confirmed|disputed|already addressed","severity":"low|medium|high|critical","reason":"<judgment sentence>","comment_id":<positive id from a trusted lane entry or carried Runeseer ledger entry>}]}`
                       - Include every open Medium, High, or Critical finding from any lane.
                       - Exclude Low notes from the machine findings and count.
                       - A finding is open only while the defect is still present at HEAD. Your Lane judgment decides: `confirmed` findings are open; `disputed` and `already addressed` findings are not, even when their review threads are still unresolved on GitHub, and a ledger entry whose defect the current HEAD fixes is not open either.
                       - When every lane finding is disputed or already addressed and no novel finding remains, the array is empty, `count` is 0, and the human summary starts with `**Looks good.**`.
                       - Use `runeseer` as the lane for your own findings. Preserve the originating lane for other findings.
-                      - Include every other-lane judgment in `lane_judgments`, including every root inline lane comment, rechecked ledger findings, and judgments excluded from `findings`.
+                      - Include each root inline comment from both trusted lane files in `lane_judgments`.
+                      - Include `confirmed`, `disputed`, and `already addressed` judgments.
+                      - Include a carried Runeseer ledger finding in `lane_judgments` only when its stored `comment_id` is a positive integer.
+                      - Do not include a novel same-round Runeseer finding in `lane_judgments`. The workflow binds its comment ID after the session.
                       - Put an issue comment ID in `nonfinding_issue_comment_ids` only when it contains no defect. Otherwise, include one lane judgment with that ID. Classify every issue comment exactly once.
                       - For every judgment, write a short factual `reason` for machine use. The human summary can translate or omit it.
-                      - Copy `lane`, `path`, and `comment_id` from the originating lane comment. Copy `line`, or `original_line` when `line` is null. The workflow rejects an omitted inline comment or a mismatched identity.
-                      - Copy `comment_id` from the originating entry's `id` in the trusted lane files. Every lane judgment needs this ID.
+                      - For a trusted lane judgment, copy `lane`, `path`, and `comment_id` from the originating entry. Copy `line`, or `original_line` when `line` is null.
+                      - The workflow rejects an omitted root inline comment or a mismatched trusted-lane identity.
+                      - For a carried Runeseer judgment, copy `lane`, `path`, `line`, and `comment_id` from the previous verdict.
+                      - Every lane judgment needs a positive `comment_id`. Never use null or a schema placeholder.
                       - Set `comment_id` to null on every novel Runeseer finding: the workflow posts the findings file after the session and binds each finding to its comment by anchor and severity.
                       - The workflow rejects a Runeseer finding without a matching findings-file line.
                       - Preserve `comment_id` on carried ledger findings when it exists.
