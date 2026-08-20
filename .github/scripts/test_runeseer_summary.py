@@ -525,6 +525,36 @@ class SummaryTests(unittest.TestCase):
                                  [self.posted_comment(11)])
         self.assertEqual(finding["comment_id"], 11)
 
+    def test_format_persists_the_bound_comment_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            verdict_path = root / "verdict.json"
+            summary_path = root / "summary.md"
+            comments_path = root / "runeseer.json"
+            verdict_path.write_text(
+                json.dumps(verdict(findings=[self.own_finding()])), encoding="utf-8"
+            )
+            summary_path.write_text(
+                "**Request changes.** The setup omits its executable path.",
+                encoding="utf-8",
+            )
+            comments_path.write_text(
+                json.dumps([self.posted_comment(11)]), encoding="utf-8"
+            )
+
+            SUMMARY.format_review(
+                verdict_path,
+                summary_path,
+                SHA,
+                1,
+                RUN_URL,
+                runeseer_comment_paths=[comments_path],
+            )
+
+            stored = json.loads(verdict_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(stored["findings"][0]["comment_id"], 11)
+
     def test_a_novel_finding_without_a_posted_comment_is_rejected(self):
         with self.assertRaises(SUMMARY.SummaryError):
             SUMMARY.validate_verdict(verdict(findings=[self.own_finding()]), SHA, 1, None, [])
