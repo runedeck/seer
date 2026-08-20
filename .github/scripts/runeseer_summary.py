@@ -233,6 +233,22 @@ def validate_runeseer_bindings(
     }
     if set(sources) - finding_ids:
         raise SummaryError("Every new Runeseer inline comment needs an open finding.")
+    findings_by_id = {
+        finding["comment_id"]: finding
+        for finding in own_findings
+        if finding.get("comment_id") is not None
+    }
+    for comment_id in set(sources) & finding_ids:
+        comment = sources[comment_id]
+        finding = findings_by_id[comment_id]
+        if comment_key(comment) != (
+            finding.get("path"),
+            finding.get("line"),
+            finding.get("severity"),
+        ):
+            raise SummaryError(
+                "Each Runeseer finding must preserve its inline anchor and severity."
+            )
     for finding in own_findings:
         comment_id = finding.get("comment_id")
         if (
@@ -450,6 +466,106 @@ def validate_summary(summary: str, verdict: dict[str, Any]) -> str:
     return summary
 
 
+def fallback_summary(verdict: dict[str, Any]) -> str:
+    if verdict["findings"]:
+        return "**Request changes.** Resolve the open findings in the risk table."
+    if verdict["restart"] != "none":
+        return "**Request changes.** The requested review stages must inspect this head again."
+    return "**Looks good.** The review found no open correctness defects."
+
+
+def select_summary(summary: str, verdict: dict[str, Any]) -> str:
+    if prose_word_count(summary) <= 80:
+        return validate_summary(summary, verdict)
+    print(
+        "warning: the model summary exceeded 80 words; using the fixed summary",
+        file=sys.stderr,
+    )
+    return fallback_summary(verdict)
+
+
+def load_rdjson(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise SummaryError(f"Could not read findings from {path}: {error}") from error
+    records = []
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SummaryError(
+                f"The findings file has invalid JSON on line {line_number}."
+            ) from error
+        if not isinstance(record, dict):
+            raise SummaryError("Each findings-file line must contain a JSON object.")
+        records.append(record)
+    return records
+
+
+def validate_findings_file(verdict: dict[str, Any], records: list[dict[str, Any]]) -> None:
+    severity_values = {
+        "Critical": ("critical", "ERROR"),
+        "High": ("high", "ERROR"),
+        "Medium": ("medium", "WARNING"),
+    }
+    actual = []
+    for record in records:
+        message = record.get("message")
+        match = (
+            re.match(r"^\*\*(Critical|High|Medium)\*\*", message)
+            if isinstance(message, str)
+            else None
+        )
+        location = record.get("location")
+        span = location.get("range") if isinstance(location, dict) else None
+        start = span.get("start") if isinstance(span, dict) else None
+        path = location.get("path") if isinstance(location, dict) else None
+        line = start.get("line") if isinstance(start, dict) else None
+        if match is None or not isinstance(path, str) or type(line) is not int:
+            raise SummaryError("Each findings-file line needs a severity, path, and line.")
+        severity, rdjson_severity = severity_values[match.group(1)]
+        if record.get("severity") != rdjson_severity:
+            raise SummaryError("Each findings-file severity must match its message prefix.")
+        actual.append((path, line, severity))
+    expected = [
+        (finding["path"], finding["line"], finding["severity"])
+        for finding in verdict["findings"]
+        if finding["lane"] == "runeseer"
+    ]
+    if sorted(actual) != sorted(expected):
+        raise SummaryError(
+            "The findings file must match every open Runeseer finding exactly."
+        )
+
+
+def validate_draft(
+    verdict_path: Path,
+    summary_path: Path,
+    findings_path: Path,
+    expected_sha: str,
+    expected_round: int,
+    lane_paths: list[Path] | None = None,
+    previous_path: Path | None = None,
+) -> None:
+    verdict = validate_verdict(
+        load_json(verdict_path),
+        expected_sha,
+        expected_round,
+        load_lane_comments(lane_paths),
+        None,
+        load_previous_findings(previous_path),
+    )
+    try:
+        summary = summary_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SummaryError(f"Could not read the review summary: {error}") from error
+    select_summary(summary, verdict)
+    validate_findings_file(verdict, load_rdjson(findings_path))
+
+
 def open_count_text(count: int) -> str:
     if count == 0:
         return "No open findings"
@@ -512,7 +628,7 @@ def format_review(
         summary_text = summary_path.read_text(encoding="utf-8")
     except OSError as error:
         raise SummaryError(f"Could not read {summary_path}: {error}") from error
-    summary = validate_summary(summary_text, verdict)
+    summary = select_summary(summary_text, verdict)
     footer_parts = [
         open_count_text(len(verdict["findings"])),
         f"Reviewed `{expected_sha[:8]}`",
@@ -705,6 +821,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--runeseer-comments", type=Path, action="append")
     validate_parser.add_argument("--previous-verdict", type=Path)
 
+    draft_parser = commands.add_parser("validate-draft")
+    draft_parser.add_argument("--verdict", type=Path, required=True)
+    draft_parser.add_argument("--summary", type=Path, required=True)
+    draft_parser.add_argument("--findings", type=Path, required=True)
+    draft_parser.add_argument("--sha", required=True)
+    draft_parser.add_argument("--round", type=int, required=True)
+    draft_parser.add_argument("--lane-comments", type=Path, action="append")
+    draft_parser.add_argument("--previous-verdict", type=Path)
+
     format_parser = commands.add_parser("format")
     format_parser.add_argument("--verdict", type=Path, required=True)
     format_parser.add_argument("--summary", type=Path, required=True)
@@ -752,6 +877,17 @@ def main() -> int:
                 load_lane_comments(arguments.lane_comments),
                 load_lane_comments(arguments.runeseer_comments),
                 load_previous_findings(arguments.previous_verdict),
+            )
+            return 0
+        if arguments.command == "validate-draft":
+            validate_draft(
+                arguments.verdict,
+                arguments.summary,
+                arguments.findings,
+                arguments.sha,
+                arguments.round,
+                arguments.lane_comments,
+                arguments.previous_verdict,
             )
             return 0
         if arguments.command == "format":

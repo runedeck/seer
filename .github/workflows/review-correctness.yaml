@@ -329,6 +329,25 @@ jobs:
                   sudo install -o root -g root -m 0444 "$lane_tmp"/*.json "$RUNESEER_LANES/"
                   echo "inline: $(jq 'length' "$lane_tmp/inline-comments.json"), issue: $(jq 'length' "$lane_tmp/issue-comments.json")"
 
+            # The head can change during the lane wait. Stop before the paid
+            # call when that happens. The next round must review the new head.
+            - id: freshness
+              name: Verify the head for round ${{ steps.ledger.outputs.round }}
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+              run: |
+                  live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv')
+                  if [ "$live" != "$HEAD_SHA"$'\t'"$BASE_SHA" ]; then
+                      echo "stale=true" >> "$GITHUB_OUTPUT"
+                      echo "the pull request changed before round ${{ steps.ledger.outputs.round }} started the provider"
+                      exit 1
+                  fi
+                  echo "stale=false" >> "$GITHUB_OUTPUT"
+                  echo "round ${{ steps.ledger.outputs.round }} will review $HEAD_SHA"
+
             - id: runeseer
               uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
               with:
@@ -336,6 +355,7 @@ jobs:
                   private-key: ${{ secrets.RUNESEER_APP_KEY }}
 
             - id: adjudicate
+              name: Run correctness round ${{ steps.ledger.outputs.round }}
               if: steps.scope.outputs.skip == 'false'
               uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
               with:
@@ -353,7 +373,7 @@ jobs:
                   claude_args: |
                       --model opus
                       --max-turns 40
-                      --allowedTools "Read,Write,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*)"
+                      --allowedTools "Read,Write,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git rev-parse:*)"
                   prompt: |
                       You are runeseer, the adjudicating correctness reviewer. Write with the terse, factual register of Cursor Bugbot and Macroscope. Output rules below are binding.
 
@@ -394,6 +414,9 @@ jobs:
                       - Recheck ledger findings against HEAD. Carry each still-unresolved finding into the new verdict JSON; omit it only when HEAD addresses it.
                       - When the previous verdict SHA is an ancestor of HEAD, this is a re-round: review ONLY the range from that SHA to HEAD. Report only defects that range introduces or fails to fix. Never report a new finding whose lines that range did not change, however real it looks; a pre-existing condition on unchanged lines is out of scope and at most a `restart` reason.
                       - Review correctness only: logic errors, broken invariants, silent failure modes, security problems, and claims the diff does not uphold.
+                      - When a related open pull request can overlap this change, inspect it. Report absorbed work as dependency context, not a defect.
+                      - Verify each changed provenance digest against its subject file.
+                      - A test that repeats helper assignments is not behavior evidence. Verify the public path that uses the helper.
                       - Never duplicate another lane. A judgment in the summary is adjudication, not a second report.
                       - Record runeseer findings of Medium, High, or Critical severity in the findings file. Put novel Low notes only in the human summary.
                       - Do not include Low notes in `findings` or `count`.
@@ -463,6 +486,30 @@ jobs:
 
                       A review that writes no result is a failed review. Even a clean review must write all three required files.
 
+            # Validate all provider files before the workflow publishes findings.
+            # This prevents orphan comments when the verdict or summary is invalid.
+            - name: Bind and validate the provider draft
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+              run: |
+                  [ -f runeseer-verdict.json ] \
+                      || { echo "the session finished without runeseer-verdict.json"; exit 1; }
+                  jq --arg base "$BASE_SHA" '. + {base: $base}' runeseer-verdict.json \
+                      > runeseer-verdict.bound.json
+                  command mv runeseer-verdict.bound.json runeseer-verdict.json
+                  python3 "$RUNESEER_FORMATTER" validate-draft \
+                      --verdict runeseer-verdict.json \
+                      --summary runeseer-summary.md \
+                      --findings runeseer-findings.rdjsonl \
+                      --sha "$HEAD_SHA" \
+                      --round "$REVIEW_ROUND" \
+                      --lane-comments "$RUNESEER_LANES/inline-comments.json" \
+                      --lane-comments "$RUNESEER_LANES/issue-comments.json" \
+                      --previous-verdict "$RUNESEER_LANES/previous-verdict.json"
+
             # The model writes findings; this step posts them. reviewdog anchors
             # positions, deduplicates repeats by fingerprint, and removes the
             # comments of findings the current file no longer carries (comments
@@ -470,7 +517,7 @@ jobs:
             - name: Post findings through reviewdog
               if: steps.scope.outputs.skip == 'false'
               env:
-                  REVIEWDOG_TOKEN: ${{ steps.runeseer.outputs.token }}
+                  REVIEWDOG_GITHUB_API_TOKEN: ${{ steps.runeseer.outputs.token }}
                   GITHUB_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REVIEWDOG_VERSION: 0.21.0
                   REVIEWDOG_SHA256: ad5ce7d5ffa52aaa7ec8710a8fa764181b6cecaab843cc791e1cce1680381569
@@ -522,18 +569,6 @@ jobs:
                       "$new_comments" "$RUNESEER_LANES/runeseer-new-comments.json"
                   echo "new Runeseer findings: $(jq 'length' "$new_comments")"
 
-            # The verdict binds to the base it was judged against, so a later
-            # retarget invalidates the ledger. The lane writes this, not the
-            # model, so it is never misremembered.
-            - name: Bind verdict to base
-              if: steps.scope.outputs.skip == 'false'
-              env:
-                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
-              run: |
-                  [ -f runeseer-verdict.json ] || exit 0
-                  jq --arg base "$BASE_SHA" '. + {base: $base}' runeseer-verdict.json > runeseer-verdict.bound.json
-                  command mv runeseer-verdict.bound.json runeseer-verdict.json
-
             # Silence can look like approval. A skipped scope posts a clear
             # status without replacing the latest judged summary and round.
             - name: Publish skipped review status
@@ -579,9 +614,11 @@ jobs:
                       session_stats=$(jq -r '
                           [.[] | select(.type == "result")] | last
                           | if . == null then "" else
+                              (.duration_ms / 1000 | round) as $seconds
+                              |
                               "$" + (.total_cost_usd * 100 | round / 100 | tostring)
-                              + " · " + ((.duration_ms / 60000 | floor | tostring) + "m"
-                              + ((.duration_ms / 1000 | round) % 60 | tostring) + "s")
+                              + " · " + (($seconds / 60 | floor | tostring) + "m"
+                              + ($seconds % 60 | tostring) + "s")
                               + " · " + (.num_turns | tostring) + " turns"
                             end' "$EXECUTION_FILE" 2>/dev/null || echo "")
                   fi
@@ -934,7 +971,7 @@ jobs:
             # A cancelled round (superseded by a push or new review label) is not
             # a provider failure and must not trip the breaker.
             - name: Provider circuit breaker
-              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.freshness.outputs.stale != 'true'
               continue-on-error: true
               env:
                   GH_TOKEN: ${{ github.token }}

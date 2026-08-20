@@ -172,10 +172,13 @@ class SummaryTests(unittest.TestCase):
                 "**Looks good.** The change is correct. <!-- runeseer-verdict -->",
             )
 
-    def test_summary_enforces_word_limit(self):
+    def test_overlong_summary_uses_fixed_summary(self):
         words = " ".join(f"word{number}" for number in range(81))
-        with self.assertRaises(SUMMARY.SummaryError):
-            self.format_case(verdict(), f"**Looks good.** {words}")
+        body = self.format_case(verdict(), f"**Looks good.** {words}")
+        self.assertIn(
+            "**Looks good.** The review found no open correctness defects.", body
+        )
+        self.assertNotIn("word80", body)
 
     def test_count_must_equal_findings_length(self):
         data = verdict()
@@ -460,6 +463,17 @@ class SummaryTests(unittest.TestCase):
         ]
         self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, None, comments), data)
 
+    def test_new_runeseer_comment_must_match_anchor_and_severity(self):
+        for field, value in (("line", 228), ("body", "**High** — Wrong severity.")):
+            with self.subTest(field=field):
+                finding = self.own_finding(comment_id=11)
+                comment = self.posted_comment(11)
+                comment[field] = value
+                with self.assertRaises(SUMMARY.SummaryError):
+                    SUMMARY.validate_verdict(
+                        verdict(findings=[finding]), SHA, 1, None, [comment]
+                    )
+
     @staticmethod
     def own_finding(comment_id=None):
         return {
@@ -487,6 +501,72 @@ class SummaryTests(unittest.TestCase):
         SUMMARY.validate_verdict(verdict(findings=[finding]), SHA, 1, None,
                                  [self.posted_comment(11)])
         self.assertEqual(finding["comment_id"], 11)
+
+    def test_draft_validation_precedes_finding_publication(self):
+        finding = self.own_finding()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            verdict_path = root / "verdict.json"
+            summary_path = root / "summary.md"
+            findings_path = root / "findings.rdjsonl"
+            lanes_path = root / "lanes.json"
+            verdict_path.write_text(
+                json.dumps(verdict(findings=[finding])), encoding="utf-8"
+            )
+            summary_path.write_text(
+                "**Request changes.** The setup omits its executable path.",
+                encoding="utf-8",
+            )
+            findings_path.write_text(
+                json.dumps(self.finding_record()) + "\n", encoding="utf-8"
+            )
+            lanes_path.write_text("[]", encoding="utf-8")
+
+            SUMMARY.validate_draft(
+                verdict_path,
+                summary_path,
+                findings_path,
+                SHA,
+                1,
+                [lanes_path],
+            )
+
+            findings_path.write_text("", encoding="utf-8")
+            with self.assertRaises(SUMMARY.SummaryError):
+                SUMMARY.validate_draft(
+                    verdict_path,
+                    summary_path,
+                    findings_path,
+                    SHA,
+                    1,
+                    [lanes_path],
+                )
+
+            verdict_path.write_text(json.dumps(verdict()), encoding="utf-8")
+            summary_path.write_text("**Looks good.** Nothing blocks.", encoding="utf-8")
+            findings_path.write_text(
+                json.dumps(self.finding_record()) + "\n", encoding="utf-8"
+            )
+            with self.assertRaises(SUMMARY.SummaryError):
+                SUMMARY.validate_draft(
+                    verdict_path,
+                    summary_path,
+                    findings_path,
+                    SHA,
+                    1,
+                    [lanes_path],
+                )
+
+    @staticmethod
+    def finding_record():
+        return {
+            "message": "**Medium** — The setup omits its executable path.",
+            "location": {
+                "path": "install-tools",
+                "range": {"start": {"line": 227}},
+            },
+            "severity": "WARNING",
+        }
 
     def test_a_novel_finding_without_a_posted_comment_is_rejected(self):
         with self.assertRaises(SUMMARY.SummaryError):
