@@ -470,7 +470,7 @@ jobs:
             - name: Post findings through reviewdog
               if: steps.scope.outputs.skip == 'false'
               env:
-                  REVIEWDOG_TOKEN: ${{ steps.runeseer.outputs.token }}
+                  REVIEWDOG_GITHUB_API_TOKEN: ${{ steps.runeseer.outputs.token }}
                   GITHUB_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REVIEWDOG_VERSION: 0.21.0
                   REVIEWDOG_SHA256: ad5ce7d5ffa52aaa7ec8710a8fa764181b6cecaab843cc791e1cce1680381569
@@ -579,9 +579,11 @@ jobs:
                       session_stats=$(jq -r '
                           [.[] | select(.type == "result")] | last
                           | if . == null then "" else
+                              (.duration_ms / 1000 | round) as $seconds
+                              |
                               "$" + (.total_cost_usd * 100 | round / 100 | tostring)
-                              + " · " + ((.duration_ms / 60000 | floor | tostring) + "m"
-                              + ((.duration_ms / 1000 | round) % 60 | tostring) + "s")
+                              + " · " + (($seconds / 60 | floor | tostring) + "m"
+                              + ($seconds % 60 | tostring) + "s")
                               + " · " + (.num_turns | tostring) + " turns"
                             end' "$EXECUTION_FILE" 2>/dev/null || echo "")
                   fi

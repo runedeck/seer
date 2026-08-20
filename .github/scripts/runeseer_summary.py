@@ -233,6 +233,22 @@ def validate_runeseer_bindings(
     }
     if set(sources) - finding_ids:
         raise SummaryError("Every new Runeseer inline comment needs an open finding.")
+    findings_by_id = {
+        finding["comment_id"]: finding
+        for finding in own_findings
+        if finding.get("comment_id") is not None
+    }
+    for comment_id in set(sources) & finding_ids:
+        comment = sources[comment_id]
+        finding = findings_by_id[comment_id]
+        if comment_key(comment) != (
+            finding.get("path"),
+            finding.get("line"),
+            finding.get("severity"),
+        ):
+            raise SummaryError(
+                "Each Runeseer finding must preserve its inline anchor and severity."
+            )
     for finding in own_findings:
         comment_id = finding.get("comment_id")
         if (

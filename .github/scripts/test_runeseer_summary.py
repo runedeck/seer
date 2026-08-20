@@ -460,6 +460,17 @@ class SummaryTests(unittest.TestCase):
         ]
         self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, None, comments), data)
 
+    def test_new_runeseer_comment_must_match_anchor_and_severity(self):
+        for field, value in (("line", 228), ("body", "**High** — Wrong severity.")):
+            with self.subTest(field=field):
+                finding = self.own_finding(comment_id=11)
+                comment = self.posted_comment(11)
+                comment[field] = value
+                with self.assertRaises(SUMMARY.SummaryError):
+                    SUMMARY.validate_verdict(
+                        verdict(findings=[finding]), SHA, 1, None, [comment]
+                    )
+
     @staticmethod
     def own_finding(comment_id=None):
         return {
