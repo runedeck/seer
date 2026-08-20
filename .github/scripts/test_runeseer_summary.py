@@ -660,6 +660,14 @@ class SummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(SUMMARY.SummaryError, "at most 30 novel"):
             SUMMARY.validate_verdict(verdict(findings=findings), SHA, 1)
 
+    def test_novel_runeseer_findings_can_share_an_anchor(self):
+        first = self.own_finding()
+        second = self.own_finding()
+        second["summary"] = "The setup omits its binary name"
+        data = verdict(findings=[first, second])
+
+        self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1), data)
+
     @staticmethod
     def finding_record():
         return {

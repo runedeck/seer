@@ -425,7 +425,13 @@ def validate_verdict(
     if runeseer_comments is not None:
         validate_runeseer_bindings(findings, runeseer_comments, previous_findings or [])
     finding_keys = [
-        (item.get("lane"), item.get("path"), item.get("line"), item.get("comment_id"))
+        (
+            item.get("lane"),
+            item.get("path"),
+            item.get("line"),
+            item.get("summary"),
+            item.get("comment_id"),
+        )
         for item in findings
     ]
     if len(finding_keys) != len(set(finding_keys)):
@@ -440,6 +446,7 @@ def validate_verdict(
             item.get("lane"),
             item.get("path"),
             item.get("line"),
+            item.get("summary"),
             item.get("comment_id"),
         ): item
         for item in judgments
