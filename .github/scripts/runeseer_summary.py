@@ -40,10 +40,34 @@ VERDICT_PREFIXES = {
     "clean": "**Looks good.**",
     "findings": "**Request changes.**",
 }
+REVIEWDOG_BODY_PREFIX = (
+    "<sub>reported by [reviewdog](https://github.com/reviewdog/reviewdog) "
+    ":dog:</sub><br>"
+)
+REVIEWDOG_TOOL_HEADER = "**[runeseer]**"
+REVIEWDOG_SEVERITY_ICONS = {
+    "critical": "🚫",
+    "high": "🚫",
+    "medium": "⚠️",
+}
 
 
 class SummaryError(RuntimeError):
     """Report invalid review state or a publication failure."""
+
+
+def parse_reviewdog_comment(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise SummaryError("Each Reviewdog comment needs a valid body.")
+    header, separator, message = value.partition(REVIEWDOG_BODY_PREFIX)
+    match = re.match(r"^\*\*(Critical|High|Medium)\*\*", message)
+    if not separator or match is None:
+        raise SummaryError("Each Runeseer comment needs the Reviewdog v0.21.0 wrapper.")
+    severity = match.group(1).lower()
+    expected_header = f"{REVIEWDOG_SEVERITY_ICONS[severity]} {REVIEWDOG_TOOL_HEADER} "
+    if header != expected_header:
+        raise SummaryError("Each Runeseer comment needs the exact Reviewdog tool header.")
+    return severity
 
 
 def load_json(path: Path) -> Any:
@@ -154,7 +178,6 @@ def validate_runeseer_bindings(
     model-supplied IDs used to carry still holds: every new comment needs an open finding,
     every finding needs new or carried evidence, and anchors and severities must agree.
     """
-    severity_pattern = re.compile(r"^\*\*(Critical|High|Medium)\*\*")
     sources: dict[int, dict[str, Any]] = {}
     for comment in comments:
         comment_id = comment.get("id")
@@ -162,11 +185,14 @@ def validate_runeseer_bindings(
             sources[comment_id] = comment
 
     def comment_key(comment: dict[str, Any]) -> tuple[Any, Any, Any]:
-        severity = severity_pattern.match(comment.get("body", ""))
+        try:
+            severity = parse_reviewdog_comment(comment.get("body"))
+        except SummaryError:
+            severity = None
         return (
             comment.get("path"),
             comment.get("line") or comment.get("original_line"),
-            severity.group(1).lower() if severity else None,
+            severity,
         )
 
     own_findings = [
@@ -175,14 +201,10 @@ def validate_runeseer_bindings(
     previous_own = [
         finding for finding in previous_findings if finding.get("lane") == "runeseer"
     ]
-    previous_ids = {
-        finding.get("comment_id")
+    previous_by_id = {
+        finding["comment_id"]: finding
         for finding in previous_own
         if type(finding.get("comment_id")) is int
-    }
-    previous_keys = {
-        (finding.get("path"), finding.get("line"), finding.get("summary"))
-        for finding in previous_own
     }
 
     unclaimed = dict(sources)
@@ -196,9 +218,6 @@ def validate_runeseer_bindings(
             if comment_key(comment) == anchor
         ]
         if not matches:
-            carried = (finding.get("path"), finding.get("line"), finding.get("summary"))
-            if carried in previous_keys:
-                continue
             raise SummaryError(
                 "Each new Runeseer finding needs a posted inline comment at its anchor."
             )
@@ -251,13 +270,24 @@ def validate_runeseer_bindings(
             )
     for finding in own_findings:
         comment_id = finding.get("comment_id")
-        if (
-            comment_id is not None
-            and comment_id not in sources
-            and comment_id not in previous_ids
-        ):
+        if comment_id is None or comment_id in sources:
+            continue
+        previous = previous_by_id.get(comment_id)
+        if previous is None:
             raise SummaryError(
                 "Each Runeseer finding ID needs new or carried evidence."
+            )
+        if (
+            finding.get("path"),
+            finding.get("line"),
+            finding.get("severity"),
+        ) != (
+            previous.get("path"),
+            previous.get("line"),
+            previous.get("severity"),
+        ):
+            raise SummaryError(
+                "Each carried Runeseer finding must preserve its path, line, and severity."
             )
 
 

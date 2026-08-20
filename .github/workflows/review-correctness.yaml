@@ -463,17 +463,20 @@ jobs:
 
                       A review that writes no result is a failed review. Even a clean review must write all three required files.
 
-            # The model writes findings; this step posts them. reviewdog anchors
-            # positions, deduplicates repeats by fingerprint, and removes the
-            # comments of findings the current file no longer carries (comments
-            # with replies stay). The binary is pinned and checksum-verified.
+            # The model writes findings. Reviewdog anchors positions and identifies
+            # repeated findings by fingerprint. It removes comments for absent
+            # findings. It keeps comments that have replies.
+            - name: Install reviewdog
+              if: steps.scope.outputs.skip == 'false'
+              # The pinned setup action verifies the selected release checksum.
+              uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+              with:
+                  reviewdog_version: v0.21.0
+
             - name: Post findings through reviewdog
               if: steps.scope.outputs.skip == 'false'
               env:
                   REVIEWDOG_GITHUB_API_TOKEN: ${{ steps.runeseer.outputs.token }}
-                  GITHUB_TOKEN: ${{ steps.runeseer.outputs.token }}
-                  REVIEWDOG_VERSION: 0.21.0
-                  REVIEWDOG_SHA256: ad5ce7d5ffa52aaa7ec8710a8fa764181b6cecaab843cc791e1cce1680381569
                   EXECUTION_FILE: ${{ steps.adjudicate.outputs.execution_file }}
               run: |
                   set -o pipefail
@@ -489,13 +492,7 @@ jobs:
                   fi
                   [ -f runeseer-findings.rdjsonl ] \
                       || { echo "the session finished without writing runeseer-findings.rdjsonl"; exit 1; }
-                  tmp="$(mktemp -d)"
-                  curl -fsSL "https://github.com/reviewdog/reviewdog/releases/download/v${REVIEWDOG_VERSION}/reviewdog_${REVIEWDOG_VERSION}_Linux_x86_64.tar.gz" \
-                      -o "$tmp/reviewdog.tar.gz"
-                  echo "${REVIEWDOG_SHA256}  ${tmp}/reviewdog.tar.gz" | sha256sum -c - >/dev/null \
-                      || { echo "reviewdog tarball failed its checksum"; exit 1; }
-                  tar -xzf "$tmp/reviewdog.tar.gz" -C "$tmp"
-                  "$tmp/reviewdog" -f=rdjsonl -name=runeseer \
+                  reviewdog -f=rdjsonl -name=runeseer \
                       -reporter=github-pr-review -filter-mode=diff_context -fail-level=none -tee \
                       < runeseer-findings.rdjsonl
                   echo "posted $(wc -l < runeseer-findings.rdjsonl | tr -d ' ') finding line(s)"
