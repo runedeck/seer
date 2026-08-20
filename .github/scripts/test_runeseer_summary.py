@@ -66,6 +66,46 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("No open findings", body)
         self.assertIn("Reviewed `01234567`", body)
 
+    def test_clean_summary_renders_headline_without_table(self):
+        body = self.format_case(
+            verdict(),
+            "**Looks good.** The installer reports its executable path after every successful setup.",
+        )
+        self.assertIn("### Runeseer review — clean", body)
+        self.assertNotIn("| Risk |", body)
+
+    def test_findings_summary_renders_risk_table(self):
+        data = verdict(
+            findings=[
+                {
+                    "path": "install-tools",
+                    "line": 227,
+                    "summary": "Success skips path advice",
+                    "lane": "runeseer",
+                    "judgment": "confirmed",
+                    "severity": "medium",
+                },
+                {
+                    "path": "publish.sh",
+                    "line": 12,
+                    "summary": "Token echoed | into the log",
+                    "lane": "runeseer",
+                    "judgment": "confirmed",
+                    "severity": "high",
+                },
+            ]
+        )
+        body = self.format_case(
+            data,
+            "**Request changes.** `install-tools:227` returns before it reports the required executable path.",
+        )
+        self.assertIn("### Runeseer review — 2 open findings", body)
+        lines = body.splitlines()
+        self.assertIn("| Risk | Finding | Location |", lines)
+        high = lines.index("| High | Token echoed \\| into the log | `publish.sh:12` |")
+        medium = lines.index("| Medium | Success skips path advice | `install-tools:227` |")
+        self.assertLess(high, medium)
+
     def test_findings_summary_uses_array_length(self):
         data = verdict(
             findings=[

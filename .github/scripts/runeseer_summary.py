@@ -419,6 +419,37 @@ def open_count_text(count: int) -> str:
     return f"{count} open"
 
 
+SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def headline(findings: list[dict[str, Any]]) -> str:
+    count = len(findings)
+    if count == 0:
+        return "### Runeseer review — clean"
+    noun = "finding" if count == 1 else "findings"
+    return f"### Runeseer review — {count} open {noun}"
+
+
+def findings_table(findings: list[dict[str, Any]]) -> list[str]:
+    """Render the open findings as one risk table, highest severity first."""
+    if not findings:
+        return []
+    ordered = sorted(
+        findings,
+        key=lambda item: (
+            SEVERITY_RANK.get(str(item.get("severity")), len(SEVERITY_RANK)),
+            str(item.get("path", "")),
+            item.get("line") or 0,
+        ),
+    )
+    lines = ["| Risk | Finding | Location |", "| --- | --- | --- |"]
+    for item in ordered:
+        risk = str(item.get("severity", "")).capitalize()
+        title = str(item.get("summary", "")).replace("|", "\\|")
+        lines.append(f"| {risk} | {title} | `{item['path']}:{item['line']}` |")
+    return lines
+
+
 def format_review(
     verdict_path: Path,
     summary_path: Path,
@@ -449,22 +480,24 @@ def format_review(
             f"[review run]({run_url})",
         )
     )
-    return "\n".join(
-        (
-            SUMMARY_MARKER,
-            VERDICT_MARKER.format(
-                sha=expected_sha,
-                base=verdict["base"],
-                round=verdict["round"],
-                verdict=verdict["verdict"],
-                restart=verdict["restart"],
-            ),
-            summary,
-            "",
-            "---",
-            footer,
-        )
-    )
+    lines = [
+        SUMMARY_MARKER,
+        VERDICT_MARKER.format(
+            sha=expected_sha,
+            base=verdict["base"],
+            round=verdict["round"],
+            verdict=verdict["verdict"],
+            restart=verdict["restart"],
+        ),
+        headline(verdict["findings"]),
+        "",
+    ]
+    table = findings_table(verdict["findings"])
+    if table:
+        lines.extend(table)
+        lines.append("")
+    lines.extend((summary, "", "---", footer))
+    return "\n".join(lines)
 
 
 def next_round(
