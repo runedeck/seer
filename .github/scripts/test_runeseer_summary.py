@@ -172,10 +172,14 @@ class SummaryTests(unittest.TestCase):
                 "**Looks good.** The change is correct. <!-- runeseer-verdict -->",
             )
 
-    def test_summary_enforces_word_limit(self):
+    def test_clean_summary_over_word_limit_uses_safe_fallback(self):
         words = " ".join(f"word{number}" for number in range(81))
-        with self.assertRaises(SUMMARY.SummaryError):
-            self.format_case(verdict(), f"**Looks good.** {words}")
+        body = self.format_case(verdict(), f"**Looks good.** {words}")
+        self.assertIn(
+            "**Looks good.** The review found no blocking correctness defects.",
+            body,
+        )
+        self.assertNotIn("word80", body)
 
     def test_count_must_equal_findings_length(self):
         data = verdict()
@@ -519,6 +523,17 @@ class SummaryTests(unittest.TestCase):
             ),
         }
 
+    @staticmethod
+    def finding_record():
+        return {
+            "message": "**Medium** — The setup omits its executable path.",
+            "location": {
+                "path": "install-tools",
+                "range": {"start": {"line": 227}},
+            },
+            "severity": "WARNING",
+        }
+
     def test_binding_fills_the_comment_id_by_anchor(self):
         finding = self.own_finding()
         SUMMARY.validate_verdict(verdict(findings=[finding]), SHA, 1, None,
@@ -558,6 +573,39 @@ class SummaryTests(unittest.TestCase):
     def test_a_novel_finding_without_a_posted_comment_is_rejected(self):
         with self.assertRaises(SUMMARY.SummaryError):
             SUMMARY.validate_verdict(verdict(findings=[self.own_finding()]), SHA, 1, None, [])
+
+    def test_filtered_finding_stays_blocking_without_an_inline_comment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            verdict_path = root / "verdict.json"
+            summary_path = root / "summary.md"
+            comments_path = root / "runeseer.json"
+            findings_path = root / "runeseer-findings.rdjsonl"
+            verdict_path.write_text(
+                json.dumps(verdict(findings=[self.own_finding()])), encoding="utf-8"
+            )
+            summary_path.write_text(
+                "**Request changes.** The setup omits its executable path.",
+                encoding="utf-8",
+            )
+            comments_path.write_text("[]", encoding="utf-8")
+            findings_path.write_text(
+                json.dumps(self.finding_record()) + "\n", encoding="utf-8"
+            )
+
+            body = SUMMARY.format_review(
+                verdict_path,
+                summary_path,
+                SHA,
+                1,
+                RUN_URL,
+                runeseer_comment_paths=[comments_path],
+                runeseer_findings_path=findings_path,
+            )
+            stored = json.loads(verdict_path.read_text(encoding="utf-8"))
+
+        self.assertIn("### Runeseer review — 1 open finding", body)
+        self.assertIsNone(stored["findings"][0]["comment_id"])
 
     def test_an_ambiguous_anchor_binding_is_rejected(self):
         with self.assertRaises(SUMMARY.SummaryError):

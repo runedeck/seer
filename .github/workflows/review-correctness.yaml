@@ -503,7 +503,8 @@ jobs:
                   echo "posted $(wc -l < runeseer-findings.rdjsonl | tr -d ' ') finding line(s)"
 
             # Bind each new Runeseer inline comment to the machine findings.
-            # The model cannot modify this root-owned evidence.
+            # Reviewdog can filter positions outside the diff context.
+            # The findings file then keeps the verdict blocking and visible.
             - name: Fetch new Runeseer findings
               if: steps.scope.outputs.skip == 'false'
               env:
@@ -600,6 +601,7 @@ jobs:
                       --lane-comments "$RUNESEER_LANES/issue-comments.json" \
                       --runeseer-comments "$RUNESEER_LANES/runeseer-new-comments.json" \
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
+                      --runeseer-findings runeseer-findings.rdjsonl \
                       --output runeseer-review.md
                   python3 "$RUNESEER_FORMATTER" publish \
                       --body runeseer-review.md \
@@ -966,7 +968,8 @@ jobs:
                       --lane-comments "$RUNESEER_LANES/inline-comments.json" \
                       --lane-comments "$RUNESEER_LANES/issue-comments.json" \
                       --runeseer-comments "$RUNESEER_LANES/runeseer-new-comments.json" \
-                      --previous-verdict "$RUNESEER_LANES/previous-verdict.json" >/dev/null 2>&1; then
+                      --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
+                      --runeseer-findings runeseer-findings.rdjsonl >/dev/null 2>&1; then
                       verdict_valid=true
                   fi
                   # Name the real fault in fixed words. No provider output or
