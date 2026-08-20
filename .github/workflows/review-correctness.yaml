@@ -424,6 +424,9 @@ jobs:
                       Findings file:
                       - Write `runeseer-findings.rdjsonl` in the workspace root. You post nothing yourself; the workflow posts each line as an inline comment after the session.
                       - One JSON object per line, rdjsonl shape: `{"message": "<comment body>", "location": {"path": "<path>", "range": {"start": {"line": <line>}}}, "severity": "ERROR|WARNING|INFO"}`.
+                      - Use a positive line number.
+                      - Do not set a diagnostic source name. The workflow supplies `runeseer`.
+                      - Write at most 30 novel Runeseer findings in one round. Carried findings do not use this limit.
                       - `severity` maps from the prefix: Critical and High are ERROR, Medium is WARNING.
                       - Write the file even when no findings remain; an empty file states that.
                       - When the fix is mechanical, attach it as a structured suggestion on the same line: `"suggestions": [{"range": {"start": {"line": <first>}, "end": {"line": <last>}}, "text": "<replacement lines>"}]`. Give the exact replacement text and the exact line range it replaces; the posting step renders the one-click suggestion. Attach a suggestion only when you are certain the replacement is complete and correct.
@@ -469,10 +472,10 @@ jobs:
                       - For every judgment, write a short factual `reason` for machine use. The human summary can translate or omit it.
                       - Copy `lane`, `path`, and `comment_id` from the originating lane comment. Copy `line`, or `original_line` when `line` is null. The workflow rejects an omitted inline comment or a mismatched identity.
                       - Copy `comment_id` from the originating entry's `id` in the trusted lane files. Every lane judgment needs this ID.
-                      - Set `comment_id` to null on every novel Runeseer finding: the workflow posts the findings file after the session and binds each finding to its comment by anchor and severity.
+                      - Set `comment_id` to null on every novel Runeseer finding. The workflow binds the finding after it posts the comment.
                       - The workflow rejects a Runeseer finding without a matching findings-file line.
                       - Preserve `comment_id` on carried ledger findings when it exists.
-                      - Each `summary` is a factual title of at most 12 words.
+                      - For each Runeseer finding, copy the first message sentence into `summary` without its final punctuation.
                       - `count` must equal the findings array length. Set `verdict` to `clean` only when the array is empty; otherwise set it to `findings`.
                       - `restart` is almost always `none`. Set `cursor` or `macroscope` only when changes since the free lanes settled are structurally large or shift unseen risk. State the reason in one human summary sentence.
 
@@ -507,20 +510,25 @@ jobs:
                       --sha "$HEAD_SHA" \
                       --round "$REVIEW_ROUND" \
                       --lane-comments "$RUNESEER_LANES/inline-comments.json" \
-                      --lane-comments "$RUNESEER_LANES/issue-comments.json" \
-                      --previous-verdict "$RUNESEER_LANES/previous-verdict.json"
+                      --lane-comments "$RUNESEER_LANES/issue-comments.json"
 
-            # The model writes findings; this step posts them. reviewdog anchors
-            # positions, deduplicates repeats by fingerprint, and removes the
-            # comments of findings the current file no longer carries (comments
-            # with replies stay). The binary is pinned and checksum-verified.
-            - name: Post findings through reviewdog
+            # The model writes findings. Reviewdog anchors positions and removes
+            # stale comments. Reviewdog keeps comments that have replies. The
+            # setup action uses a commit SHA. The binary uses an immutable release.
+            - name: Set up reviewdog
+              if: steps.scope.outputs.skip == 'false'
+              uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
+              with:
+                  reviewdog_version: v0.21.0
+
+            - id: publish_findings
+              name: Post findings through reviewdog
               if: steps.scope.outputs.skip == 'false'
               env:
+                  GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REVIEWDOG_GITHUB_API_TOKEN: ${{ steps.runeseer.outputs.token }}
-                  GITHUB_TOKEN: ${{ steps.runeseer.outputs.token }}
-                  REVIEWDOG_VERSION: 0.21.0
-                  REVIEWDOG_SHA256: ad5ce7d5ffa52aaa7ec8710a8fa764181b6cecaab843cc791e1cce1680381569
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
                   EXECUTION_FILE: ${{ steps.adjudicate.outputs.execution_file }}
               run: |
                   set -o pipefail
@@ -536,13 +544,14 @@ jobs:
                   fi
                   [ -f runeseer-findings.rdjsonl ] \
                       || { echo "the session finished without writing runeseer-findings.rdjsonl"; exit 1; }
-                  tmp="$(mktemp -d)"
-                  curl -fsSL "https://github.com/reviewdog/reviewdog/releases/download/v${REVIEWDOG_VERSION}/reviewdog_${REVIEWDOG_VERSION}_Linux_x86_64.tar.gz" \
-                      -o "$tmp/reviewdog.tar.gz"
-                  echo "${REVIEWDOG_SHA256}  ${tmp}/reviewdog.tar.gz" | sha256sum -c - >/dev/null \
-                      || { echo "reviewdog tarball failed its checksum"; exit 1; }
-                  tar -xzf "$tmp/reviewdog.tar.gz" -C "$tmp"
-                  "$tmp/reviewdog" -f=rdjsonl -name=runeseer \
+                  live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv')
+                  if [ "$live" != "$HEAD_SHA"$'\t'"$BASE_SHA" ]; then
+                      echo "stale=true" >> "$GITHUB_OUTPUT"
+                      echo "The pull request changed. This stale round publishes no findings."
+                      exit 1
+                  fi
+                  echo "stale=false" >> "$GITHUB_OUTPUT"
+                  reviewdog -f=rdjsonl -name=runeseer \
                       -reporter=github-pr-review -filter-mode=diff_context -fail-level=none -tee \
                       < runeseer-findings.rdjsonl
                   echo "posted $(wc -l < runeseer-findings.rdjsonl | tr -d ' ') finding line(s)"
@@ -971,7 +980,7 @@ jobs:
             # A cancelled round (superseded by a push or new review label) is not
             # a provider failure and must not trip the breaker.
             - name: Provider circuit breaker
-              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.freshness.outputs.stale != 'true'
+              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.freshness.outputs.stale != 'true' && steps.publish_findings.outputs.stale != 'true'
               continue-on-error: true
               env:
                   GH_TOKEN: ${{ github.token }}

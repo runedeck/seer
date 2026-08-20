@@ -40,10 +40,56 @@ VERDICT_PREFIXES = {
     "clean": "**Looks good.**",
     "findings": "**Request changes.**",
 }
+REVIEWDOG_BODY_PREFIX = (
+    "<sub>reported by [reviewdog](https://github.com/reviewdog/reviewdog) "
+    ":dog:</sub><br>"
+)
+REVIEWDOG_TOOL_HEADER = "**[runeseer]**"
+REVIEWDOG_SEVERITY_ICONS = {
+    "critical": "🚫",
+    "high": "🚫",
+    "medium": "⚠️",
+}
+MAX_NOVEL_RUNESEER_FINDINGS = 30
 
 
 class SummaryError(RuntimeError):
     """Report invalid review state or a publication failure."""
+
+
+def parse_runeseer_message(value: Any) -> tuple[str, str]:
+    if not isinstance(value, str) or not value:
+        raise SummaryError("Each findings-file line needs a valid message.")
+    first_line = value.splitlines()[0]
+    match = re.fullmatch(r"\*\*(Critical|High|Medium)\*\* — (.+)", first_line)
+    if match is None:
+        raise SummaryError(
+            "Each findings-file message needs a severity and one summary sentence."
+        )
+    summary = match.group(2).strip().rstrip(".!?").strip()
+    if not summary:
+        raise SummaryError("Each findings-file message needs a summary sentence.")
+    return match.group(1).lower(), summary
+
+
+def parse_reviewdog_comment(value: Any) -> tuple[str, str]:
+    if not isinstance(value, str) or not value:
+        raise SummaryError("Each reviewdog comment needs a valid body.")
+    header, separator, message = value.partition(REVIEWDOG_BODY_PREFIX)
+    if not separator:
+        raise SummaryError("Each Runeseer comment needs the reviewdog wrapper.")
+    severity, summary = parse_runeseer_message(message)
+    header_parts = header.split(" ", 2)
+    if len(header_parts) < 2 or header_parts[1] != REVIEWDOG_TOOL_HEADER:
+        raise SummaryError(
+            "Each Runeseer comment needs the runeseer reviewdog tool name."
+        )
+    icon = header_parts[0]
+    if icon != REVIEWDOG_SEVERITY_ICONS[severity]:
+        raise SummaryError(
+            "Each reviewdog severity icon must match the Runeseer severity."
+        )
+    return severity, summary
 
 
 def load_json(path: Path) -> Any:
@@ -148,25 +194,26 @@ def validate_runeseer_bindings(
 ) -> None:
     """Bind each novel Runeseer finding to the inline comment the workflow posted for it.
 
-    The model writes the findings file; reviewdog posts it after the session. The model
-    therefore cannot know comment IDs, so this step assigns them, matching by anchor and
-    severity against the root-owned list of new Runeseer comments. Every invariant the
-    model-supplied IDs used to carry still holds: every new comment needs an open finding,
-    every finding needs new or carried evidence, and anchors and severities must agree.
+    Reviewdog posts the findings after the session. The model cannot know the comment IDs.
+    The workflow matches each path, line, severity, and summary against root-owned comments.
+    Each new comment needs an open finding. Each finding needs new or carried evidence.
     """
-    severity_pattern = re.compile(r"^\*\*(Critical|High|Medium)\*\*")
     sources: dict[int, dict[str, Any]] = {}
     for comment in comments:
         comment_id = comment.get("id")
         if type(comment_id) is int and comment.get("in_reply_to_id") is None:
             sources[comment_id] = comment
 
-    def comment_key(comment: dict[str, Any]) -> tuple[Any, Any, Any]:
-        severity = severity_pattern.match(comment.get("body", ""))
+    def comment_key(comment: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+        try:
+            severity, summary = parse_reviewdog_comment(comment.get("body"))
+        except SummaryError:
+            severity, summary = None, None
         return (
             comment.get("path"),
             comment.get("line") or comment.get("original_line"),
-            severity.group(1).lower() if severity else None,
+            severity,
+            summary,
         )
 
     own_findings = [
@@ -175,30 +222,28 @@ def validate_runeseer_bindings(
     previous_own = [
         finding for finding in previous_findings if finding.get("lane") == "runeseer"
     ]
-    previous_ids = {
-        finding.get("comment_id")
+    previous_by_id = {
+        finding["comment_id"]: finding
         for finding in previous_own
         if type(finding.get("comment_id")) is int
-    }
-    previous_keys = {
-        (finding.get("path"), finding.get("line"), finding.get("summary"))
-        for finding in previous_own
     }
 
     unclaimed = dict(sources)
     for finding in own_findings:
         if finding.get("comment_id") is not None:
             continue
-        anchor = (finding.get("path"), finding.get("line"), finding.get("severity"))
+        anchor = (
+            finding.get("path"),
+            finding.get("line"),
+            finding.get("severity"),
+            finding.get("summary"),
+        )
         matches = [
             comment_id
             for comment_id, comment in unclaimed.items()
             if comment_key(comment) == anchor
         ]
         if not matches:
-            carried = (finding.get("path"), finding.get("line"), finding.get("summary"))
-            if carried in previous_keys:
-                continue
             raise SummaryError(
                 "Each new Runeseer finding needs a posted inline comment at its anchor."
             )
@@ -216,7 +261,12 @@ def validate_runeseer_bindings(
         comment_id = finding.get("comment_id")
         if comment_id is None or comment_id in sources:
             continue
-        anchor = (finding.get("path"), finding.get("line"), finding.get("severity"))
+        anchor = (
+            finding.get("path"),
+            finding.get("line"),
+            finding.get("severity"),
+            finding.get("summary"),
+        )
         matches = [
             candidate
             for candidate, comment in unclaimed.items()
@@ -245,19 +295,31 @@ def validate_runeseer_bindings(
             finding.get("path"),
             finding.get("line"),
             finding.get("severity"),
+            finding.get("summary"),
         ):
             raise SummaryError(
-                "Each Runeseer finding must preserve its inline anchor and severity."
+                "Each Runeseer finding must preserve its inline anchor, severity, and summary."
             )
     for finding in own_findings:
         comment_id = finding.get("comment_id")
-        if (
-            comment_id is not None
-            and comment_id not in sources
-            and comment_id not in previous_ids
-        ):
+        if comment_id is None or comment_id in sources:
+            continue
+        previous = previous_by_id.get(comment_id)
+        if previous is None:
             raise SummaryError(
                 "Each Runeseer finding ID needs new or carried evidence."
+            )
+        if (
+            finding.get("path"),
+            finding.get("line"),
+            finding.get("severity"),
+        ) != (
+            previous.get("path"),
+            previous.get("line"),
+            previous.get("severity"),
+        ):
+            raise SummaryError(
+                "Each carried Runeseer finding must preserve its anchor and severity."
             )
 
 
@@ -326,8 +388,8 @@ def validate_verdict(
                 "Each blocking finding needs Medium, High, or Critical severity."
             )
         validate_plain_text(item.get("path"), "Each finding path")
-        if type(item.get("line")) is not int or item["line"] < 0:
-            raise SummaryError("Each finding needs a nonnegative line number.")
+        if type(item.get("line")) is not int or item["line"] < 1:
+            raise SummaryError("Each finding needs a positive line number.")
         validate_plain_text(item.get("summary"), "Each finding summary")
         if item.get("lane") not in {"runeseer", "cursor", "macroscope"}:
             raise SummaryError("Each finding needs a known source lane.")
@@ -338,6 +400,14 @@ def validate_verdict(
             raise SummaryError("Each finding comment ID must be a positive integer.")
         if item["lane"] != "runeseer" and comment_id is None:
             raise SummaryError("Each lane finding needs its source comment ID.")
+    novel_runeseer_count = sum(
+        item["lane"] == "runeseer" and item.get("comment_id") is None
+        for item in findings
+    )
+    if novel_runeseer_count > MAX_NOVEL_RUNESEER_FINDINGS:
+        raise SummaryError(
+            "A review can contain at most 30 novel Runeseer findings."
+        )
     for item in judgments:
         if not isinstance(item, dict):
             raise SummaryError("Each lane judgment must be an object.")
@@ -507,31 +577,42 @@ def load_rdjson(path: Path) -> list[dict[str, Any]]:
 
 def validate_findings_file(verdict: dict[str, Any], records: list[dict[str, Any]]) -> None:
     severity_values = {
-        "Critical": ("critical", "ERROR"),
-        "High": ("high", "ERROR"),
-        "Medium": ("medium", "WARNING"),
+        "critical": "ERROR",
+        "high": "ERROR",
+        "medium": "WARNING",
     }
     actual = []
     for record in records:
-        message = record.get("message")
-        match = (
-            re.match(r"^\*\*(Critical|High|Medium)\*\*", message)
-            if isinstance(message, str)
-            else None
-        )
+        severity, summary = parse_runeseer_message(record.get("message"))
         location = record.get("location")
         span = location.get("range") if isinstance(location, dict) else None
         start = span.get("start") if isinstance(span, dict) else None
         path = location.get("path") if isinstance(location, dict) else None
         line = start.get("line") if isinstance(start, dict) else None
-        if match is None or not isinstance(path, str) or type(line) is not int:
-            raise SummaryError("Each findings-file line needs a severity, path, and line.")
-        severity, rdjson_severity = severity_values[match.group(1)]
-        if record.get("severity") != rdjson_severity:
+        if not isinstance(path, str) or type(line) is not int or line < 1:
+            raise SummaryError(
+                "Each findings-file line needs a path and positive line number."
+            )
+        source = record.get("source")
+        if source is None:
+            source = {}
+        if not isinstance(source, dict) or source.get("name", "") not in {
+            "",
+            "runeseer",
+        }:
+            raise SummaryError(
+                "Each findings-file source name must be empty or runeseer."
+            )
+        if record.get("severity") != severity_values[severity]:
             raise SummaryError("Each findings-file severity must match its message prefix.")
-        actual.append((path, line, severity))
+        actual.append((path, line, severity, summary))
     expected = [
-        (finding["path"], finding["line"], finding["severity"])
+        (
+            finding["path"],
+            finding["line"],
+            finding["severity"],
+            finding["summary"],
+        )
         for finding in verdict["findings"]
         if finding["lane"] == "runeseer"
     ]
@@ -548,7 +629,6 @@ def validate_draft(
     expected_sha: str,
     expected_round: int,
     lane_paths: list[Path] | None = None,
-    previous_path: Path | None = None,
 ) -> None:
     verdict = validate_verdict(
         load_json(verdict_path),
@@ -556,7 +636,6 @@ def validate_draft(
         expected_round,
         load_lane_comments(lane_paths),
         None,
-        load_previous_findings(previous_path),
     )
     try:
         summary = summary_path.read_text(encoding="utf-8")
@@ -828,7 +907,6 @@ def build_parser() -> argparse.ArgumentParser:
     draft_parser.add_argument("--sha", required=True)
     draft_parser.add_argument("--round", type=int, required=True)
     draft_parser.add_argument("--lane-comments", type=Path, action="append")
-    draft_parser.add_argument("--previous-verdict", type=Path)
 
     format_parser = commands.add_parser("format")
     format_parser.add_argument("--verdict", type=Path, required=True)
@@ -887,7 +965,6 @@ def main() -> int:
                 arguments.sha,
                 arguments.round,
                 arguments.lane_comments,
-                arguments.previous_verdict,
             )
             return 0
         if arguments.command == "format":

@@ -2,9 +2,10 @@ name: Review Correctness Entry
 
 # Thin caller: the lane's body lives in this repository. The caller owns
 # the triggers, the concurrency, and the permissions. Review labels request
-# rounds, while stage labels record settled work. Applying or removing this
-# workflow's review label may cancel an active run; nothing else does. The
-# lane consumes labels with the workflow token when a round ends, and those
+# rounds, while stage labels record settled work. A new head cancels an active
+# round and refreshes the mirror without starting another paid review. Review
+# label changes can also cancel an active run. The lane consumes labels with
+# the workflow token when a round ends, and those
 # removals emit no events, so a clean round never re-enters here.
 # ready_for_review re-evaluates the mirror and releases a pending review label.
 # pull_request_target, deliberately: the caller executes from the base branch,
@@ -13,7 +14,7 @@ name: Review Correctness Entry
 # explicitly and strips its instruction surfaces before the model reads it.
 on:
     pull_request_target:
-        types: [labeled, unlabeled, ready_for_review, edited]
+        types: [labeled, unlabeled, synchronize, ready_for_review, edited]
 
 permissions:
     contents: read
@@ -25,7 +26,7 @@ permissions:
 
 concurrency:
     group: review-correctness-${{ github.event.pull_request.number }}
-    cancel-in-progress: ${{ contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) && contains(fromJSON('["review", "review:runeseer"]'), github.event.label.name) }}
+    cancel-in-progress: ${{ github.event.action == 'synchronize' || (contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) && contains(fromJSON('["review", "review:runeseer"]'), github.event.label.name)) }}
 
 jobs:
     # A queued ready event keeps its label payload after another round

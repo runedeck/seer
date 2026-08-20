@@ -53,6 +53,18 @@ class SummaryTests(unittest.TestCase):
                 RUN_URL,
             )
 
+    def test_findings_message_normalizes_terminal_punctuation_and_spaces(self):
+        self.assertEqual(
+            SUMMARY.parse_runeseer_message(
+                "**Medium** — The setup omits its executable path.  \n- evidence"
+            ),
+            ("medium", "The setup omits its executable path"),
+        )
+
+    def test_findings_message_rejects_blank_summary(self):
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.parse_runeseer_message("**Medium** —    ")
+
     def test_clean_summary_has_markers_and_footer(self):
         body = self.format_case(
             verdict(),
@@ -435,17 +447,19 @@ class SummaryTests(unittest.TestCase):
                 "user": {"login": "runeseer[bot]"},
                 "path": "install-tools",
                 "line": 227,
-                "body": "**Medium** — The setup omits its executable path.",
+                "body": self.reviewdog_body(
+                    "**Medium** — The setup omits its executable path."
+                ),
             }
         ]
         with self.assertRaises(SUMMARY.SummaryError):
             SUMMARY.validate_verdict(verdict(), SHA, 1, None, comments)
 
-    def test_new_runeseer_comment_matches_its_finding(self):
+    def test_reviewdog_v021_comment_matches_its_finding(self):
         finding = {
             "path": "install-tools",
             "line": 227,
-            "summary": "Setup omits executable path",
+            "summary": "The setup omits its executable path",
             "lane": "runeseer",
             "judgment": "confirmed",
             "severity": "medium",
@@ -458,13 +472,23 @@ class SummaryTests(unittest.TestCase):
                 "user": {"login": "runeseer[bot]"},
                 "path": "install-tools",
                 "line": 227,
-                "body": "**Medium** — The setup omits its executable path.",
+                "body": self.reviewdog_body(
+                    "**Medium** — The setup omits its executable path."
+                ),
             }
         ]
         self.assertEqual(SUMMARY.validate_verdict(data, SHA, 1, None, comments), data)
 
     def test_new_runeseer_comment_must_match_anchor_and_severity(self):
-        for field, value in (("line", 228), ("body", "**High** — Wrong severity.")):
+        for field, value in (
+            ("line", 228),
+            (
+                "body",
+                self.reviewdog_body(
+                    "**High** — The setup omits its executable path.", "🚫"
+                ),
+            ),
+        ):
             with self.subTest(field=field):
                 finding = self.own_finding(comment_id=11)
                 comment = self.posted_comment(11)
@@ -474,12 +498,40 @@ class SummaryTests(unittest.TestCase):
                         verdict(findings=[finding]), SHA, 1, None, [comment]
                     )
 
+    def test_new_runeseer_comment_must_match_summary(self):
+        finding = self.own_finding(comment_id=11)
+        comment = self.posted_comment(11)
+        comment["body"] = self.reviewdog_body(
+            "**Medium** — The setup writes the wrong executable path."
+        )
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.validate_verdict(
+                verdict(findings=[finding]), SHA, 1, None, [comment]
+            )
+
+    def test_reviewdog_comment_must_use_the_runeseer_tool_name(self):
+        body = self.reviewdog_body(
+            "**Medium** — The setup omits its executable path."
+        ).replace("**[runeseer]**", "**[other-tool]**")
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "reviewdog tool name"):
+            SUMMARY.parse_reviewdog_comment(body)
+
+    @staticmethod
+    def reviewdog_body(message, icon="⚠️"):
+        return (
+            f"{icon} **[runeseer]** "
+            "<sub>reported by [reviewdog]"
+            "(https://github.com/reviewdog/reviewdog) :dog:</sub><br>"
+            f"{message}\n"
+            "<!-- __reviewdog__:ChBkMTAyNzkyYTU3MTg4ZWE0EgdydW5lc2Vlcg== -->\n"
+        )
+
     @staticmethod
     def own_finding(comment_id=None):
         return {
             "path": "install-tools",
             "line": 227,
-            "summary": "Setup omits executable path",
+            "summary": "The setup omits its executable path",
             "lane": "runeseer",
             "judgment": "confirmed",
             "severity": "medium",
@@ -493,7 +545,9 @@ class SummaryTests(unittest.TestCase):
             "user": {"login": "runeseer[bot]"},
             "path": "install-tools",
             "line": 227,
-            "body": "**Medium** — The setup omits its executable path.",
+            "body": SummaryTests.reviewdog_body(
+                "**Medium** — The setup omits its executable path."
+            ),
         }
 
     def test_binding_fills_the_comment_id_by_anchor(self):
@@ -502,7 +556,7 @@ class SummaryTests(unittest.TestCase):
                                  [self.posted_comment(11)])
         self.assertEqual(finding["comment_id"], 11)
 
-    def test_draft_validation_precedes_finding_publication(self):
+    def test_draft_validation_requires_matching_findings(self):
         finding = self.own_finding()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -531,6 +585,26 @@ class SummaryTests(unittest.TestCase):
                 [lanes_path],
             )
 
+            wrong_message = self.finding_record()
+            wrong_message["message"] = (
+                "**Medium** — The setup writes the wrong executable path."
+            )
+            findings_path.write_text(
+                json.dumps(wrong_message) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                SUMMARY.SummaryError,
+                "must match every open Runeseer finding exactly",
+            ):
+                SUMMARY.validate_draft(
+                    verdict_path,
+                    summary_path,
+                    findings_path,
+                    SHA,
+                    1,
+                    [lanes_path],
+                )
+
             findings_path.write_text("", encoding="utf-8")
             with self.assertRaises(SUMMARY.SummaryError):
                 SUMMARY.validate_draft(
@@ -557,6 +631,35 @@ class SummaryTests(unittest.TestCase):
                     [lanes_path],
                 )
 
+    def test_findings_file_rejects_unpostable_fields(self):
+        finding = self.own_finding()
+        data = verdict(findings=[finding])
+        named_record = self.finding_record()
+        named_record["source"] = {"name": "runeseer"}
+        SUMMARY.validate_findings_file(data, [named_record])
+        for field in ("line", "source"):
+            with self.subTest(field=field):
+                record = self.finding_record()
+                if field == "line":
+                    record["location"]["range"]["start"]["line"] = 0
+                else:
+                    record["source"] = {"name": "other"}
+                with self.assertRaises(SUMMARY.SummaryError):
+                    SUMMARY.validate_findings_file(data, [record])
+
+    def test_novel_runeseer_findings_stop_at_reviewdog_limit(self):
+        findings = []
+        for line in range(1, 32):
+            finding = self.own_finding()
+            finding["line"] = line
+            finding["summary"] = f"Finding {line}"
+            findings.append(finding)
+
+        accepted = verdict(findings=findings[:30])
+        self.assertEqual(SUMMARY.validate_verdict(accepted, SHA, 1), accepted)
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "at most 30 novel"):
+            SUMMARY.validate_verdict(verdict(findings=findings), SHA, 1)
+
     @staticmethod
     def finding_record():
         return {
@@ -582,6 +685,17 @@ class SummaryTests(unittest.TestCase):
         SUMMARY.validate_verdict(verdict(findings=[finding]), SHA, 1, None,
                                  [self.posted_comment(12)], [self.own_finding(comment_id=999)])
         self.assertEqual(finding["comment_id"], 12)
+
+    def test_a_carried_finding_preserves_its_comment_id_and_severity(self):
+        previous = self.own_finding(comment_id=999)
+        for field, value in (("comment_id", None), ("severity", "high")):
+            with self.subTest(field=field):
+                finding = self.own_finding(comment_id=999)
+                finding[field] = value
+                with self.assertRaises(SUMMARY.SummaryError):
+                    SUMMARY.validate_verdict(
+                        verdict(findings=[finding]), SHA, 1, None, [], [previous]
+                    )
 
     def test_the_footer_carries_session_stats(self):
         with tempfile.TemporaryDirectory() as directory:
