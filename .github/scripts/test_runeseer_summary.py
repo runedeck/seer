@@ -509,11 +509,11 @@ class SummaryTests(unittest.TestCase):
                 verdict(findings=[finding]), SHA, 1, None, [comment]
             )
 
-    def test_reviewdog_comment_must_use_the_runeseer_tool_name(self):
+    def test_reviewdog_comment_needs_the_exact_runeseer_wrapper(self):
         body = self.reviewdog_body(
             "**Medium** — The setup omits its executable path."
         ).replace("**[runeseer]**", "**[other-tool]**")
-        with self.assertRaisesRegex(SUMMARY.SummaryError, "reviewdog tool name"):
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "exact Reviewdog tool"):
             SUMMARY.parse_reviewdog_comment(body)
 
     @staticmethod
@@ -686,9 +686,14 @@ class SummaryTests(unittest.TestCase):
                                  [self.posted_comment(12)], [self.own_finding(comment_id=999)])
         self.assertEqual(finding["comment_id"], 12)
 
-    def test_a_carried_finding_preserves_its_comment_id_and_severity(self):
+    def test_a_carried_finding_preserves_its_prior_identity(self):
         previous = self.own_finding(comment_id=999)
-        for field, value in (("comment_id", None), ("severity", "high")):
+        for field, value in (
+            ("comment_id", None),
+            ("path", "other-file"),
+            ("line", 228),
+            ("severity", "high"),
+        ):
             with self.subTest(field=field):
                 finding = self.own_finding(comment_id=999)
                 finding[field] = value

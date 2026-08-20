@@ -77,18 +77,11 @@ def parse_reviewdog_comment(value: Any) -> tuple[str, str]:
         raise SummaryError("Each reviewdog comment needs a valid body.")
     header, separator, message = value.partition(REVIEWDOG_BODY_PREFIX)
     if not separator:
-        raise SummaryError("Each Runeseer comment needs the reviewdog wrapper.")
+        raise SummaryError("Each Runeseer comment needs the Reviewdog v0.21.0 wrapper.")
     severity, summary = parse_runeseer_message(message)
-    header_parts = header.split(" ", 2)
-    if len(header_parts) < 2 or header_parts[1] != REVIEWDOG_TOOL_HEADER:
-        raise SummaryError(
-            "Each Runeseer comment needs the runeseer reviewdog tool name."
-        )
-    icon = header_parts[0]
-    if icon != REVIEWDOG_SEVERITY_ICONS[severity]:
-        raise SummaryError(
-            "Each reviewdog severity icon must match the Runeseer severity."
-        )
+    expected_header = f"{REVIEWDOG_SEVERITY_ICONS[severity]} {REVIEWDOG_TOOL_HEADER} "
+    if header != expected_header:
+        raise SummaryError("Each Runeseer comment needs the exact Reviewdog tool header.")
     return severity, summary
 
 
@@ -319,7 +312,7 @@ def validate_runeseer_bindings(
             previous.get("severity"),
         ):
             raise SummaryError(
-                "Each carried Runeseer finding must preserve its anchor and severity."
+                "Each carried Runeseer finding must preserve its path, line, and severity."
             )
 
 

@@ -512,9 +512,9 @@ jobs:
                       --lane-comments "$RUNESEER_LANES/inline-comments.json" \
                       --lane-comments "$RUNESEER_LANES/issue-comments.json"
 
-            # The model writes findings. Reviewdog anchors positions and removes
-            # stale comments. Reviewdog keeps comments that have replies. The
-            # setup action uses a commit SHA. The binary uses an immutable release.
+            # Reviewdog anchors positions and uses fingerprints to identify findings.
+            # It removes absent findings and keeps comments that have replies.
+            # The pinned setup action verifies the immutable release checksum.
             - name: Set up reviewdog
               if: steps.scope.outputs.skip == 'false'
               uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
