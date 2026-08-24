@@ -5,6 +5,12 @@ name: Review Correctness
 # logic and runs in the caller's repository with the caller's event.
 on:
     workflow_call:
+        inputs:
+            reviewer_login:
+                description: GitHub bot login that publishes the review
+                required: false
+                type: string
+                default: "runeseer[bot]"
         secrets:
             RUNESEER_APP_ID:
                 required: true
@@ -20,7 +26,7 @@ on:
 env:
     LANE_BOTS: '["macroscopeapp[bot]", "cursor[bot]"]'
     LANE_GRAPHQL_LOGINS: '["macroscopeapp", "cursor", "macroscopeapp[bot]", "cursor[bot]"]'
-    RUNESEER_GRAPHQL_LOGINS: '["runeseer", "runeseer[bot]"]'
+    REVIEWER_LOGIN: ${{ inputs.reviewer_login }}
     APPS_EXPECTED: cursor
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
     LABEL_RUNE_BLOCKED: "issue:rune"
@@ -284,7 +290,7 @@ jobs:
                   legacy_rounds=0
                   marker_round=0
                   gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                      --jq '[.[] | select(.user.login == "runeseer[bot]") | .body]' \
+                      --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
                       | jq -s -r 'add // [] | .[]' > /tmp/runeseer-round-history.txt \
                       || { echo "could not read earlier rounds; rerun the review"; exit 1; }
                   legacy_rounds=$(grep -c '^review/correctness:' /tmp/runeseer-round-history.txt || true)
@@ -323,7 +329,7 @@ jobs:
                       --jq "[.[] | select(.user.login as \$login | $lanes | index(\$login))]" \
                       | jq -s 'add // []' > "$lane_tmp/issue-comments.json"
                   gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                      --jq '[.[] | select(.user.login == "runeseer[bot]") | .id]' \
+                      --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .id]' \
                       | jq -s 'add // [] | unique' > "$lane_tmp/runeseer-before.json"
                   sudo install -d -o root -g root -m 0555 "$RUNESEER_LANES"
                   sudo install -o root -g root -m 0444 "$lane_tmp"/*.json "$RUNESEER_LANES/"
@@ -514,7 +520,7 @@ jobs:
                   comments="$RUNNER_TEMP/runeseer-comments.json"
                   new_comments="$RUNNER_TEMP/runeseer-new-comments.json"
                   gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                      --jq '[.[] | select(.user.login == "runeseer[bot]")]' \
+                      --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN)]' \
                       | jq -s 'add // []' > "$comments"
                   jq --slurpfile before "$RUNESEER_LANES/runeseer-before.json" '
                       [.[]
@@ -606,7 +612,8 @@ jobs:
                   python3 "$RUNESEER_FORMATTER" publish \
                       --body runeseer-review.md \
                       --repo "${{ github.repository }}" \
-                      --pr "${{ github.event.pull_request.number }}"
+                      --pr "${{ github.event.pull_request.number }}" \
+                      --author "$REVIEWER_LOGIN"
 
             # Other-lane judgments close threads that no longer represent
             # defects. Confirmed findings stay open for the owner's decision.
@@ -748,9 +755,11 @@ jobs:
                       and .restart == "none"' runeseer-verdict.json >/dev/null; then
                       echo "this head still carries findings; this lane's own threads stay open"
                   else
-                      jq -c --argjson logins "$RUNESEER_GRAPHQL_LOGINS" '
-                          .[] | select(.isResolved == false)
-                          | select(.comments.nodes[0].author.login as $login | $logins | index($login))' <<<"$threads" \
+                      jq -c --arg login "$REVIEWER_LOGIN" '
+                          ($login | sub("\\[bot\\]$"; "")) as $slug
+                          | .[] | select(.isResolved == false)
+                          | select(.comments.nodes[0].author.login as $author
+                              | [$login, $slug] | index($author))' <<<"$threads" \
                           | while IFS= read -r own_thread; do
                           own_comment_id=$(jq -r '.comments.nodes[0].databaseId // empty' <<<"$own_thread")
                           [ -n "$own_comment_id" ] || continue
@@ -791,7 +800,7 @@ jobs:
                   [ "$(jq 'length' <<<"$confirmed")" = "0" ] && exit 0
                   if ! prior_escalations=$(gh api --paginate \
                       "repos/$REPO/issues/$PR/comments?per_page=100" \
-                      --jq '[.[] | select(.user.login == "runeseer[bot]") | .body]' \
+                      --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
                       | jq -s 'add // []'); then
                       echo "could not query prior owner escalations; skipping this escalation to prevent duplicate requests"
                       exit 0
@@ -957,7 +966,7 @@ jobs:
                       MARKER=$(grep -F '<!-- runeseer-verdict ' runeseer-review.md | sed -n '1p')
                       export MARKER
                       published=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                          --jq '[.[] | select(.user.login == "runeseer[bot]") | select(.body | contains(env.MARKER))] | length > 0' \
+                          --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | select(.body | contains(env.MARKER))] | length > 0' \
                           | jq -s 'any') || published=false
                   fi
                   verdict_valid=false
@@ -1006,7 +1015,7 @@ jobs:
                       marker="<!-- runeseer-provider-failure:$HEAD_SHA -->"
                       if ! comments=$(gh api --paginate \
                           "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                          --jq '[.[] | select(.user.login == "runeseer[bot]") | .body]' \
+                          --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
                           | jq -s 'add // []'); then
                           echo "::warning::could not read Runeseer comments. The provider failure notice was not posted"
                           exit 0
