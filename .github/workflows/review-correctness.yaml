@@ -90,10 +90,9 @@ jobs:
                   done
                   echo "instruction surface pinned to the base branch."
 
-            # Prose-only diffs are the conventions lane's territory; the
-            # subscription reviews executable surface. Markdown under
-            # docs/specs or .github stays in scope, since canon and
-            # machinery are executable in the way that matters.
+            # Prose-only diffs use the conventions lane. The subscription
+            # reviews executable surfaces. Markdown in docs/specs, .github,
+            # rune skills, or rune rules stays in scope.
             - id: scope
               name: Scope to reviewable changes
               env:
@@ -114,10 +113,10 @@ jobs:
                   fi
                   files=$(gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --name-only)
                   substantive=$(printf '%s\n' "$files" | grep -Ev '\.md$' || true)
-                  in_scope_md=$(printf '%s\n' "$files" | grep -E '^(docs/specs/|\.github/).*\.md$' || true)
+                  in_scope_md=$(printf '%s\n' "$files" | grep -E '^(docs/specs/|\.github/|runes/[^/]+/(skills|rules)/).*\.md$' || true)
                   if [ -z "$substantive" ] && [ -z "$in_scope_md" ]; then
                       echo "skip=true" >> "$GITHUB_OUTPUT"
-                      echo "reason=This change modifies prose outside the executable specification and workflow scope." >> "$GITHUB_OUTPUT"
+                      echo "reason=This change modifies prose outside the executable specification, workflow, and rune instruction scope." >> "$GITHUB_OUTPUT"
                       echo "Prose-only change; correctness lane stands down."
                   else
                       echo "skip=false" >> "$GITHUB_OUTPUT"
