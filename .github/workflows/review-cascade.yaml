@@ -237,7 +237,7 @@ jobs:
                       gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1 \
                           || gh api -X POST "repos/$REPO/labels" \
                               -f name="$1" -f color="$LABEL_COLOR" \
-                              -f description="Review provider requires intervention" >/dev/null
+                              -f description="Review lane requires intervention" >/dev/null
                       # An issue: label event fails every lane guard, so this
                       # blocker cannot re-enter or relaunch a cascade.
                       gh api -X POST \
@@ -251,7 +251,7 @@ jobs:
                   }
 
                   # An ignored lane reports in full; only its power to stop the
-                  # funnel is withdrawn. A terminal provider failure still
+                  # funnel is withdrawn. A terminal review failure still
                   # fails: that is a broken lane, not a judged one, and skip:
                   # is the override for a lane that should not run at all.
                   # Callers read stage_unsettled rather than a return code:
@@ -293,14 +293,14 @@ jobs:
                               fi
                               [ -z "$summon_label" ] || clear_label "$summon_label"
                               [ -z "$blocker" ] || mark_blocked "$blocker"
-                              fail_cascade "$stage reported a terminal provider failure: $failure_url"
+                              fail_cascade "$stage reported a terminal review failure: $failure_url"
                           fi
                           if [ -n "$rest_bot" ]; then
                               failure_url=$(terminal_comment_after "$comment_after" "$rest_bot")
                               if [ -n "$failure_url" ]; then
                                   [ -z "$summon_label" ] || clear_label "$summon_label"
                                   [ -z "$blocker" ] || mark_blocked "$blocker"
-                                  fail_cascade "$stage reported a terminal provider failure: $failure_url"
+                                  fail_cascade "$stage reported a terminal review failure: $failure_url"
                               fi
                           fi
                           sleep "$POLL_SECONDS"
@@ -367,7 +367,7 @@ jobs:
                       if settled "$APP_CURSOR"; then
                           echo "cursor already settled on this head; not asking it again."
                       elif blocked "$LABEL_CURSOR_BLOCKED"; then
-                          fail_cascade "$LABEL_CURSOR_BLOCKED is present; clear the provider problem before re-summoning."
+                          fail_cascade "$LABEL_CURSOR_BLOCKED is present; clear the review failure before re-summoning."
                       else
                           # Cursor ignores bot-authored comments, so only the
                           # owner-minted token can actually summon it. Falling
@@ -405,7 +405,7 @@ jobs:
                       macroscope_comment_id=$(latest_comment_id)
                       if ! settled "$APP_MACROSCOPE"; then
                           if blocked "$LABEL_MACROSCOPE_BLOCKED"; then
-                              fail_cascade "$LABEL_MACROSCOPE_BLOCKED is present; clear the provider problem before re-summoning."
+                              fail_cascade "$LABEL_MACROSCOPE_BLOCKED is present; clear the review failure before re-summoning."
                           fi
                           ensure_label "$LABEL_MACROSCOPE"
                       fi
@@ -439,7 +439,7 @@ jobs:
                       exit 0
                   fi
                   if blocked "$LABEL_RUNE_BLOCKED"; then
-                      fail_cascade "$LABEL_RUNE_BLOCKED is present; clear the provider problem before re-summoning."
+                      fail_cascade "$LABEL_RUNE_BLOCKED is present; clear the review failure before re-summoning."
                   fi
                   ensure_label "$LABEL_RUNESEER"
                   echo "runeseer summoned; its clean verdict earns the approval, and only then does the pull request reach the owner."

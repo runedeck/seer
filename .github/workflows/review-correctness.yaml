@@ -30,12 +30,6 @@ env:
     APPS_EXPECTED: cursor
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
     LABEL_RUNE_BLOCKED: "issue:rune"
-    RUNESEER_PROVIDER_FAILURE_GUIDANCE: |
-        The possible causes are exhausted Claude usage, a provider failure, or incomplete review output.
-
-        An owner can restore Claude usage or wait for the limit to reset.
-
-        Rerun the failed workflow only when the pull request head is unchanged. Otherwise, clear `issue:rune` after recovery and request a new round.
     LABEL_STAGE_CURSOR: "stage%3Acursor"
     LABEL_STAGE_MACROSCOPE: "stage%3Amacroscope"
     ARTIFACT_PREFIX: runeseer-verdict-pr
@@ -124,7 +118,8 @@ jobs:
 
             # Fetch trusted formatter code once, before the paid review starts.
             # Later steps reuse this exact reusable-workflow revision.
-            - name: Fetch the review formatter
+            - id: formatter
+              name: Fetch the review formatter
               if: steps.scope.outputs.skip == 'false'
               env:
                   GH_TOKEN: ${{ github.token }}
@@ -178,7 +173,11 @@ jobs:
               if: steps.scope.outputs.skip == 'false'
               env:
                   GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  RUN_ID: ${{ github.run_id }}
               run: |
                   set -o pipefail
                   name="${ARTIFACT_PREFIX}${{ github.event.pull_request.number }}"
@@ -269,21 +268,12 @@ jobs:
                       fi
                   fi
                   command rm -rf .candidate-verdict .previous-verdict candidate-verdict.zip
-                  # A base change invalidates settled free-lane stages. Clear them
-                  # so the cascade repeats them while this lane reviews the full diff.
+                  # A base change invalidates the settled free-lane stages.
+                  # The guarded reset runs after this step computes its round.
                   base_reset=false
                   if [ -n "$latest_base" ] && [ "$latest_base" != "$BASE_SHA" ]; then
-                      echo "the newest ledger uses another base; clearing the settled stages"
-                      for stage_label in $LABEL_STAGE_CURSOR $LABEL_STAGE_MACROSCOPE; do
-                          gh api -X DELETE \
-                              "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$stage_label" \
-                              >/dev/null 2>&1 || true
-                      done
                       base_reset=true
                   fi
-                  echo "base_reset=${base_reset}" >> "$GITHUB_OUTPUT"
-                  echo "prev_sha=${prev_sha}" >> "$GITHUB_OUTPUT"
-                  echo "previous verdict: ${prev_sha:-none}"
                   # The artifact and sticky marker both store the current round.
                   # The maximum survives artifact expiry and partial prior runs.
                   legacy_rounds=0
@@ -307,13 +297,63 @@ jobs:
                   echo "round=${round}" >> "$GITHUB_OUTPUT"
                   echo "earlier_rounds=${earlier_rounds}" >> "$GITHUB_OUTPUT"
                   echo "current review round: ${round}"
+                  check_current_round() {
+                      if ! live=$(gh api "repos/$REPO/pulls/$PR" \
+                          --jq '[.head.sha, .base.sha] | @tsv'); then
+                          echo "Could not verify the live pull request."
+                          return 1
+                      fi
+                      [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || {
+                          echo "The pull request changed."
+                          echo "This stale round did not reset stage labels."
+                          return 1
+                      }
+                      if ! newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
+                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$round" --run-id "$RUN_ID"); then
+                          echo "Could not compare the published review summary."
+                          return 1
+                      fi
+                      [ "$newer" = "false" ] || {
+                          echo "A newer review run already published this head."
+                          echo "This older round did not reset stage labels."
+                          return 1
+                      }
+                  }
+                  clear_stage() {
+                      check_current_round || return 1
+                      gh api -X DELETE \
+                          "repos/$REPO/issues/$PR/labels/$1" \
+                          >/dev/null 2>&1 || true
+                      if ! remaining=$(gh api --paginate \
+                          "repos/$REPO/issues/$PR/labels?per_page=100" \
+                          --jq '[.[].name]' | jq -s --arg label "$(printf '%s' "$1" | sed 's/%3A/:/')" \
+                          'add // [] | index($label) != null'); then
+                          echo "Could not verify the stage label removal."
+                          return 1
+                      fi
+                      [ "$remaining" = "false" ] || {
+                          echo "Could not reset the stage label: $1"
+                          return 1
+                      }
+                  }
+                  if [ "$base_reset" = "true" ]; then
+                      echo "The newest ledger uses another base."
+                      clear_stage "$LABEL_STAGE_CURSOR" || exit 1
+                      clear_stage "$LABEL_STAGE_MACROSCOPE" || exit 1
+                      echo "The workflow reset the settled stages."
+                  fi
+                  echo "base_reset=${base_reset}" >> "$GITHUB_OUTPUT"
+                  echo "prev_sha=${prev_sha}" >> "$GITHUB_OUTPUT"
+                  echo "previous verdict: ${prev_sha:-none}"
 
             # Only the lane bots' own words reach the model: any other
             # commenter's text is a prompt-injection vector into the
             # verdict that earns approval.
             - id: lanes
               name: Fetch the other lanes' findings
-              if: steps.scope.outputs.skip == 'false'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
@@ -335,13 +375,14 @@ jobs:
                   echo "inline: $(jq 'length' "$lane_tmp/inline-comments.json"), issue: $(jq 'length' "$lane_tmp/issue-comments.json")"
 
             - id: runeseer
+              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
               with:
                   app-id: ${{ secrets.RUNESEER_APP_ID }}
                   private-key: ${{ secrets.RUNESEER_APP_KEY }}
 
             - id: adjudicate
-              if: steps.scope.outputs.skip == 'false'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
               with:
                   claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -408,6 +449,8 @@ jobs:
                       - One JSON object per line, rdjsonl shape: `{"message": "<comment body>", "location": {"path": "<path>", "range": {"start": {"line": <line>}}}, "severity": "ERROR|WARNING|INFO"}`.
                       - `severity` maps from the prefix: Critical and High are ERROR, Medium is WARNING.
                       - Write the file even when no findings remain; an empty file states that.
+                      - Keep each JSON record within 16,384 UTF-8 bytes.
+                      - Keep each text field within 4,096 UTF-8 bytes.
                       - When the fix is mechanical, attach it as a structured suggestion on the same line: `"suggestions": [{"range": {"start": {"line": <first>}, "end": {"line": <last>}}, "text": "<replacement lines>"}]`. Give the exact replacement text and the exact line range it replaces; the posting step renders the one-click suggestion. Attach a suggestion only when you are certain the replacement is complete and correct.
 
                       Message format, for every findings-file line:
@@ -429,6 +472,7 @@ jobs:
                       - Write `runeseer-summary.md` in the workspace root. Do not publish the summary yourself.
                       - Write one verdict line, followed by at most three bullets. Use no heading.
                       - Keep all model-authored prose within 80 words.
+                      - Keep the file within 4,096 UTF-8 bytes.
                       - Start the first line with `**Request changes.**` when findings remain or a restart is requested.
                       - Start the first line with `**Looks good.**` when no findings remain and no restart is requested.
                       - Follow the verdict with one concrete sentence about the most important result.
@@ -442,6 +486,8 @@ jobs:
                       - Use exactly this schema:
                         `{"sha":"<full HEAD sha>","round":${{ steps.ledger.outputs.round }},"verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","nonfinding_issue_comment_ids":[123],"findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope","judgment":"confirmed","severity":"medium|high|critical","comment_id":<originating comment database id for a posted inline finding>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope","judgment":"confirmed|disputed|already addressed","severity":"low|medium|high|critical","reason":"<judgment sentence>","comment_id":<positive id from a trusted lane entry or carried Runeseer ledger entry>}]}`
                       - Include every open Medium, High, or Critical finding from any lane.
+                      - Include at most 50 open findings and 200 lane judgments.
+                      - Keep each model-authored text field within 4,096 UTF-8 bytes.
                       - Exclude Low notes from the machine findings and count.
                       - A finding is open only while the defect is still present at HEAD. Your Lane judgment decides: `confirmed` findings are open; `disputed` and `already addressed` findings are not, even when their review threads are still unresolved on GitHub, and a ledger entry whose defect the current HEAD fixes is not open either.
                       - When every lane finding is disputed or already addressed and no novel finding remains, the array is empty, `count` is 0, and the human summary starts with `**Looks good.**`.
@@ -473,21 +519,62 @@ jobs:
 
                       A review that writes no result is a failed review. Even a clean review must write all three required files.
 
+            # Validate deterministic output before Reviewdog changes remote comments.
+            # Novel Runeseer comment IDs bind after Reviewdog posts the findings.
+            - id: prevalidate
+              name: Validate review output before publication
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              env:
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              run: |
+                  for output in runeseer-verdict.json runeseer-findings.rdjsonl; do
+                      [ -f "$output" ] || {
+                          echo "The review did not create the required file: $output"
+                          exit 1
+                      }
+                  done
+                  jq --arg base "$BASE_SHA" '. + {base: $base}' \
+                      runeseer-verdict.json > "$RUNNER_TEMP/runeseer-prevalidate-verdict.json"
+                  python3 "$RUNESEER_FORMATTER" format \
+                      --verdict "$RUNNER_TEMP/runeseer-prevalidate-verdict.json" \
+                      --summary runeseer-summary.md \
+                      --sha "$HEAD_SHA" \
+                      --round "$REVIEW_ROUND" \
+                      --run-url "$RUN_URL" \
+                      --lane-comments "$RUNESEER_LANES/inline-comments.json" \
+                      --lane-comments "$RUNESEER_LANES/issue-comments.json" \
+                      --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
+                      --runeseer-findings runeseer-findings.rdjsonl \
+                      --output "$RUNNER_TEMP/runeseer-prevalidate-review.md"
+                  command mv "$RUNNER_TEMP/runeseer-prevalidate-verdict.json" \
+                      runeseer-verdict.json
+
             # The model writes findings. Reviewdog anchors positions and identifies
             # repeated findings by fingerprint. It removes comments for absent
             # findings. It keeps comments that have replies.
             - name: Install reviewdog
-              if: steps.scope.outputs.skip == 'false'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               # The pinned setup action verifies the selected release checksum.
               uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
               with:
                   reviewdog_version: v0.21.0
 
-            - name: Post findings through reviewdog
-              if: steps.scope.outputs.skip == 'false'
+            - id: post_findings
+              name: Post findings through reviewdog
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               env:
+                  GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REVIEWDOG_GITHUB_API_TOKEN: ${{ steps.runeseer.outputs.token }}
                   EXECUTION_FILE: ${{ steps.adjudicate.outputs.execution_file }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  RUN_ID: ${{ github.run_id }}
               run: |
                   set -o pipefail
                   # A truncated session has not looked at everything, and posting its partial file
@@ -502,6 +589,21 @@ jobs:
                   fi
                   [ -f runeseer-findings.rdjsonl ] \
                       || { echo "the session finished without writing runeseer-findings.rdjsonl"; exit 1; }
+                  live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
+                  [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || {
+                      echo "The pull request changed."
+                      echo "This stale round did not post findings."
+                      exit 1
+                  }
+                  newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
+                      --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                      --head "$HEAD_SHA" --base "$BASE_SHA" \
+                      --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                  [ "$newer" = "false" ] || {
+                      echo "A newer review run already published this head."
+                      echo "This older round did not post findings."
+                      exit 1
+                  }
                   reviewdog -f=rdjsonl -name=runeseer \
                       -reporter=github-pr-review -filter-mode=diff_context -fail-level=none -tee \
                       < runeseer-findings.rdjsonl
@@ -510,12 +612,34 @@ jobs:
             # Bind each new Runeseer inline comment to the machine findings.
             # Reviewdog can filter positions outside the diff context.
             # The findings file then keeps the verdict blocking and visible.
-            - name: Fetch new Runeseer findings
-              if: steps.scope.outputs.skip == 'false'
+            - id: fetch_findings
+              name: Fetch new Runeseer findings
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               env:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  RUN_ID: ${{ github.run_id }}
               run: |
                   set -o pipefail
+                  live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
+                  [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || {
+                      echo "The pull request changed."
+                      echo "This stale round did not fetch new findings."
+                      exit 1
+                  }
+                  newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
+                      --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                      --head "$HEAD_SHA" --base "$BASE_SHA" \
+                      --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                  [ "$newer" = "false" ] || {
+                      echo "A newer review run already published this head."
+                      echo "This older round did not fetch new findings."
+                      exit 1
+                  }
                   comments="$RUNNER_TEMP/runeseer-comments.json"
                   new_comments="$RUNNER_TEMP/runeseer-new-comments.json"
                   gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments?per_page=100" \
@@ -533,8 +657,9 @@ jobs:
             # The verdict binds to the base it was judged against, so a later
             # retarget invalidates the ledger. The lane writes this, not the
             # model, so it is never misremembered.
-            - name: Bind verdict to base
-              if: steps.scope.outputs.skip == 'false'
+            - id: bind
+              name: Bind verdict to base
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               env:
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
               run: |
@@ -542,44 +667,18 @@ jobs:
                   jq --arg base "$BASE_SHA" '. + {base: $base}' runeseer-verdict.json > runeseer-verdict.bound.json
                   command mv runeseer-verdict.bound.json runeseer-verdict.json
 
-            # Silence can look like approval. A skipped scope posts a clear
-            # status without replacing the latest judged summary and round.
-            - name: Publish skipped review status
-              if: steps.scope.outputs.skip == 'true'
+            # The model writes judgment only. This step validates that judgment
+            # and adds head-bound markers and accounting.
+            - id: prepare
+              name: Prepare current review summary
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               env:
-                  GH_TOKEN: ${{ steps.runeseer.outputs.token }}
-                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
-                  RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-                  SKIP_REASON: ${{ steps.scope.outputs.reason }}
-              run: |
-                  live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv')
-                  [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] \
-                      || { echo "the pull request changed; this stale skip status is not published"; exit 1; }
-                  short_sha=$(printf '%.8s' "$HEAD_SHA")
-                  body=$(printf '**Not reviewed.** %s\n\n---\nReviewed `%s` · [review run](%s)' \
-                      "$SKIP_REASON" "$short_sha" "$RUN_URL")
-                  gh api -X POST "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
-                      -f body="$body"
-
-            # The model writes judgment only. This step validates that judgment,
-            # adds head-bound markers and accounting, and publishes one current
-            # summary through the Runeseer identity.
-            - name: Publish current review summary
-              if: steps.scope.outputs.skip == 'false'
-              env:
-                  GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
                   RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
                   EXECUTION_FILE: ${{ steps.adjudicate.outputs.execution_file }}
               run: |
                   set -o pipefail
-                  live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv')
-                  [ "$live" = "$HEAD_SHA"$'\t'"${{ github.event.pull_request.base.sha }}" ] || {
-                      echo "the pull request changed after this round started; this stale round publishes no judgment"
-                      exit 1
-                  }
                   # The same accounting the GitLab-side reviewer appends: cost, duration, turns.
                   # Absent stats keep the footer short rather than failing the publish.
                   session_stats=""
@@ -608,28 +707,68 @@ jobs:
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
                       --runeseer-findings runeseer-findings.rdjsonl \
                       --output runeseer-review.md
-                  python3 "$RUNESEER_FORMATTER" publish \
-                      --body runeseer-review.md \
-                      --repo "${{ github.repository }}" \
-                      --pr "${{ github.event.pull_request.number }}" \
-                      --author "$REVIEWER_LOGIN"
 
-            # Other-lane judgments close threads that no longer represent
-            # defects. Confirmed findings stay open for the owner's decision.
-            - name: Apply lane judgments
-              if: steps.scope.outputs.skip == 'false'
+            # The publisher verifies the live head, base, comment identity,
+            # and stored body after deterministic preparation succeeds.
+            - id: publish
+              name: Publish current review summary
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               env:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  RUN_ID: ${{ github.run_id }}
               run: |
-                  set -o pipefail
-                  live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
-                  [ "$live" = "$HEAD_SHA"$'\t'"${{ github.event.pull_request.base.sha }}" ] || {
-                      echo "the pull request changed after this round started; this stale round changes no threads"
+                  newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
+                      --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                      --head "$HEAD_SHA" --base "$BASE_SHA" \
+                      --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                  [ "$newer" = "false" ] || {
+                      echo "A newer review run already published this head."
                       exit 1
                   }
+                  python3 "$RUNESEER_FORMATTER" publish \
+                      --body runeseer-review.md \
+                      --repo "$REPO" \
+                      --pr "$PR" \
+                      --author "$REVIEWER_LOGIN"
+
+            # Other-lane judgments close threads that no longer represent
+            # defects. Confirmed findings stay open for the owner's decision.
+            - id: judgments
+              name: Apply lane judgments
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              env:
+                  GH_TOKEN: ${{ steps.runeseer.outputs.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  RUN_ID: ${{ github.run_id }}
+              run: |
+                  set -o pipefail
+                  check_current_round() {
+                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
+                      [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || {
+                          echo "The pull request changed."
+                          echo "This stale round changed no review threads."
+                          return 1
+                      }
+                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
+                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                      [ "$newer" = "false" ] || {
+                          echo "A newer review run already published this head."
+                          echo "This older round changed no review threads."
+                          return 1
+                      }
+                  }
+                  check_current_round || exit 1
                   short_sha=$(printf '%.8s' "$HEAD_SHA")
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; no lane judgments to apply"; exit 0; }
                   if ! jq -e '.lane_judgments | type == "array"' runeseer-verdict.json >/dev/null; then
@@ -711,22 +850,14 @@ jobs:
                       if [ "$(jq -r '.judgment' <<<"$judgment")" = "already addressed" ]; then
                           reply_body="Fixed in \`$short_sha\`. This issue is no longer present."
                       fi
-                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
-                      [ "$live" = "$HEAD_SHA"$'\t'"${{ github.event.pull_request.base.sha }}" ] || {
-                          echo "the pull request changed; this stale round stops thread updates"
-                          exit 1
-                      }
+                      check_current_round || exit 1
                       if ! reply_error=$(gh api -X POST \
                           "repos/$REPO/pulls/$PR/comments/$first_comment_id/replies" \
                           -f body="$reply_body" 2>&1); then
                           echo "could not reply to review thread for $path:$line; leaving it unresolved: $reply_error"
                           continue
                       fi
-                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
-                      [ "$live" = "$HEAD_SHA"$'\t'"${{ github.event.pull_request.base.sha }}" ] || {
-                          echo "the pull request changed; this stale round stops thread updates"
-                          exit 1
-                      }
+                      check_current_round || exit 1
                       if ! resolution=$(gh api graphql \
                           -f query='mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } } }' \
                           -f threadId="$thread_id" 2>&1); then
@@ -765,22 +896,14 @@ jobs:
                           own_path=$(jq -r '.path' <<<"$own_thread")
                           own_line=$(jq -r '.line // .originalLine // 0' <<<"$own_thread")
                           own_thread_id=$(jq -r '.id' <<<"$own_thread")
-                          live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
-                          [ "$live" = "$HEAD_SHA"$'\t'"${{ github.event.pull_request.base.sha }}" ] || {
-                              echo "the pull request changed; this stale round stops thread updates"
-                              exit 1
-                          }
+                          check_current_round || exit 1
                           if ! own_reply=$(gh api -X POST \
                               "repos/$REPO/pulls/$PR/comments/$own_comment_id/replies" \
                               -f body="Fixed in \`$short_sha\`. This issue is no longer present." 2>&1); then
                               echo "could not reply to this lane's thread for $own_path:$own_line; leaving it unresolved: $own_reply"
                               continue
                           fi
-                          live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
-                          [ "$live" = "$HEAD_SHA"$'\t'"${{ github.event.pull_request.base.sha }}" ] || {
-                              echo "the pull request changed; this stale round stops thread updates"
-                              exit 1
-                          }
+                          check_current_round || exit 1
                           if ! own_resolution=$(gh api graphql \
                               -f query='mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { isResolved } } }' \
                               -f threadId="$own_thread_id" 2>&1); then
@@ -795,52 +918,97 @@ jobs:
                       done
                   fi
 
-                  confirmed=$(jq -c '[.lane_judgments[] | select(.judgment == "confirmed" and .severity != "low")]' runeseer-verdict.json)
-                  [ "$(jq 'length' <<<"$confirmed")" = "0" ] && exit 0
-                  if ! prior_escalations=$(gh api --paginate \
-                      "repos/$REPO/issues/$PR/comments?per_page=100" \
-                      --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
-                      | jq -s 'add // []'); then
-                      echo "could not query prior owner escalations; skipping this escalation to prevent duplicate requests"
+                  confirmed=$(jq -c '.findings' runeseer-verdict.json)
+                  if [ "$(jq 'length' <<<"$confirmed")" = "0" ]; then
+                      owner_result=$(python3 "$RUNESEER_FORMATTER" reconcile-owner-escalation \
+                          --clear \
+                          --repo "$REPO" \
+                          --pr "$PR" \
+                          --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" \
+                          --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" \
+                          --run-id "$RUN_ID") || {
+                          echo "Could not remove the stale owner escalation."
+                          exit 1
+                      }
+                      echo "$owner_result"
+                      [ "$owner_result" != "Runeseer kept the newer owner escalation." ] || exit 1
                       exit 0
                   fi
-                  # An originating comment id is the only identity that both
-                  # survives a reword and separates two findings, so it alone
-                  # carries the dedup marker. A finding without one has no such
-                  # identity: it escalates every round rather than borrowing a
-                  # key that would silently drop it. The schema asks for the id
-                  # on every lane finding, which keeps this path rare.
-                  confirmed=$(jq -c --argjson prior "$prior_escalations" '
-                      def escalation_key:
-                          if .comment_id then ({lane, comment_id} | @base64) else null end;
-                      map(. + {escalation_key: escalation_key})
-                      | map(select(
-                          .escalation_key as $key
-                          | $key == null
-                          or ($prior | any(.[]; contains("<!-- runeseer-escalation:\($key) -->")) | not)
-                      ))' <<<"$confirmed")
-                  [ "$(jq 'length' <<<"$confirmed")" = "0" ] && {
-                      echo "all confirmed findings were already escalated"
-                      exit 0
+                  confirmed=$(jq -c '
+                      map(. + {escalation_key:
+                          (if .comment_id then ({lane, comment_id} | @base64) else null end)})' \
+                      <<<"$confirmed")
+                  # GitHub uses the first CODEOWNERS file in this order.
+                  # Read it from the trusted base commit.
+                  codeowners_path=""
+                  for candidate in .github/CODEOWNERS CODEOWNERS docs/CODEOWNERS; do
+                      if git cat-file -e "$BASE_SHA:$candidate" 2>/dev/null; then
+                          codeowners_path="$candidate"
+                          break
+                      fi
+                  done
+                  [ -n "$codeowners_path" ] || {
+                      echo "The trusted base has no CODEOWNERS file."
+                      echo "Runeseer did not post an owner escalation."
+                      exit 1
                   }
-                  owner="${REPO%/*}"
-                  escalation=$(jq -r --arg owner "$owner" '
-                      ["@\($owner), these findings need an owner decision before merge:", ""]
-                      + (map("- `\(.path):\(.line)`: \(.summary)"
-                          + (if .escalation_key then "\n<!-- runeseer-escalation:\(.escalation_key) -->" else "" end)))
-                      + ["", "Please decide whether each finding should be fixed or accepted."]
-                      | join("\n")' <<<"$confirmed")
-                  if ! escalation_error=$(gh api -X POST "repos/$REPO/issues/$PR/comments" \
-                      -f body="$escalation" 2>&1); then
-                      echo "could not post the confirmed-finding escalation; the runeseer app token may lack issue-comment write scope: $escalation_error"
-                  else
-                      echo "posted one owner escalation for newly confirmed findings"
+                  codeowners_file="$RUNNER_TEMP/runeseer-base-codeowners"
+                  git show "$BASE_SHA:$codeowners_path" > "$codeowners_file" || {
+                      echo "Could not read CODEOWNERS from the trusted base."
+                      echo "Runeseer did not post an owner escalation."
+                      exit 1
+                  }
+                  owner=$(python3 "$RUNESEER_FORMATTER" owner-from-codeowners \
+                      --codeowners "$codeowners_file") || {
+                      echo "Could not resolve a personal owner from the trusted base."
+                      echo "Runeseer did not post an owner escalation."
+                      exit 1
+                  }
+                  if ! owner_type=$(gh api "users/${owner#@}" --jq '.type'); then
+                      echo "Could not verify the CODEOWNERS account."
+                      echo "Runeseer did not post an owner escalation."
+                      exit 1
                   fi
+                  [ "$owner_type" = "User" ] || {
+                      echo "The CODEOWNERS account is not a human user."
+                      echo "Runeseer did not post an owner escalation."
+                      exit 1
+                  }
+                  confirmed_file="$RUNNER_TEMP/runeseer-owner-findings.json"
+                  escalation_file="$RUNNER_TEMP/runeseer-owner-escalation.md"
+                  printf '%s\n' "$confirmed" > "$confirmed_file"
+                  python3 "$RUNESEER_FORMATTER" owner-escalation \
+                      --owner "$owner" \
+                      --findings "$confirmed_file" \
+                      --head "$HEAD_SHA" \
+                      --base "$BASE_SHA" \
+                      --run-id "$RUN_ID" > "$escalation_file" || {
+                      echo "Could not format the owner escalation."
+                      echo "Runeseer did not post an owner escalation."
+                      exit 1
+                  }
+                  owner_result=$(python3 "$RUNESEER_FORMATTER" reconcile-owner-escalation \
+                      --body "$escalation_file" \
+                      --repo "$REPO" \
+                      --pr "$PR" \
+                      --author "$REVIEWER_LOGIN" \
+                      --head "$HEAD_SHA" \
+                      --base "$BASE_SHA" \
+                      --review-round "$REVIEW_ROUND" \
+                      --run-id "$RUN_ID") || {
+                      echo "Could not reconcile the owner escalation."
+                      exit 1
+                  }
+                  echo "$owner_result"
+                  [ "$owner_result" != "Runeseer kept the newer owner escalation." ] || exit 1
 
             # The verdict artifact is the machine-readable record: the next
             # round's ledger, and the approval's evidence.
-            - name: Upload verdict
-              if: steps.scope.outputs.skip == 'false'
+            - id: upload
+              name: Upload verdict
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
               with:
                   name: runeseer-verdict-pr${{ github.event.pull_request.number }}
@@ -851,84 +1019,126 @@ jobs:
                   retention-days: 30
                   if-no-files-found: warn
 
-            # Earned approval: a clean verdict FOR THIS HEAD, read from the
-            # artifact rather than comment archaeology. The live head is
-            # re-fetched first and the review is pinned to the judged commit,
-            # so a push racing the verdict can never collect the approval.
-            # A clean verdict that requests a restart approves nothing: the
-            # restarted stages must settle before the merge gate opens.
-            - name: Approve on clean verdict
-              if: steps.scope.outputs.skip == 'false'
-              env:
-                  GH_TOKEN: ${{ steps.runeseer.outputs.token }}
-                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
-              run: |
-                  [ -f runeseer-verdict.json ] || { echo "no verdict file; not approving"; exit 0; }
-                  live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv')
-                  # Clean means explicitly, completely clean: every field
-                  # present and exact, no defaults. A partial verdict object
-                  # approves nothing.
-                  if jq -e --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" '
-                      .verdict == "clean" and .count == 0
-                      and (.findings | type == "array" and length == 0)
-                      and .restart == "none"
-                      and .sha == $sha and .base == $base' runeseer-verdict.json >/dev/null \
-                      && [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ]; then
-                      gh api -X POST "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews" \
-                          -f event=APPROVE \
-                          -f commit_id="$HEAD_SHA" \
-                          -f body="Earned approval: review/correctness returned a clean verdict for ${HEAD_SHA}. Dismissed automatically on any new push."
-                  fi
-
             # A review label requests one round, even when the scope stands down:
             # consuming the labels stops a later push from re-running the
             # paid lane out of funnel order. The next round starts with a
             # fresh review label.
-            - name: Consume the review labels
+            - id: consume
+              name: Consume the review labels
               if: always()
               continue-on-error: true
               env:
                   GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  RUN_ID: ${{ github.run_id }}
+                  SCOPE_SKIPPED: ${{ steps.scope.outputs.skip }}
+                  BASE_RESET: ${{ steps.ledger.outputs.base_reset }}
               run: |
+                  set -o pipefail
+                  check_current_round() {
+                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
+                      [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || return 1
+                      [ "$SCOPE_SKIPPED" != "true" ] || return 0
+                      [ "$BASE_RESET" != "true" ] || return 0
+                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
+                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                      [ "$newer" = "false" ]
+                  }
                   for label in $LABELS_CONSUMED; do
+                      check_current_round || {
+                          echo "This stale round did not consume review labels."
+                          exit 1
+                      }
                       gh api -X DELETE \
-                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$label" \
+                          "repos/$REPO/issues/$PR/labels/$label" \
                           >/dev/null 2>&1 || true
                   done
-                  echo "review labels consumed; a new review label starts the next round."
+                  if ! remaining=$(gh api --paginate \
+                      "repos/$REPO/issues/$PR/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s -r 'add // [] | .[]'); then
+                      echo "Could not verify the review label removal."
+                      exit 1
+                  fi
+                  for label in $LABELS_CONSUMED; do
+                      name=$(printf '%s' "$label" | sed 's/%3A/:/g')
+                      if printf '%s\n' "$remaining" | grep -Fqx "$name"; then
+                          echo "Could not consume the review label: $name"
+                          exit 1
+                      fi
+                  done
+                  echo "The workflow consumed the review labels."
 
             # The adjudicator's requested restart clears the recorded stage
             # labels, so the next round re-runs the named stage onward. The
             # workflow token's label events trigger nothing. The clears are
             # verified: a stage label that survives would silently skip a
             # stage the adjudicator wanted re-run, so this step fails loudly.
-            - name: Apply requested restart
-              if: steps.scope.outputs.skip == 'false'
+            - id: restart
+              name: Apply requested restart
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               env:
                   GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  RUN_ID: ${{ github.run_id }}
               run: |
+                  set -o pipefail
                   [ -f runeseer-verdict.json ] || exit 0
                   restart=$(jq -r '.restart // "none"' runeseer-verdict.json)
+                  check_current_round() {
+                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv') || {
+                          echo "Could not verify the live pull request."
+                          return 1
+                      }
+                      [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || {
+                          echo "The pull request changed."
+                          echo "This stale round did not clear stage labels."
+                          return 1
+                      }
+                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
+                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID") || {
+                          echo "Could not compare the published review summary."
+                          return 1
+                      }
+                      [ "$newer" = "false" ] || {
+                          echo "A newer review run already published this head."
+                          echo "This older round did not clear stage labels."
+                          return 1
+                      }
+                  }
                   clear_stage() {
+                      check_current_round || return 1
                       gh api -X DELETE \
-                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$1" \
+                          "repos/$REPO/issues/$PR/labels/$1" \
                           >/dev/null 2>&1 || true
-                      remaining=$(gh api --paginate \
-                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                      if ! remaining=$(gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
                           --jq '[.[].name]' | jq -s --arg label "$(printf '%s' "$1" | sed 's/%3A/:/')" \
-                          'add // [] | index($label) != null')
+                          'add // [] | index($label) != null'); then
+                          echo "Could not verify the stage label removal."
+                          return 1
+                      fi
                       [ "$remaining" = "false" ] \
-                          || { echo "could not clear stage label $1; the restart did not apply"; exit 1; }
+                          || { echo "could not clear stage label $1; the restart did not apply"; return 1; }
                   }
                   case "$restart" in
                       cursor)
-                          clear_stage "$LABEL_STAGE_CURSOR"
-                          clear_stage "$LABEL_STAGE_MACROSCOPE"
+                          clear_stage "$LABEL_STAGE_CURSOR" || exit 1
+                          clear_stage "$LABEL_STAGE_MACROSCOPE" || exit 1
                           echo "restart requested: the next round re-runs the full funnel."
                           ;;
                       macroscope)
-                          clear_stage "$LABEL_STAGE_MACROSCOPE"
+                          clear_stage "$LABEL_STAGE_MACROSCOPE" || exit 1
                           echo "restart requested: the next round re-runs macroscope onward."
                           ;;
                       none)
@@ -940,36 +1150,230 @@ jobs:
                           ;;
                   esac
 
-            # A round that produced no verdict is a provider failure, not a
-            # finding: the blocker label stops the cascade from re-summoning
-            # this lane until the problem is fixed. A round that produced a
-            # verdict clears the blocker. The workflow token's label events
-            # trigger nothing, so neither write re-enters the cascade.
-            # A cancelled round (superseded by a push or new review label) is not
-            # a provider failure and must not trip the breaker.
-            - name: Provider circuit breaker
+            # A failed Runeseer round activates the blocker. A valid published
+            # verdict removes the blocker before approval and the verdict gate.
+            # The breaker classifies every post-publication finalizer.
+            - id: breaker
+              name: Runeseer circuit breaker
               if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
-              continue-on-error: true
               env:
                   GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
                   RUNESEER_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  FORMATTER_OUTCOME: ${{ steps.formatter.outcome }}
+                  ADJUDICATE_OUTCOME: ${{ steps.adjudicate.outcome }}
+                  PREVALIDATE_OUTCOME: ${{ steps.prevalidate.outcome }}
+                  PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+                  PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+                  JUDGMENTS_OUTCOME: ${{ steps.judgments.outcome }}
+                  UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+                  CONSUME_OUTCOME: ${{ steps.consume.outcome }}
+                  RESTART_OUTCOME: ${{ steps.restart.outcome }}
+                  PRE_BREAKER_STATUS: ${{ job.status }}
+                  RUN_ID: ${{ github.run_id }}
+                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
               run: |
                   set -o pipefail
                   encoded=$(printf '%s' "$LABEL_RUNE_BLOCKED" | sed 's/:/%3A/')
-                  # Only a validated verdict and published human summary prove
-                  # that the provider completed the review.
-                  published=false
-                  if [ -f runeseer-review.md ]; then
-                      MARKER=$(grep -F '<!-- runeseer-verdict ' runeseer-review.md | sed -n '1p')
-                      export MARKER
-                      published=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                          --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | select(.body | contains(env.MARKER))] | length > 0' \
-                          | jq -s 'any') || published=false
+                  check_live() {
+                      if ! live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv'); then
+                          echo "Could not verify the live pull request."
+                          return 1
+                      fi
+                      [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || {
+                          echo "The pull request changed."
+                          echo "This stale circuit breaker made no remote changes."
+                          return 2
+                      }
+                  }
+
+                  check_current_round() {
+                      check_live || return $?
+                      if ! newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
+                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID"); then
+                          echo "Could not compare the published review summary."
+                          return 1
+                      fi
+                      case "$newer" in
+                          false)
+                              return 0
+                              ;;
+                          true)
+                              echo "A newer review run already published this head."
+                              echo "This superseded circuit breaker made no remote changes."
+                              return 2
+                              ;;
+                          *)
+                              echo "Runeseer returned an invalid summary comparison."
+                              return 1
+                              ;;
+                      esac
+                  }
+
+                  verify_blocker() {
+                      expected="$1"
+                      if ! labels=$(gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
+                          --jq '[.[].name]' | jq -s -r 'add // [] | .[]'); then
+                          echo "Could not verify the issue:rune label."
+                          return 1
+                      fi
+                      present=false
+                      printf '%s\n' "$labels" | grep -Fqx "$LABEL_RUNE_BLOCKED" && present=true
+                      [ "$present" = "$expected" ] || {
+                          echo "The issue:rune label state is incorrect."
+                          return 1
+                      }
+                  }
+
+                  ensure_blocker_label() {
+                      if gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1; then
+                          check_current_round || return $?
+                          gh api -X PATCH "repos/$REPO/labels/$encoded" \
+                              -f description="Review lane requires intervention" >/dev/null \
+                              || return 1
+                      else
+                          check_current_round || return $?
+                          if gh api -X POST "repos/$REPO/labels" \
+                              -f name="$LABEL_RUNE_BLOCKED" \
+                              -f color="d93f0b" \
+                              -f description="Review lane requires intervention" >/dev/null; then
+                              return 0
+                          fi
+                          # The read can fail during a transient API error. A
+                          # patch distinguishes an existing label from a failed create.
+                          check_current_round || return $?
+                          gh api -X PATCH "repos/$REPO/labels/$encoded" \
+                              -f description="Review lane requires intervention" >/dev/null \
+                              || return 1
+                      fi
+                  }
+
+                  set_blocker() {
+                      ensure_blocker_label || return $?
+                      check_current_round || return $?
+                      gh api -X POST "repos/$REPO/issues/$PR/labels" \
+                          -f "labels[]=$LABEL_RUNE_BLOCKED" >/dev/null \
+                          || return 1
+                      verify_blocker true || return 1
+                  }
+
+                  clear_blocker() {
+                      ensure_blocker_label || return $?
+                      check_current_round || return $?
+                      gh api -X DELETE "repos/$REPO/issues/$PR/labels/$encoded" \
+                          >/dev/null 2>&1 || true
+                      verify_blocker false || return 1
+                  }
+
+                  ensure_formatter() {
+                      [ -x "$RUNESEER_FORMATTER" ] && return 0
+                      workflow_sha="${{ job.workflow_sha }}"
+                      [ -n "$workflow_sha" ] || return 1
+                      temporary_formatter=$(mktemp) || return 1
+                      if gh api "repos/runedeck/seer/contents/.github/scripts/runeseer_summary.py?ref=$workflow_sha" \
+                          -H 'Accept: application/vnd.github.raw+json' > "$temporary_formatter" \
+                          && python3 -m py_compile "$temporary_formatter" \
+                          && sudo install -o root -g root -m 0555 \
+                              "$temporary_formatter" "$RUNESEER_FORMATTER"; then
+                          command rm -f "$temporary_formatter"
+                          return 0
+                      fi
+                      command rm -f "$temporary_formatter"
+                      return 1
+                  }
+
+                  publish_failure_notice() {
+                      kind="$1"
+                      [ -n "$RUNESEER_TOKEN" ] || {
+                          echo "The Runeseer app token is unavailable."
+                          return 1
+                      }
+                      check_current_round || return $?
+                      failure_body="$RUNNER_TEMP/runeseer-failure-notice.md"
+                      python3 "$RUNESEER_FORMATTER" failure-notice \
+                          --kind "$kind" --run-url "$RUN_URL" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --run-id "$RUN_ID" > "$failure_body" || return 1
+                      if ! notice_result=$(GH_TOKEN="$RUNESEER_TOKEN" \
+                          python3 "$RUNESEER_FORMATTER" reconcile-failure-notice \
+                          --body "$failure_body" \
+                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID"); then
+                          echo "Runeseer could not reconcile the failure notice."
+                          return 1
+                      fi
+                      echo "$notice_result"
+                      [ "$notice_result" != "Runeseer kept the newer failure notice." ] \
+                          || return 2
+                  }
+
+                  record_failure() {
+                      blocker_status=0
+                      set_blocker || blocker_status=$?
+                      [ "$blocker_status" -ne 2 ] || return 2
+                      [ "$blocker_status" -eq 0 ] || return 1
+                      notice_status=0
+                      publish_failure_notice "$1" || notice_status=$?
+                      [ "$notice_status" -ne 2 ] || return 2
+                      [ "$notice_status" -eq 0 ]
+                  }
+
+                  if ! ensure_formatter; then
+                      live_status=0
+                      check_live || live_status=$?
+                      [ "$live_status" -ne 2 ] || exit 0
+                      echo "Could not load the trusted Runeseer formatter."
+                      exit 1
+                  fi
+
+                  case "$REVIEW_ROUND" in
+                      ""|*[!0-9]*|0)
+                          round_history="$RUNNER_TEMP/runeseer-breaker-round-history.md"
+                          if ! gh api --paginate \
+                              "repos/$REPO/issues/$PR/comments?per_page=100" \
+                              --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
+                              | jq -s -r 'add // [] | .[]' > "$round_history"; then
+                              echo "Could not derive the fallback review round."
+                              exit 1
+                          fi
+                          if ! previous_round=$(python3 "$RUNESEER_FORMATTER" marker-round \
+                              --history "$round_history" --base "$BASE_SHA"); then
+                              echo "Could not read the fallback review round."
+                              exit 1
+                          fi
+                          case "$previous_round" in
+                              ""|*[!0-9]*)
+                                  echo "The fallback review round is invalid."
+                                  exit 1
+                                  ;;
+                          esac
+                          REVIEW_ROUND=$((previous_round + 1))
+                          echo "The circuit breaker uses fallback review round $REVIEW_ROUND."
+                          ;;
+                  esac
+
+                  current_status=0
+                  check_current_round || current_status=$?
+                  [ "$current_status" -ne 2 ] || exit 0
+                  [ "$current_status" -eq 0 ] || exit 1
+
+                  verdict_exists=false
+                  [ -f runeseer-verdict.json ] && verdict_exists=true
+                  required_outputs_exist=false
+                  if [ -f runeseer-verdict.json ] \
+                      && [ -f runeseer-findings.rdjsonl ]; then
+                      required_outputs_exist=true
                   fi
                   verdict_valid=false
-                  if python3 "$RUNESEER_FORMATTER" validate-verdict \
+                  if [ "$verdict_exists" = "true" ] \
+                      && python3 "$RUNESEER_FORMATTER" validate-verdict \
                       --verdict runeseer-verdict.json \
                       --sha "$HEAD_SHA" \
                       --round "$REVIEW_ROUND" \
@@ -980,61 +1384,91 @@ jobs:
                       --runeseer-findings runeseer-findings.rdjsonl >/dev/null 2>&1; then
                       verdict_valid=true
                   fi
-                  # Name the real fault in fixed words. No provider output or
-                  # pull request text reaches the comment.
-                  if [ ! -f runeseer-verdict.json ]; then
-                      fault_title="the provider produced no verdict"
-                      fault_detail="The round ended without a verdict file. The provider did not complete the review."
-                  elif [ "$verdict_valid" != "true" ]; then
-                      fault_title="the verdict failed validation"
-                      fault_detail="The provider produced a verdict. The verdict did not validate for this head and round."
-                  else
-                      fault_title="the summary was not published"
-                      fault_detail="The verdict validated. The summary comment did not reach the pull request."
+                  if ! fault_kind=$(python3 "$RUNESEER_FORMATTER" failure-kind \
+                      --verdict-exists "$verdict_exists" \
+                      --required-outputs-exist "$required_outputs_exist" \
+                      --verdict-valid "$verdict_valid" \
+                      --formatter-outcome "$FORMATTER_OUTCOME" \
+                      --adjudicate-outcome "$ADJUDICATE_OUTCOME" \
+                      --prevalidate-outcome "$PREVALIDATE_OUTCOME" \
+                      --prepare-outcome "$PREPARE_OUTCOME" \
+                      --publish-outcome "$PUBLISH_OUTCOME" \
+                      --pre-breaker-status "$PRE_BREAKER_STATUS" \
+                      --judgments-outcome "$JUDGMENTS_OUTCOME" \
+                      --upload-outcome "$UPLOAD_OUTCOME" \
+                      --consume-outcome "$CONSUME_OUTCOME" \
+                      --restart-outcome "$RESTART_OUTCOME"); then
+                      echo "Could not classify the Runeseer failure."
+                      record_status=0
+                      record_failure workflow || record_status=$?
+                      [ "$record_status" -ne 2 ] || exit 0
+                      exit 1
                   fi
-                  if [ "$published" = "true" ] && [ "$verdict_valid" = "true" ]; then
-                      gh api -X DELETE \
-                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/$encoded" \
-                          >/dev/null 2>&1 || true
-                  else
-                      gh api "repos/${{ github.repository }}/labels/$encoded" >/dev/null 2>&1 \
-                          || gh api -X POST "repos/${{ github.repository }}/labels" \
-                              -f name="$LABEL_RUNE_BLOCKED" -f color="d93f0b" \
-                              -f description="Review provider requires intervention" >/dev/null
-                      gh api -X POST \
-                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" \
-                          -f "labels[]=$LABEL_RUNE_BLOCKED" >/dev/null
-                      if [ -z "$RUNESEER_TOKEN" ]; then
-                          echo "::warning::Runeseer app token is unavailable. The provider failure notice was not posted"
-                          exit 0
+
+                  if [ -z "$RUNESEER_TOKEN" ]; then
+                      echo "The Runeseer app token is unavailable."
+                      echo "Runeseer could not reconcile the failure notice."
+                      blocker_status=0
+                      set_blocker || blocker_status=$?
+                      [ "$blocker_status" -ne 2 ] || exit 0
+                      exit 1
+                  fi
+
+                  if [ "$fault_kind" = "none" ]; then
+                      if ! notice_result=$(GH_TOKEN="$RUNESEER_TOKEN" \
+                          python3 "$RUNESEER_FORMATTER" reconcile-failure-notice \
+                          --clear \
+                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID"); then
+                          echo "Runeseer could not remove the stale failure notice."
+                          record_status=0
+                          record_failure workflow_after_publication || record_status=$?
+                          [ "$record_status" -ne 2 ] || exit 0
+                          exit 1
+                      fi
+                      echo "$notice_result"
+                      [ "$notice_result" != "Runeseer kept the newer failure notice." ] || exit 0
+                      clear_status=0
+                      clear_blocker || clear_status=$?
+                      [ "$clear_status" -ne 2 ] || exit 0
+                      if [ "$clear_status" -ne 0 ]; then
+                          echo "Runeseer could not verify the blocker removal."
+                          record_status=0
+                          record_failure workflow_after_publication || record_status=$?
+                          [ "$record_status" -ne 2 ] || exit 0
+                          exit 1
                       fi
 
-                      # A fixed message explains the failure without copying
-                      # provider output or pull request text into the comment.
-                      marker="<!-- runeseer-provider-failure:$HEAD_SHA -->"
-                      if ! comments=$(gh api --paginate \
-                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
-                          --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
-                          | jq -s 'add // []'); then
-                          echo "::warning::could not read Runeseer comments. The provider failure notice was not posted"
-                          exit 0
+                      if jq -e --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" '
+                          .verdict == "clean" and .count == 0
+                          and (.findings | type == "array" and length == 0)
+                          and .restart == "none"
+                          and .sha == $sha and .base == $base' runeseer-verdict.json >/dev/null; then
+                          approval_status=0
+                          check_current_round || approval_status=$?
+                          [ "$approval_status" -ne 2 ] || exit 0
+                          if [ "$approval_status" -ne 0 ] \
+                              || ! approval=$(GH_TOKEN="$RUNESEER_TOKEN" gh api -X POST \
+                                  "repos/$REPO/pulls/$PR/reviews" \
+                                  -f event=APPROVE \
+                                  -f commit_id="$HEAD_SHA" \
+                                  -f body="Earned approval: review/correctness returned a clean verdict for ${HEAD_SHA}. Dismissed automatically on any new push.") \
+                              || ! jq -e --arg head "$HEAD_SHA" '
+                                  .state == "APPROVED" and .commit_id == $head' <<<"$approval" >/dev/null; then
+                              echo "Runeseer could not publish the earned approval."
+                              record_status=0
+                              record_failure workflow_after_publication || record_status=$?
+                              [ "$record_status" -ne 2 ] || exit 0
+                              exit 1
+                          fi
                       fi
-                      if jq -e --arg marker "$marker" 'any(.[]; contains($marker))' <<<"$comments" >/dev/null; then
-                          echo "the provider failure notice already exists for $HEAD_SHA"
-                          exit 0
-                      fi
-
-                      run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-                      body=$(printf '### Runeseer is paused — %s\n\n%s\n\n%s\n[Open the failed workflow](%s)\n\n%s' \
-                          "$fault_title" "$fault_detail" "$RUNESEER_PROVIDER_FAILURE_GUIDANCE" "$run_url" "$marker")
-                      if ! GH_TOKEN="$RUNESEER_TOKEN" gh api -X POST \
-                          "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
-                          -f body="$body" >/dev/null; then
-                          echo "::warning::could not post the Runeseer provider failure notice"
-                      else
-                          echo "posted one provider failure notice for $HEAD_SHA"
-                      fi
+                      exit 0
                   fi
+                  record_status=0
+                  record_failure "$fault_kind" || record_status=$?
+                  [ "$record_status" -ne 2 ] || exit 0
+                  exit 1
 
             # The spec's word is binding: a lane holding unresolved findings
             # fails its check. Green means clean for THIS head, never merely
@@ -1045,8 +1479,14 @@ jobs:
                   GH_TOKEN: ${{ github.token }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  BASE_RESET: ${{ steps.ledger.outputs.base_reset }}
               run: |
                   set -o pipefail
+                  if [ "$BASE_RESET" = "true" ]; then
+                      echo "The base-reset round stopped before Runeseer adjudication."
+                      echo "The workflow reset the free-lane stages and consumed the review labels."
+                      exit 1
+                  fi
                   [ -f runeseer-verdict.json ] || { echo "no verdict file; the review did not complete"; exit 1; }
                   live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv')
                   if [ "$live" != "$HEAD_SHA"$'\t'"$BASE_SHA" ]; then
