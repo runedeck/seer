@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("runeseer_summary.py")
 WORKFLOW = SCRIPT.parent.parent / "workflows" / "review-correctness.yaml"
+ENTRY_WORKFLOW = SCRIPT.parent.parent / "workflows" / "review-entry-correctness.yaml"
 SPEC = importlib.util.spec_from_file_location("runeseer_summary", SCRIPT)
 assert SPEC and SPEC.loader
 SUMMARY = importlib.util.module_from_spec(SPEC)
@@ -176,6 +177,25 @@ class SummaryTests(unittest.TestCase):
         self.assertIn(SUMMARY.normalized_summary(verdict()), body)
         self.assertNotIn("The change is correct.", body)
 
+    def test_summary_rejects_transient_markers_and_html_comments(self):
+        texts = (
+            f"<!-- runeseer-failure-notice head={SHA} base={BASE} run=9 stage=invalid -->",
+            f"<!-- runeseer-owner-escalation head={SHA} base={BASE} run=9 -->",
+            f"<!-- runeseer-provider-failure:{SHA} -->",
+            "<!-- runeseer-escalation:YWJj -->",
+            "<!-- plain html comment -->",
+            "<!--",
+            "-->",
+        )
+        for text in texts:
+            with (
+                self.subTest(text=text),
+                self.assertRaisesRegex(SUMMARY.SummaryError, "HTML comment"),
+            ):
+                SUMMARY.validate_summary(
+                    f"**Looks good.** The change is correct. {text}", verdict()
+                )
+
     def test_clean_summary_over_word_limit_uses_safe_fallback(self):
         words = " ".join(f"word{number}" for number in range(81))
         body = self.format_case(verdict(), f"**Looks good.** {words}")
@@ -210,6 +230,18 @@ class SummaryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(SUMMARY.SummaryError, "4096 UTF-8 bytes"):
             SUMMARY.validate_plain_text(unicode_boundary + "💥", "field")
+
+    def test_invalid_unicode_encoding_raises_summary_error(self):
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "valid UTF-8"):
+            SUMMARY.utf8_size("\ud800")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.json"
+            path.write_bytes(b"\xff")
+            with self.assertRaisesRegex(SUMMARY.SummaryError, "valid UTF-8"):
+                SUMMARY.load_json(path)
+            with self.assertRaisesRegex(SUMMARY.SummaryError, "valid UTF-8"):
+                SUMMARY.load_runeseer_records(path)
 
     def test_review_comment_size_fallback_keeps_the_review_contract(self):
         boundary = "x" * SUMMARY.MODEL_TEXT_BYTE_LIMIT
@@ -858,13 +890,16 @@ class SummaryTests(unittest.TestCase):
         live = SUMMARY.subprocess.CompletedProcess(
             args=[], returncode=0, stdout=f"{SHA}\t{BASE}\n", stderr=""
         )
-        run_gh.side_effect = [read, live, write]
+        run_gh.side_effect = [read, live, read, write]
 
-        action = SUMMARY.publish_summary(BODY, "runedeck/seer", 7, "runeseer[bot]")
+        action, comment_id = SUMMARY.publish_summary(
+            BODY, "runedeck/seer", 7, "runeseer[bot]"
+        )
 
         self.assertEqual(action, "updated")
+        self.assertEqual(comment_id, 9)
         self.assertIn(
-            "repos/runedeck/seer/issues/comments/9", run_gh.call_args_list[2].args[0]
+            "repos/runedeck/seer/issues/comments/9", run_gh.call_args_list[3].args[0]
         )
 
     @patch.object(SUMMARY, "run_gh")
@@ -898,12 +933,12 @@ class SummaryTests(unittest.TestCase):
         live = SUMMARY.subprocess.CompletedProcess(
             args=[], returncode=0, stdout=f"{SHA}\t{BASE}\n", stderr=""
         )
-        run_gh.side_effect = [read, live, write]
+        run_gh.side_effect = [read, live, read, write]
 
         SUMMARY.publish_summary(BODY, "runedeck/seer", 7, "runeseer[bot]")
 
         self.assertIn(
-            "repos/runedeck/seer/issues/comments/2", run_gh.call_args_list[2].args[0]
+            "repos/runedeck/seer/issues/comments/2", run_gh.call_args_list[3].args[0]
         )
 
     @patch.object(SUMMARY, "run_gh")
@@ -961,13 +996,16 @@ class SummaryTests(unittest.TestCase):
             stdout=json.dumps({"id": 9, "body": candidate}),
             stderr="",
         )
-        run_gh.side_effect = [read, live, write]
+        run_gh.side_effect = [read, live, read, write]
 
-        action = SUMMARY.publish_summary(candidate, "runedeck/seer", 7, "runeseer[bot]")
+        action, comment_id = SUMMARY.publish_summary(
+            candidate, "runedeck/seer", 7, "runeseer[bot]"
+        )
 
         self.assertEqual(action, "updated")
+        self.assertEqual(comment_id, 9)
         self.assertIn(
-            "repos/runedeck/seer/issues/comments/9", run_gh.call_args_list[2].args[0]
+            "repos/runedeck/seer/issues/comments/9", run_gh.call_args_list[3].args[0]
         )
 
     @patch.object(SUMMARY, "run_gh")
@@ -986,9 +1024,12 @@ class SummaryTests(unittest.TestCase):
         )
         run_gh.side_effect = [read, live, write]
 
-        action = SUMMARY.publish_summary(BODY, "runedeck/seer", 7, "runeseer[bot]")
+        action, comment_id = SUMMARY.publish_summary(
+            BODY, "runedeck/seer", 7, "runeseer[bot]"
+        )
 
         self.assertEqual(action, "created")
+        self.assertEqual(comment_id, 9)
         self.assertIn(
             "repos/runedeck/seer/issues/7/comments", run_gh.call_args_list[2].args[0]
         )
@@ -1009,6 +1050,156 @@ class SummaryTests(unittest.TestCase):
         with self.assertRaises(SUMMARY.SummaryError):
             SUMMARY.publish_summary(BODY, "runedeck/seer", 7, "runeseer[bot]")
         self.assertEqual(run_gh.call_count, 1)
+
+    @staticmethod
+    def review_footer(run_id):
+        return (
+            "\n\n---\nNo open findings · Reviewed `01234567` · "
+            f"[review run](https://github.com/runedeck/seer/actions/runs/{run_id})"
+        )
+
+    @patch.object(SUMMARY, "run_gh")
+    def test_publish_lets_a_newer_run_replace_the_same_round(self, run_gh):
+        existing = {
+            "id": 9,
+            "created_at": "2026-08-14T02:00:00Z",
+            "user": {"login": "runeseer[bot]"},
+            "body": BODY + self.review_footer(124),
+        }
+        candidate = BODY + self.review_footer(125)
+        read = SUMMARY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(existing), stderr=""
+        )
+        live = SUMMARY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"{SHA}\t{BASE}\n", stderr=""
+        )
+        write = SUMMARY.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"id": 9, "body": candidate}),
+            stderr="",
+        )
+        run_gh.side_effect = [read, live, read, write]
+
+        action, comment_id = SUMMARY.publish_summary(
+            candidate, "runedeck/seer", 7, "runeseer[bot]"
+        )
+
+        self.assertEqual(action, "updated")
+        self.assertEqual(comment_id, 9)
+        self.assertIn(
+            "repos/runedeck/seer/issues/comments/9", run_gh.call_args_list[3].args[0]
+        )
+
+    @patch.object(SUMMARY, "run_gh")
+    def test_publish_rejects_an_equal_or_older_run_for_the_same_round(self, run_gh):
+        existing = {
+            "id": 9,
+            "created_at": "2026-08-14T02:00:00Z",
+            "user": {"login": "runeseer[bot]"},
+            "body": BODY + self.review_footer(124),
+        }
+        read = SUMMARY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(existing), stderr=""
+        )
+        for run_id in (124, 123):
+            with self.subTest(run_id=run_id):
+                run_gh.reset_mock()
+                run_gh.side_effect = [read]
+                with self.assertRaisesRegex(SUMMARY.SummaryError, "already exists"):
+                    SUMMARY.publish_summary(
+                        BODY + self.review_footer(run_id),
+                        "runedeck/seer",
+                        7,
+                        "runeseer[bot]",
+                    )
+                self.assertEqual(run_gh.call_count, 1)
+
+    @patch.object(SUMMARY, "run_gh")
+    def test_publish_rejects_a_newer_summary_between_read_and_patch(self, run_gh):
+        stale = {
+            "id": 9,
+            "created_at": "2026-08-14T02:00:00Z",
+            "user": {"login": "runeseer[bot]"},
+            "body": BODY + self.review_footer(124),
+        }
+        newer = dict(stale, body=BODY + self.review_footer(127))
+        first_read = SUMMARY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(stale), stderr=""
+        )
+        live = SUMMARY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"{SHA}\t{BASE}\n", stderr=""
+        )
+        second_read = SUMMARY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(newer), stderr=""
+        )
+        run_gh.side_effect = [first_read, live, second_read]
+
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "already exists"):
+            SUMMARY.publish_summary(
+                BODY + self.review_footer(126), "runedeck/seer", 7, "runeseer[bot]"
+            )
+        self.assertEqual(run_gh.call_count, 3)
+
+    @patch.object(SUMMARY, "run_gh")
+    def test_publish_rejects_changed_or_missing_fresh_marker_identity(self, run_gh):
+        existing = {
+            "id": 9,
+            "created_at": "2026-08-14T02:00:00Z",
+            "user": {"login": "runeseer[bot]"},
+            "body": BODY + self.review_footer(124),
+        }
+        candidate = BODY + self.review_footer(126)
+        first_read = SUMMARY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(existing), stderr=""
+        )
+        live = SUMMARY.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"{SHA}\t{BASE}\n", stderr=""
+        )
+        fresh_bodies = (
+            BODY.replace(SHA, "f" * 40) + self.review_footer(125),
+            f"{SUMMARY.SUMMARY_MARKER}\nplain" + self.review_footer(125),
+        )
+        for fresh_body in fresh_bodies:
+            with self.subTest(fresh_body=fresh_body.splitlines()[1]):
+                run_gh.reset_mock()
+                fresh = dict(existing, body=fresh_body)
+                second_read = SUMMARY.subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=json.dumps(fresh), stderr=""
+                )
+                run_gh.side_effect = [first_read, live, second_read]
+                with self.assertRaisesRegex(SUMMARY.SummaryError, "marker identity"):
+                    SUMMARY.publish_summary(
+                        candidate, "runedeck/seer", 7, "runeseer[bot]"
+                    )
+                self.assertEqual(run_gh.call_count, 3)
+
+    @patch.object(SUMMARY, "run_gh")
+    def test_summary_selection_ranks_same_round_by_footer_run(self, run_gh):
+        newer_run = {
+            "id": 1,
+            "created_at": "2026-08-14T01:00:00Z",
+            "user": {"login": "runeseer[bot]"},
+            "body": BODY + self.review_footer(125),
+        }
+        older_run = {
+            "id": 2,
+            "created_at": "2026-08-14T02:00:00Z",
+            "user": {"login": "runeseer[bot]"},
+            "body": BODY + self.review_footer(124),
+        }
+        run_gh.return_value = SUMMARY.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="\n".join(json.dumps(comment) for comment in (older_run, newer_run)),
+            stderr="",
+        )
+
+        selected = SUMMARY.find_summary_comment(
+            "runedeck/seer", 7, "runeseer[bot]", BASE
+        )
+
+        self.assertEqual(selected["id"], 1)
 
     @patch.object(SUMMARY, "run_gh")
     def test_head_change_stops_publication(self, run_gh):
@@ -1037,6 +1228,7 @@ class WorkflowSourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = WORKFLOW.read_text(encoding="utf-8")
+        cls.entry_source = ENTRY_WORKFLOW.read_text(encoding="utf-8")
 
     @classmethod
     def section(cls, start, end):
@@ -1075,6 +1267,41 @@ class WorkflowSourceTests(unittest.TestCase):
         self.assertIn("if ! remaining=$(gh api --paginate", consume)
         self.assertIn("Could not verify the review label removal.", consume)
         self.assertIn("Could not consume the review label:", consume)
+
+    def test_label_consumption_preserves_later_requests(self):
+        consume = self.section("- id: consume", "- id: restart")
+        self.assertIn("if: always() && !cancelled()", consume)
+        self.assertIn(
+            "INITIAL_REVIEW_LABELS: "
+            "${{ toJSON(github.event.pull_request.labels.*.name) }}",
+            consume,
+        )
+        self.assertIn("labels_to_consume=()", consume)
+        self.assertIn('labels_to_consume+=("$label")', consume)
+        self.assertEqual(consume.count("for label in $LABELS_CONSUMED; do"), 1)
+        self.assertEqual(consume.count('for label in "${labels_to_consume[@]}"; do'), 2)
+
+    def test_entry_refreshes_the_mirror_without_starting_paid_review(self):
+        for event in (
+            "opened",
+            "reopened",
+            "synchronize",
+            "converted_to_draft",
+        ):
+            with self.subTest(event=event):
+                self.assertIn(f"            - {event}\n", self.entry_source)
+        review_start = self.entry_source.index("review:\n")
+        context_start = self.entry_source.index("review-context:", review_start)
+        review = self.entry_source[review_start:context_start]
+        self.assertIn("github.event.action == ''labeled''", review)
+        self.assertIn("github.event.action == ''ready_for_review''", review)
+        self.assertNotIn("github.event.action == ''synchronize''", review)
+
+    def test_macroscope_label_changes_cancel_an_older_consumer(self):
+        self.assertIn(
+            '["review", "review:macroscope", "review:runeseer"]',
+            self.entry_source,
+        )
 
     def test_breaker_clears_transient_state_before_approval(self):
         breaker = self.section("- id: breaker", "# The spec's word is binding")
@@ -1116,6 +1343,87 @@ class WorkflowSourceTests(unittest.TestCase):
 
     def test_scope_skips_do_not_publish_a_notice(self):
         self.assertNotIn("Publish skipped review status", self.source)
+
+    def test_scope_skip_writes_a_durable_job_summary_record(self):
+        scope = self.section("- id: scope", "- id: formatter")
+        self.assertIn("record_skip()", scope)
+        self.assertIn('>> "$GITHUB_STEP_SUMMARY"', scope)
+        self.assertIn(
+            "This green check records a skipped review, not a clean verdict.", scope
+        )
+        self.assertEqual(scope.count('record_skip "$reason"'), 2)
+
+    def test_consume_still_clears_labels_after_a_pre_ledger_failure(self):
+        consume = self.section("- id: consume", "- id: restart")
+        self.assertIn('if [ ! -x "$RUNESEER_FORMATTER" ]; then', consume)
+        self.assertIn('""|*[!0-9]*|0)', consume)
+        self.assertEqual(
+            consume.count("this current-head round still consumes its labels"), 2
+        )
+
+    def test_owner_resolution_failure_skips_the_escalation_without_failing(self):
+        judgments = self.section("- id: judgments", "- id: upload")
+        self.assertEqual(
+            judgments.count(
+                "Runeseer skipped the owner escalation and kept the findings verdict."
+            ),
+            3,
+        )
+        self.assertNotIn('gh api "users/${owner#@}"', judgments)
+        self.assertEqual(
+            judgments.count("Runeseer did not post an owner escalation."), 1
+        )
+        format_failure = judgments.index("Could not format the owner escalation.")
+        reconcile_failure = judgments.index("Could not reconcile the owner escalation.")
+        for position in (format_failure, reconcile_failure):
+            self.assertIn("exit 1", judgments[position:])
+
+    def test_judgment_loops_fail_the_step_on_a_stale_round(self):
+        judgments = self.section("- id: judgments", "- id: upload")
+        self.assertNotIn("| while IFS= read -r", judgments)
+        self.assertIn('done < "$judgments_file"', judgments)
+        self.assertIn('done < "$own_threads_file"', judgments)
+
+    def test_each_guarded_mutation_reads_a_fresh_run_order(self):
+        for start, end in (
+            ("- id: ledger", "- id: lanes"),
+            ("- id: judgments", "- id: upload"),
+            ("- id: consume", "- id: restart"),
+            ("- id: restart", "- id: breaker"),
+            ("- id: breaker", "# The spec's word is binding"),
+        ):
+            with self.subTest(step=start):
+                step = self.section(start, end)
+                self.assertEqual(step.count("newer-summary"), 1)
+                self.assertNotIn("newer_cached", step)
+
+    def test_post_publication_steps_use_the_trusted_summary_comment_id(self):
+        publish = self.section("- id: publish", "- id: judgments")
+        self.assertIn("summary-comment-id=", publish)
+        self.assertIn(
+            'summary_comment_id=${summary_comment_id}" >> "$GITHUB_OUTPUT"',
+            publish,
+        )
+        for start, end in (
+            ("- id: judgments", "- id: upload"),
+            ("- id: consume", "- id: restart"),
+            ("- id: restart", "- id: breaker"),
+            ("- id: breaker", "# The spec's word is binding"),
+        ):
+            with self.subTest(step=start):
+                step = self.section(start, end)
+                self.assertIn(
+                    "SUMMARY_COMMENT_ID: "
+                    "${{ steps.publish.outputs.summary_comment_id }}",
+                    step,
+                )
+                self.assertIn("--summary-comment-id", step)
+
+    def test_called_workflow_serializes_each_pull_request(self):
+        header = self.section("concurrency:", "jobs:")
+        self.assertIn("github.repository", header)
+        self.assertIn("github.event.pull_request.number", header)
+        self.assertIn("cancel-in-progress: false", header)
 
     def test_base_reset_uses_guarded_cleanup_after_round_computation(self):
         ledger = self.section("- id: ledger", "- id: lanes")
@@ -1227,7 +1535,7 @@ class ReliabilityTests(unittest.TestCase):
         )
 
     @classmethod
-    def reconcile(cls, notice_type, body):
+    def reconcile(cls, notice_type, body, summary_comment_id=None):
         function = (
             SUMMARY.reconcile_failure_notice
             if notice_type == "failure"
@@ -1242,6 +1550,7 @@ class ReliabilityTests(unittest.TestCase):
             BASE,
             3,
             cls.RUN_ID,
+            summary_comment_id,
         )
 
     def test_repository_owner_uses_the_last_catch_all_rule(self):
@@ -1312,7 +1621,7 @@ docs/** @DocsOwner
                 "path": "docs/decisions/DECK-0008 Idea-to-Merge Flywheel.md",
                 "line": 16,
                 "summary": "Decision record references an absent DECK entry",
-                "escalation_key": "eyJsYW5lIjoicnVuZXNlZXIifQ==",
+                "escalation_key": "e30=",
             },
             {
                 "path": "runes/core/skills/IntakeIdea/SKILL.md",
@@ -1688,6 +1997,141 @@ docs/** @DocsOwner
                 (3, 124),
             )
 
+    @staticmethod
+    def published_summary_body(run_id=124):
+        return (
+            BODY.replace("round=1", "round=3")
+            + "\n\n---\nNo open findings · Reviewed `01234567` · "
+            + f"[review run](https://github.com/runedeck/deck/actions/runs/{run_id})"
+        )
+
+    @patch.object(SUMMARY, "run_gh")
+    def test_direct_summary_read_compares_without_pagination(self, run_gh):
+        comment = {
+            "id": 9,
+            "issue_url": f"https://api.github.com/repos/{self.REPO}/issues/{self.PR}",
+            "user": {"login": self.AUTHOR},
+            "body": self.published_summary_body(),
+        }
+        run_gh.return_value = self.completed(stdout=json.dumps(comment))
+
+        self.assertTrue(
+            SUMMARY.published_summary_is_newer(
+                self.REPO, self.PR, self.AUTHOR, SHA, BASE, 3, 123, 9
+            )
+        )
+        self.assertFalse(
+            SUMMARY.published_summary_is_newer(
+                self.REPO, self.PR, self.AUTHOR, SHA, BASE, 3, 124, 9
+            )
+        )
+        for call in run_gh.call_args_list:
+            self.assertEqual(
+                call.args[0], ["api", f"repos/{self.REPO}/issues/comments/9"]
+            )
+
+    @patch.object(SUMMARY, "run_gh")
+    def test_direct_summary_read_fails_closed_on_identity_faults(self, run_gh):
+        good = self.published_summary_body()
+        footer = good.removeprefix(BODY.replace("round=1", "round=3"))
+
+        def owned(body, issue_url=None):
+            return {
+                "id": 9,
+                "issue_url": issue_url
+                or f"https://api.github.com/repos/{self.REPO}/issues/{self.PR}",
+                "user": {"login": self.AUTHOR},
+                "body": body,
+            }
+
+        cases = (
+            (
+                "author",
+                {
+                    "id": 9,
+                    "issue_url": f"https://api.github.com/repos/{self.REPO}/issues/{self.PR}",
+                    "user": {"login": "attacker"},
+                    "body": good,
+                },
+            ),
+            (
+                "issue",
+                owned(
+                    good,
+                    f"https://api.github.com/repos/{self.REPO}/issues/{self.PR + 1}",
+                ),
+            ),
+            ("marker", owned("plain" + footer)),
+            ("duplicate summary marker", owned(f"{SUMMARY.SUMMARY_MARKER}\n{good}")),
+            ("duplicate verdict marker", owned(f"{good}\n{BODY.splitlines()[1]}")),
+            ("head", owned(good.replace(SHA, "f" * 40))),
+            ("base", owned(good.replace(BASE, "e" * 40))),
+            ("round", owned(good.replace("round=3", "round=0"))),
+            (
+                "footer head",
+                owned(good.replace("Reviewed `01234567`", "Reviewed `ffffffff`")),
+            ),
+            ("footer run", owned(BODY.replace("round=1", "round=3"))),
+        )
+        for name, comment in cases:
+            with self.subTest(name=name):
+                run_gh.return_value = self.completed(stdout=json.dumps(comment))
+                with self.assertRaises(SUMMARY.SummaryError):
+                    SUMMARY.published_summary_is_newer(
+                        self.REPO, self.PR, self.AUTHOR, SHA, BASE, 3, 123, 9
+                    )
+
+    def test_newer_summary_between_two_mutations_stops_the_second(self):
+        stale = {"id": 6, "_runeseer_transient_run": self.RUN_ID - 2}
+        older = {"id": 7, "_runeseer_transient_run": self.RUN_ID - 1}
+        with (
+            patch.object(
+                SUMMARY,
+                "published_summary_is_newer",
+                side_effect=[False, False, True],
+            ) as newer,
+            patch.object(
+                SUMMARY, "find_transient_comments", return_value=[stale, older]
+            ),
+            patch.object(SUMMARY, "read_transient_comment", side_effect=[stale, older]),
+            patch.object(SUMMARY, "verify_live_pull_request"),
+            patch.object(SUMMARY, "run_gh", return_value=self.completed()) as run_gh,
+        ):
+            action = self.reconcile("failure", None)
+
+        self.assertEqual(action, "kept newer")
+        self.assertEqual(newer.call_count, 3)
+        self.assertEqual(run_gh.call_count, 1)
+        self.assertEqual(run_gh.call_args.args[0][:3], ["api", "-X", "DELETE"])
+        self.assertIn("issues/comments/6", run_gh.call_args.args[0][3])
+
+    def test_trusted_summary_id_avoids_pagination_before_each_deletion(self):
+        stale = {"id": 6, "_runeseer_transient_run": self.RUN_ID - 2}
+        older = {"id": 7, "_runeseer_transient_run": self.RUN_ID - 1}
+        with (
+            patch.object(SUMMARY, "latest_summary_clock") as paginated,
+            patch.object(
+                SUMMARY, "summary_comment_clock", return_value=(3, 122)
+            ) as direct,
+            patch.object(
+                SUMMARY, "find_transient_comments", return_value=[stale, older]
+            ),
+            patch.object(SUMMARY, "read_transient_comment", side_effect=[stale, older]),
+            patch.object(SUMMARY, "verify_live_pull_request"),
+            patch.object(SUMMARY, "run_gh", return_value=self.completed()) as run_gh,
+        ):
+            action = self.reconcile("failure", None, summary_comment_id=42)
+
+        self.assertEqual(action, "removed 2")
+        paginated.assert_not_called()
+        self.assertEqual(direct.call_count, 3)
+        for direct_call in direct.call_args_list:
+            self.assertEqual(
+                direct_call.args,
+                (self.REPO, self.PR, 42, self.AUTHOR, SHA, BASE),
+            )
+        self.assertEqual(run_gh.call_count, 2)
+
     def test_transient_comment_reads_fail_closed(self):
         failure = self.completed(returncode=1, stderr="API failed")
         with patch.object(SUMMARY, "run_gh", return_value=failure):
@@ -1909,6 +2353,124 @@ docs/** @DocsOwner
                         notice_type,
                     )
                 )
+
+    def test_summary_comment_is_never_a_transient_notice(self):
+        for notice_type in ("failure", "owner"):
+            with self.subTest(notice_type=notice_type):
+                comment = {
+                    "id": 7,
+                    "user": {"login": self.AUTHOR},
+                    "body": BODY + "\n" + self.notice_body(notice_type),
+                }
+                self.assertIsNone(
+                    SUMMARY.parse_transient_comment(comment, self.AUTHOR, notice_type)
+                )
+
+    def test_disputed_external_findings_cannot_turn_the_verdict_clean(self):
+        data = verdict()
+        data["findings"] = [
+            {
+                "path": "file.py",
+                "line": 12,
+                "summary": "Guard accepts stale state",
+                "lane": "cursor",
+                "judgment": "confirmed",
+                "severity": "medium",
+                "comment_id": 5,
+            }
+        ]
+        judgment = self.external_judgment()
+        judgment["judgment"] = "disputed"
+        data["lane_judgments"] = [judgment]
+
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "contradiction"):
+            SUMMARY.canonicalize_external_findings(
+                data, [self.trusted_inline_comment()]
+            )
+
+    def test_additive_repair_still_restores_an_omitted_confirmed_finding(self):
+        data = verdict()
+        data["lane_judgments"] = [self.external_judgment()]
+
+        repaired = SUMMARY.canonicalize_external_findings(
+            data, [self.trusted_inline_comment()]
+        )
+
+        self.assertEqual(repaired["verdict"], "findings")
+        self.assertEqual(repaired["count"], 1)
+        self.assertEqual(repaired["findings"][0]["comment_id"], 5)
+
+    def test_malformed_only_external_findings_are_discarded(self):
+        data = verdict()
+        data["findings"] = [
+            "malformed external finding",
+            {"lane": "cursor", "comment_id": 999},
+            {"lane": "unknown", "path": "stale.py"},
+        ]
+
+        repaired = SUMMARY.canonicalize_external_findings(data, [])
+
+        self.assertEqual(repaired["findings"], [])
+        self.assertEqual(repaired["count"], 0)
+        self.assertEqual(repaired["verdict"], "clean")
+
+    def test_incomplete_external_findings_are_discarded_before_contradictions(self):
+        complete = {
+            "path": "file.py",
+            "line": 12,
+            "summary": "Guard accepts stale state",
+            "lane": "cursor",
+            "judgment": "confirmed",
+            "severity": "medium",
+            "comment_id": 5,
+        }
+        judgment = self.external_judgment()
+        judgment["judgment"] = "disputed"
+        for missing in complete:
+            with self.subTest(missing=missing):
+                declared = dict(complete)
+                del declared[missing]
+                data = verdict()
+                data["findings"] = [declared]
+                data["lane_judgments"] = [judgment]
+
+                repaired = SUMMARY.canonicalize_external_findings(
+                    data, [self.trusted_inline_comment()]
+                )
+
+                self.assertEqual(repaired["findings"], [])
+                self.assertEqual(repaired["count"], 0)
+                self.assertEqual(repaired["verdict"], "clean")
+
+    def test_contradiction_is_rejected_beside_an_unrelated_runeseer_finding(self):
+        data = verdict()
+        data["findings"] = [
+            {
+                "path": "other.py",
+                "line": 3,
+                "summary": "Own unrelated defect",
+                "lane": "runeseer",
+                "judgment": "confirmed",
+                "severity": "high",
+            },
+            {
+                "path": "file.py",
+                "line": 12,
+                "summary": "Guard accepts stale state",
+                "lane": "cursor",
+                "judgment": "confirmed",
+                "severity": "medium",
+                "comment_id": 5,
+            },
+        ]
+        judgment = self.external_judgment()
+        judgment["judgment"] = "disputed"
+        data["lane_judgments"] = [judgment]
+
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "contradiction"):
+            SUMMARY.canonicalize_external_findings(
+                data, [self.trusted_inline_comment()]
+            )
 
 
 if __name__ == "__main__":

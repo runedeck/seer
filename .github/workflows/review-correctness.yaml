@@ -19,6 +19,15 @@ on:
             CLAUDE_CODE_OAUTH_TOKEN:
                 required: true
 
+# Two called runs must never mutate one pull request at the same time.
+# This group serializes the called workflow per repository and pull
+# request and never cancels an in-progress run: the caller can cancel an
+# obsolete parent run, but a canceled run leaves the group only after it
+# completes, so its cleanup cannot overlap the next called run.
+concurrency:
+    group: review-correctness-body-${{ github.repository }}-${{ github.event.pull_request.number }}
+    cancel-in-progress: false
+
 # Single declaration point for the identities, labels, and names this
 # body uses. Job-level if expressions cannot read env, so the guard
 # keeps its literals; the reviewer prompt stays inline until the shared
@@ -96,12 +105,26 @@ jobs:
                   # skip: stands the lane down before it spends anything, and
                   # the job still concludes success so the required mirror
                   # clears. A failed label read must not read as an applied skip.
+                  # The job summary keeps a durable record of every skip: the
+                  # green required check then explains itself without a
+                  # persistent pull request comment.
+                  record_skip() {
+                      {
+                          echo "### review/correctness skipped"
+                          echo ""
+                          echo "$1"
+                          echo ""
+                          echo "This green check records a skipped review, not a clean verdict."
+                      } >> "$GITHUB_STEP_SUMMARY"
+                  }
                   labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
                       --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
                       || { echo "could not read the live labels; rerun the check"; exit 1; }
                   if printf '%s\n' "$labels" | grep -qx 'skip:runeseer'; then
+                      reason="The skip:runeseer label excludes this change from automated correctness review."
                       echo "skip=true" >> "$GITHUB_OUTPUT"
-                      echo "reason=The skip:runeseer label excludes this change from automated correctness review." >> "$GITHUB_OUTPUT"
+                      echo "reason=$reason" >> "$GITHUB_OUTPUT"
+                      record_skip "$reason"
                       echo "skip:runeseer present; the correctness lane never runs."
                       exit 0
                   fi
@@ -109,8 +132,10 @@ jobs:
                   substantive=$(printf '%s\n' "$files" | grep -Ev '\.md$' || true)
                   in_scope_md=$(printf '%s\n' "$files" | grep -E '^(docs/specs/|\.github/|runes/[^/]+/(skills|rules)/).*\.md$' || true)
                   if [ -z "$substantive" ] && [ -z "$in_scope_md" ]; then
+                      reason="This change modifies prose outside the executable specification, workflow, and rune instruction scope."
                       echo "skip=true" >> "$GITHUB_OUTPUT"
-                      echo "reason=This change modifies prose outside the executable specification, workflow, and rune instruction scope." >> "$GITHUB_OUTPUT"
+                      echo "reason=$reason" >> "$GITHUB_OUTPUT"
+                      record_skip "$reason"
                       echo "Prose-only change; correctness lane stands down."
                   else
                       echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -177,7 +202,6 @@ jobs:
                   PR: ${{ github.event.pull_request.number }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
-                  RUN_ID: ${{ github.run_id }}
               run: |
                   set -o pipefail
                   name="${ARTIFACT_PREFIX}${{ github.event.pull_request.number }}"
@@ -297,6 +321,10 @@ jobs:
                   echo "round=${round}" >> "$GITHUB_OUTPUT"
                   echo "earlier_rounds=${earlier_rounds}" >> "$GITHUB_OUTPUT"
                   echo "current review round: ${round}"
+                  # Every guarded mutation re-reads the live head and the
+                  # published run order first. No mutation reuses an earlier
+                  # comparison result. No summary exists yet for this round,
+                  # so each comparison walks the full comment discovery.
                   check_current_round() {
                       if ! live=$(gh api "repos/$REPO/pulls/$PR" \
                           --jq '[.head.sha, .base.sha] | @tsv'); then
@@ -311,7 +339,7 @@ jobs:
                       if ! newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
                           --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
                           --head "$HEAD_SHA" --base "$BASE_SHA" \
-                          --review-round "$round" --run-id "$RUN_ID"); then
+                          --review-round "$round" --run-id "${{ github.run_id }}"); then
                           echo "Could not compare the published review summary."
                           return 1
                       fi
@@ -722,6 +750,7 @@ jobs:
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
                   RUN_ID: ${{ github.run_id }}
               run: |
+                  set -o pipefail
                   newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
                       --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
                       --head "$HEAD_SHA" --base "$BASE_SHA" \
@@ -730,11 +759,23 @@ jobs:
                       echo "A newer review run already published this head."
                       exit 1
                   }
-                  python3 "$RUNESEER_FORMATTER" publish \
+                  publish_output=$(python3 "$RUNESEER_FORMATTER" publish \
                       --body runeseer-review.md \
                       --repo "$REPO" \
                       --pr "$PR" \
-                      --author "$REVIEWER_LOGIN"
+                      --author "$REVIEWER_LOGIN")
+                  printf '%s\n' "$publish_output"
+                  # Later steps re-read this exact comment before each
+                  # mutation instead of paginating every comment again.
+                  summary_comment_id=$(printf '%s\n' "$publish_output" \
+                      | sed -n 's/^summary-comment-id=//p' | tail -n 1)
+                  case "$summary_comment_id" in
+                      ""|*[!0-9]*)
+                          echo "The publisher did not return the summary comment ID."
+                          exit 1
+                          ;;
+                  esac
+                  echo "summary_comment_id=${summary_comment_id}" >> "$GITHUB_OUTPUT"
 
             # Other-lane judgments close threads that no longer represent
             # defects. Confirmed findings stay open for the owner's decision.
@@ -749,8 +790,21 @@ jobs:
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
                   RUN_ID: ${{ github.run_id }}
+                  SUMMARY_COMMENT_ID: ${{ steps.publish.outputs.summary_comment_id }}
               run: |
                   set -o pipefail
+                  # Every guarded mutation re-reads the live head and the
+                  # published run order first. The trusted summary comment ID
+                  # keeps each re-read one direct comment read. No mutation
+                  # reuses an earlier comparison result.
+                  run_order_args() {
+                      newer_args=(--repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                      if [ -n "$SUMMARY_COMMENT_ID" ]; then
+                          newer_args+=(--summary-comment-id "$SUMMARY_COMMENT_ID")
+                      fi
+                  }
                   check_current_round() {
                       live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
                       [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || {
@@ -758,10 +812,11 @@ jobs:
                           echo "This stale round changed no review threads."
                           return 1
                       }
-                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
-                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
-                          --head "$HEAD_SHA" --base "$BASE_SHA" \
-                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                      run_order_args
+                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary "${newer_args[@]}") || {
+                          echo "Could not compare the published review summary."
+                          return 1
+                      }
                       [ "$newer" = "false" ] || {
                           echo "A newer review run already published this head."
                           echo "This older round changed no review threads."
@@ -803,11 +858,16 @@ jobs:
                       thread_query_failed=true
                   fi
 
+                  # The loop reads a file, not a pipeline: a stale-round exit
+                  # must stop the complete step, and a pipeline subshell would
+                  # swallow it.
+                  judgments_file="$RUNNER_TEMP/runeseer-judgments.jsonl"
                   jq -c '.lane_judgments[] | select(
                       .judgment == "disputed"
                       or .judgment == "already addressed"
                       or (.judgment == "confirmed" and .severity == "low")
-                  )' runeseer-verdict.json | while IFS= read -r judgment; do
+                  )' runeseer-verdict.json > "$judgments_file"
+                  while IFS= read -r judgment; do
                       path=$(jq -r '.path' <<<"$judgment")
                       line=$(jq -r '.line' <<<"$judgment")
                       reason=$(jq -r '.reason' <<<"$judgment")
@@ -869,7 +929,7 @@ jobs:
                           continue
                       fi
                       echo "resolved review thread for $path:$line after posting its judgment"
-                  done
+                  done < "$judgments_file"
 
                   # A clean verdict is the one statement that every finding this
                   # lane raised is gone, so it is the only safe moment to close
@@ -885,12 +945,14 @@ jobs:
                       and .restart == "none"' runeseer-verdict.json >/dev/null; then
                       echo "this head still carries findings; this lane's own threads stay open"
                   else
+                      own_threads_file="$RUNNER_TEMP/runeseer-own-threads.jsonl"
                       jq -c --arg login "$REVIEWER_LOGIN" '
                           ($login | sub("\\[bot\\]$"; "")) as $slug
                           | .[] | select(.isResolved == false)
                           | select(.comments.nodes[0].author.login as $author
                               | [$login, $slug] | index($author))' <<<"$threads" \
-                          | while IFS= read -r own_thread; do
+                          > "$own_threads_file"
+                      while IFS= read -r own_thread; do
                           own_comment_id=$(jq -r '.comments.nodes[0].databaseId // empty' <<<"$own_thread")
                           [ -n "$own_comment_id" ] || continue
                           own_path=$(jq -r '.path' <<<"$own_thread")
@@ -915,20 +977,14 @@ jobs:
                               continue
                           fi
                           echo "resolved this lane's own thread for $own_path:$own_line; this head judged clean"
-                      done
+                      done < "$own_threads_file"
                   fi
 
                   confirmed=$(jq -c '.findings' runeseer-verdict.json)
                   if [ "$(jq 'length' <<<"$confirmed")" = "0" ]; then
+                      run_order_args
                       owner_result=$(python3 "$RUNESEER_FORMATTER" reconcile-owner-escalation \
-                          --clear \
-                          --repo "$REPO" \
-                          --pr "$PR" \
-                          --author "$REVIEWER_LOGIN" \
-                          --head "$HEAD_SHA" \
-                          --base "$BASE_SHA" \
-                          --review-round "$REVIEW_ROUND" \
-                          --run-id "$RUN_ID") || {
+                          --clear "${newer_args[@]}") || {
                           echo "Could not remove the stale owner escalation."
                           exit 1
                       }
@@ -949,33 +1005,29 @@ jobs:
                           break
                       fi
                   done
+                  # A failed owner resolution must not turn a published
+                  # findings verdict into a workflow failure. The step logs a
+                  # clear skip; the verdict and its findings stand.
                   [ -n "$codeowners_path" ] || {
                       echo "The trusted base has no CODEOWNERS file."
-                      echo "Runeseer did not post an owner escalation."
-                      exit 1
+                      echo "Runeseer skipped the owner escalation and kept the findings verdict."
+                      exit 0
                   }
                   codeowners_file="$RUNNER_TEMP/runeseer-base-codeowners"
                   git show "$BASE_SHA:$codeowners_path" > "$codeowners_file" || {
                       echo "Could not read CODEOWNERS from the trusted base."
-                      echo "Runeseer did not post an owner escalation."
-                      exit 1
+                      echo "Runeseer skipped the owner escalation and kept the findings verdict."
+                      exit 0
                   }
                   owner=$(python3 "$RUNESEER_FORMATTER" owner-from-codeowners \
                       --codeowners "$codeowners_file") || {
                       echo "Could not resolve a personal owner from the trusted base."
-                      echo "Runeseer did not post an owner escalation."
-                      exit 1
+                      echo "Runeseer skipped the owner escalation and kept the findings verdict."
+                      exit 0
                   }
-                  if ! owner_type=$(gh api "users/${owner#@}" --jq '.type'); then
-                      echo "Could not verify the CODEOWNERS account."
-                      echo "Runeseer did not post an owner escalation."
-                      exit 1
-                  fi
-                  [ "$owner_type" = "User" ] || {
-                      echo "The CODEOWNERS account is not a human user."
-                      echo "Runeseer did not post an owner escalation."
-                      exit 1
-                  }
+                  # The parser accepts one personal handle from the trusted
+                  # catch-all rule. Team handles contain a slash and fail.
+                  # Do not let a transient user lookup suppress the tag.
                   confirmed_file="$RUNNER_TEMP/runeseer-owner-findings.json"
                   escalation_file="$RUNNER_TEMP/runeseer-owner-escalation.md"
                   printf '%s\n' "$confirmed" > "$confirmed_file"
@@ -989,15 +1041,9 @@ jobs:
                       echo "Runeseer did not post an owner escalation."
                       exit 1
                   }
+                  run_order_args
                   owner_result=$(python3 "$RUNESEER_FORMATTER" reconcile-owner-escalation \
-                      --body "$escalation_file" \
-                      --repo "$REPO" \
-                      --pr "$PR" \
-                      --author "$REVIEWER_LOGIN" \
-                      --head "$HEAD_SHA" \
-                      --base "$BASE_SHA" \
-                      --review-round "$REVIEW_ROUND" \
-                      --run-id "$RUN_ID") || {
+                      --body "$escalation_file" "${newer_args[@]}") || {
                       echo "Could not reconcile the owner escalation."
                       exit 1
                   }
@@ -1025,7 +1071,7 @@ jobs:
             # fresh review label.
             - id: consume
               name: Consume the review labels
-              if: always()
+              if: always() && !cancelled()
               continue-on-error: true
               env:
                   GH_TOKEN: ${{ github.token }}
@@ -1037,20 +1083,54 @@ jobs:
                   RUN_ID: ${{ github.run_id }}
                   SCOPE_SKIPPED: ${{ steps.scope.outputs.skip }}
                   BASE_RESET: ${{ steps.ledger.outputs.base_reset }}
+                  SUMMARY_COMMENT_ID: ${{ steps.publish.outputs.summary_comment_id }}
+                  INITIAL_REVIEW_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
               run: |
                   set -o pipefail
+                  if ! initial_labels=$(printf '%s' "$INITIAL_REVIEW_LABELS" | jq -r '.[]'); then
+                      echo "Could not read the review labels from the triggering event."
+                      exit 1
+                  fi
+                  labels_to_consume=()
+                  for label in $LABELS_CONSUMED; do
+                      name=$(printf '%s' "$label" | sed 's/%3A/:/g')
+                      if printf '%s\n' "$initial_labels" | grep -Fqx "$name"; then
+                          labels_to_consume+=("$label")
+                      fi
+                  done
+                  # Every label removal re-reads the live head and the
+                  # published run order first. The head check still guards a
+                  # pre-ledger failure, so an absent formatter or round never
+                  # bypasses every run-order guard. No removal reuses an
+                  # earlier comparison result.
                   check_current_round() {
-                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv')
+                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv') || return 1
                       [ "$live" = "$HEAD_SHA"$'\t'"$BASE_SHA" ] || return 1
                       [ "$SCOPE_SKIPPED" != "true" ] || return 0
                       [ "$BASE_RESET" != "true" ] || return 0
-                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
-                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                      # A pre-ledger failure leaves no formatter or no round.
+                      # The label requested exactly this round, and the head is
+                      # current, so the round still consumes its labels.
+                      if [ ! -x "$RUNESEER_FORMATTER" ]; then
+                          echo "The trusted formatter is absent; this current-head round still consumes its labels."
+                          return 0
+                      fi
+                      case "$REVIEW_ROUND" in
+                          ""|*[!0-9]*|0)
+                              echo "The review round is unknown; this current-head round still consumes its labels."
+                              return 0
+                              ;;
+                      esac
+                      newer_args=(--repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
                           --head "$HEAD_SHA" --base "$BASE_SHA" \
                           --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                      if [ -n "$SUMMARY_COMMENT_ID" ]; then
+                          newer_args+=(--summary-comment-id "$SUMMARY_COMMENT_ID")
+                      fi
+                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary "${newer_args[@]}") || return 1
                       [ "$newer" = "false" ]
                   }
-                  for label in $LABELS_CONSUMED; do
+                  for label in "${labels_to_consume[@]}"; do
                       check_current_round || {
                           echo "This stale round did not consume review labels."
                           exit 1
@@ -1065,7 +1145,7 @@ jobs:
                       echo "Could not verify the review label removal."
                       exit 1
                   fi
-                  for label in $LABELS_CONSUMED; do
+                  for label in "${labels_to_consume[@]}"; do
                       name=$(printf '%s' "$label" | sed 's/%3A/:/g')
                       if printf '%s\n' "$remaining" | grep -Fqx "$name"; then
                           echo "Could not consume the review label: $name"
@@ -1090,10 +1170,15 @@ jobs:
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
                   RUN_ID: ${{ github.run_id }}
+                  SUMMARY_COMMENT_ID: ${{ steps.publish.outputs.summary_comment_id }}
               run: |
                   set -o pipefail
                   [ -f runeseer-verdict.json ] || exit 0
                   restart=$(jq -r '.restart // "none"' runeseer-verdict.json)
+                  # Every guarded mutation re-reads the live head and the
+                  # published run order first. The trusted summary comment ID
+                  # keeps each re-read one direct comment read. No mutation
+                  # reuses an earlier comparison result.
                   check_current_round() {
                       live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv') || {
                           echo "Could not verify the live pull request."
@@ -1104,10 +1189,13 @@ jobs:
                           echo "This stale round did not clear stage labels."
                           return 1
                       }
-                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
-                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                      newer_args=(--repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
                           --head "$HEAD_SHA" --base "$BASE_SHA" \
-                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID") || {
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                      if [ -n "$SUMMARY_COMMENT_ID" ]; then
+                          newer_args+=(--summary-comment-id "$SUMMARY_COMMENT_ID")
+                      fi
+                      newer=$(python3 "$RUNESEER_FORMATTER" newer-summary "${newer_args[@]}") || {
                           echo "Could not compare the published review summary."
                           return 1
                       }
@@ -1175,10 +1263,23 @@ jobs:
                   RESTART_OUTCOME: ${{ steps.restart.outcome }}
                   PRE_BREAKER_STATUS: ${{ job.status }}
                   RUN_ID: ${{ github.run_id }}
+                  SUMMARY_COMMENT_ID: ${{ steps.publish.outputs.summary_comment_id }}
                   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
               run: |
                   set -o pipefail
                   encoded=$(printf '%s' "$LABEL_RUNE_BLOCKED" | sed 's/:/%3A/')
+                  # Every guarded mutation re-reads the live head and the
+                  # published run order first. The trusted summary comment ID
+                  # keeps each re-read one direct comment read. No mutation
+                  # reuses an earlier comparison result.
+                  run_order_args() {
+                      newer_args=(--repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
+                          --head "$HEAD_SHA" --base "$BASE_SHA" \
+                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID")
+                      if [ -n "$SUMMARY_COMMENT_ID" ]; then
+                          newer_args+=(--summary-comment-id "$SUMMARY_COMMENT_ID")
+                      fi
+                  }
                   check_live() {
                       if ! live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv'); then
                           echo "Could not verify the live pull request."
@@ -1193,10 +1294,8 @@ jobs:
 
                   check_current_round() {
                       check_live || return $?
-                      if ! newer=$(python3 "$RUNESEER_FORMATTER" newer-summary \
-                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
-                          --head "$HEAD_SHA" --base "$BASE_SHA" \
-                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID"); then
+                      run_order_args
+                      if ! newer=$(python3 "$RUNESEER_FORMATTER" newer-summary "${newer_args[@]}"); then
                           echo "Could not compare the published review summary."
                           return 1
                       fi
@@ -1300,12 +1399,10 @@ jobs:
                           --kind "$kind" --run-url "$RUN_URL" \
                           --head "$HEAD_SHA" --base "$BASE_SHA" \
                           --run-id "$RUN_ID" > "$failure_body" || return 1
+                      run_order_args
                       if ! notice_result=$(GH_TOKEN="$RUNESEER_TOKEN" \
                           python3 "$RUNESEER_FORMATTER" reconcile-failure-notice \
-                          --body "$failure_body" \
-                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
-                          --head "$HEAD_SHA" --base "$BASE_SHA" \
-                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID"); then
+                          --body "$failure_body" "${newer_args[@]}"); then
                           echo "Runeseer could not reconcile the failure notice."
                           return 1
                       fi
@@ -1415,12 +1512,10 @@ jobs:
                   fi
 
                   if [ "$fault_kind" = "none" ]; then
+                      run_order_args
                       if ! notice_result=$(GH_TOKEN="$RUNESEER_TOKEN" \
                           python3 "$RUNESEER_FORMATTER" reconcile-failure-notice \
-                          --clear \
-                          --repo "$REPO" --pr "$PR" --author "$REVIEWER_LOGIN" \
-                          --head "$HEAD_SHA" --base "$BASE_SHA" \
-                          --review-round "$REVIEW_ROUND" --run-id "$RUN_ID"); then
+                          --clear "${newer_args[@]}"); then
                           echo "Runeseer could not remove the stale failure notice."
                           record_status=0
                           record_failure workflow_after_publication || record_status=$?

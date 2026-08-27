@@ -25,7 +25,7 @@ VERDICT_MARKER_RE = re.compile(
 )
 REVIEW_FOOTER_RE = re.compile(
     r"^(?:No open findings|1 open|[1-9][0-9]* open) · "
-    r"Reviewed `[0-9a-f]{8}` · "
+    r"Reviewed `(?P<sha>[0-9a-f]{8})` · "
     r"\[review run\]\([^\r\n)]*/actions/runs/(?P<run>[1-9][0-9]*)\)"
     r"(?: · [^\r\n]+)?$"
 )
@@ -156,7 +156,20 @@ class SummaryError(RuntimeError):
 
 def utf8_size(value: str) -> int:
     """Return the UTF-8 byte count for text."""
-    return len(value.encode("utf-8"))
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise SummaryError("Text must use valid UTF-8 encoding.") from error
+
+
+def read_utf8(path: Path) -> str:
+    """Read valid UTF-8 text and normalize file and encoding failures."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise SummaryError(
+            f"Could not read valid UTF-8 from {path}: {error}"
+        ) from error
 
 
 def validate_model_text_size(value: str, field: str) -> str:
@@ -315,8 +328,8 @@ def parse_reviewdog_comment(value: Any) -> str:
 
 def load_json(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        return json.loads(read_utf8(path))
+    except json.JSONDecodeError as error:
         raise SummaryError(f"Could not read valid JSON from {path}: {error}") from error
 
 
@@ -349,10 +362,7 @@ def load_previous_findings(path: Path | None) -> list[dict[str, Any]]:
 def load_runeseer_records(path: Path | None) -> list[dict[str, Any]] | None:
     if path is None:
         return None
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as error:
-        raise SummaryError(f"Could not read {path}: {error}") from error
+    lines = read_utf8(path).splitlines()
     records: list[dict[str, Any]] = []
     for line_number, line in enumerate(lines, start=1):
         if not line.strip():
@@ -719,6 +729,11 @@ def canonicalize_external_findings(
         for finding in findings
         if isinstance(finding, dict) and finding.get("lane") == "runeseer"
     ]
+    declared_external = [
+        finding
+        for finding in findings
+        if not (isinstance(finding, dict) and finding.get("lane") == "runeseer")
+    ]
 
     external_findings: list[dict[str, Any]] = []
     for judgment in judgments:
@@ -741,6 +756,60 @@ def canonicalize_external_findings(
             }
         )
 
+    def complete_external_declaration(declared: Any) -> bool:
+        if not isinstance(declared, dict):
+            return False
+        if declared.get("lane") not in LANE_LOGINS.values():
+            return False
+        if declared.get("judgment") != "confirmed":
+            return False
+        if declared.get("severity") not in {"medium", "high", "critical"}:
+            return False
+        if type(declared.get("line")) is not int or declared["line"] < 0:
+            return False
+        try:
+            validate_plain_text(declared.get("path"), "Each lane finding path")
+            validate_plain_text(declared.get("summary"), "Each lane finding summary")
+        except SummaryError:
+            return False
+        declared_id = declared.get("comment_id")
+        if type(declared_id) is not int or declared_id < 1:
+            return False
+        source = sources.get(declared_id)
+        if source is None:
+            return False
+        source_lane, comment = source
+        source_line = comment.get("line")
+        if type(source_line) is not int:
+            source_line = comment.get("original_line")
+        return (
+            comment.get("in_reply_to_id") is None
+            and isinstance(comment.get("path"), str)
+            and bool(comment["path"])
+            and type(source_line) is int
+            and source_line >= 0
+            and (declared["lane"], declared["path"], declared["line"])
+            == (source_lane, comment["path"], source_line)
+        )
+
+    # Compatibility contract: discard each incomplete, malformed, or unknown
+    # external entry before contradiction checks. The model does not define
+    # external findings, so an invalid entry carries no authority. A complete
+    # entry names one trusted root inline comment. When the judgments removed
+    # that finding, the declaration and the judgments contradict each other.
+    rebuilt_ids = {finding["comment_id"] for finding in external_findings}
+    complete_declarations = [
+        declared
+        for declared in declared_external
+        if complete_external_declaration(declared)
+    ]
+    for declared in complete_declarations:
+        declared_id = declared["comment_id"]
+        if declared_id not in rebuilt_ids:
+            raise SummaryError(
+                "The lane judgments removed a declared external finding. "
+                "Runeseer rejects the contradiction instead of repairing it."
+            )
     repaired = copy.deepcopy(verdict)
     repaired["findings"] = own_findings + external_findings
     if len(repaired["findings"]) > MAX_OPEN_FINDINGS:
@@ -914,8 +983,13 @@ def validate_summary(summary: str, verdict: dict[str, Any]) -> str:
     summary = summary.strip()
     if not summary:
         raise SummaryError("The review summary is empty.")
-    if SUMMARY_MARKER in summary or "<!-- runeseer-verdict" in summary:
-        raise SummaryError("The model summary must not contain workflow markers.")
+    if "<!--" in summary or "-->" in summary:
+        # A bare delimiter ban rejects every workflow marker: the verdict
+        # marker, the failure notice, the owner escalation, and the legacy
+        # forms. Model text must never look like a machine marker.
+        raise SummaryError(
+            "The model summary must not contain HTML comment delimiters."
+        )
     if "\n---" in summary or any(line.startswith("#") for line in summary.splitlines()):
         raise SummaryError("The model summary must not contain headings or a footer.")
 
@@ -943,10 +1017,7 @@ def validate_summary(summary: str, verdict: dict[str, Any]) -> str:
     )
     if bullet_count > 3:
         raise SummaryError("The review summary must contain at most three bullets.")
-    if (
-        prose_word_count(summary) > 80
-        or len(summary.encode("utf-8")) > SUMMARY_BYTE_LIMIT
-    ):
+    if prose_word_count(summary) > 80 or utf8_size(summary) > SUMMARY_BYTE_LIMIT:
         summary = normalized_summary(verdict)
     return summary
 
@@ -1036,13 +1107,14 @@ def format_review(
         load_runeseer_records(runeseer_findings_path),
     )
     try:
-        summary_text = summary_path.read_text(encoding="utf-8")
+        summary_text = read_utf8(summary_path)
+    except SummaryError:
+        summary = normalized_summary(verdict)
+    else:
         try:
             summary = validate_summary(summary_text, verdict)
         except SummaryError:
             summary = normalized_summary(verdict)
-    except OSError:
-        summary = normalized_summary(verdict)
     try:
         verdict_path.write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
     except OSError as error:
@@ -1133,6 +1205,27 @@ def parse_verdict_marker(body: str) -> dict[str, Any] | None:
     }
 
 
+def parse_canonical_summary_marker(body: str) -> dict[str, Any] | None:
+    """Return the verdict identity from one canonical leading marker pair."""
+    matches = list(VERDICT_MARKER_RE.finditer(body))
+    if (
+        body.count(SUMMARY_MARKER) != 1
+        or body.count("<!-- runeseer-verdict") != 1
+        or len(matches) != 1
+    ):
+        return None
+    match = matches[0]
+    if not body.startswith(f"{SUMMARY_MARKER}\n{match.group(0)}\n"):
+        return None
+    return {
+        "sha": match.group("sha"),
+        "base": match.group("base"),
+        "round": int(match.group("round")),
+        "verdict": match.group("verdict"),
+        "restart": match.group("restart") or "none",
+    }
+
+
 def marker_round(body: str, base: str | None = None) -> int:
     rounds = [
         int(match.group("round"))
@@ -1173,10 +1266,13 @@ def find_summary_comment(
         and marker["base"] == base
     ]
     candidates = same_base or comments
+    # Within one round, the formatter-owned footer run outranks every
+    # timestamp: an older run can rewrite a comment after a newer run.
     current = max(
         candidates,
         key=lambda comment: (
             marker_round(comment.get("body", ""), base),
+            footer_run_id(comment.get("body", "")),
             comment.get("updated_at", comment.get("created_at", "")),
             comment.get("id", 0),
         ),
@@ -1229,6 +1325,51 @@ def latest_summary_clock(
     return max(clocks, default=(0, 0))
 
 
+def summary_comment_clock(
+    repo: str, number: int, comment_id: int, author: str, head: str, base: str
+) -> tuple[int, int]:
+    """Read one trusted summary comment and return its round and run.
+
+    The direct read replaces a full comment pagination after publication.
+    Every validation failure raises, so a vanished or altered summary
+    stops the mutation instead of allowing it.
+    """
+    result = run_gh(["api", f"repos/{repo}/issues/comments/{comment_id}"])
+    if result.returncode != 0:
+        raise SummaryError(
+            f"Could not read the review summary comment: {result.stderr.strip()}"
+        )
+    try:
+        comment = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SummaryError("GitHub returned an invalid comment record.") from error
+    if not isinstance(comment, dict) or comment.get("id") != comment_id:
+        raise SummaryError("The target is no longer the review summary comment.")
+    expected_issue_url = f"https://api.github.com/repos/{repo}/issues/{number}"
+    if comment.get("issue_url") != expected_issue_url:
+        raise SummaryError("The review summary comment belongs to another issue.")
+    user = comment.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    body = comment.get("body")
+    if login != author or not isinstance(body, str):
+        raise SummaryError("The target is no longer the review summary comment.")
+    verdict_marker = parse_canonical_summary_marker(body)
+    if verdict_marker is None or verdict_marker["round"] < 1:
+        raise SummaryError(
+            "The review summary comment needs exactly one canonical marker pair."
+        )
+    if verdict_marker["sha"] != head or verdict_marker["base"] != base:
+        raise SummaryError("The review summary comment reviews another head or base.")
+    _, separator, footer = body.rpartition("\n---\n")
+    footer_match = REVIEW_FOOTER_RE.fullmatch(footer.strip()) if separator else None
+    if footer_match is None:
+        raise SummaryError("The review summary comment has no footer run.")
+    if footer_match.group("sha") != head[:8]:
+        raise SummaryError("The review summary footer reviews another head.")
+    run = int(footer_match.group("run"))
+    return verdict_marker["round"], run
+
+
 def published_summary_is_newer(
     repo: str,
     number: int,
@@ -1237,26 +1378,46 @@ def published_summary_is_newer(
     base: str,
     review_round: int,
     run_id: int,
+    summary_comment_id: int | None = None,
 ) -> bool:
     """Return true when a newer published summary supersedes this run."""
-    latest_round, latest_run = latest_summary_clock(repo, number, author, head, base)
+    if summary_comment_id is not None:
+        latest_round, latest_run = summary_comment_clock(
+            repo, number, summary_comment_id, author, head, base
+        )
+    else:
+        latest_round, latest_run = latest_summary_clock(
+            repo, number, author, head, base
+        )
     return latest_round > review_round or (
         latest_round == review_round and latest_run > run_id
     )
 
 
-def publish_summary(body: str, repo: str, number: int, author: str) -> str:
+def publish_summary(body: str, repo: str, number: int, author: str) -> tuple[str, int]:
     validate_comment_body(body, "The review summary")
     marker = parse_verdict_marker(body)
     if marker is None or marker["round"] < 1:
         raise SummaryError("The review summary has no valid verdict marker.")
     comment = find_summary_comment(repo, number, author, marker["base"])
     comment_id = comment.get("id") if comment else None
+    comment_identity = (
+        parse_canonical_summary_marker(comment.get("body", "")) if comment else None
+    )
+    if comment is not None and comment_identity is None:
+        raise SummaryError("The existing review summary has no canonical marker pair.")
     existing_round = (
         marker_round(comment.get("body", ""), marker["base"]) if comment else 0
     )
-    if existing_round >= marker["round"]:
+    if existing_round > marker["round"]:
         raise SummaryError("A current or newer review summary already exists.")
+    if existing_round == marker["round"]:
+        # Within one round, the workflow run in the formatter-owned footer is
+        # the race authority: a newer run can replace the summary, and an
+        # equal or older run cannot.
+        existing_run = footer_run_id(comment.get("body", "")) if comment else 0
+        if footer_run_id(body) <= existing_run:
+            raise SummaryError("A current or newer review summary already exists.")
     if comment_id is None:
         arguments = ["api", "-X", "POST", f"repos/{repo}/issues/{number}/comments"]
         action = "created"
@@ -1273,6 +1434,30 @@ def publish_summary(body: str, repo: str, number: int, author: str) -> str:
     expected_live = f"{marker['sha']}\t{marker['base']}"
     if live.stdout.strip() != expected_live:
         raise SummaryError("The pull request changed before summary publication.")
+    if comment_id is not None:
+        # A newer run can publish between the first read and this update,
+        # and a duplicate comment can hide that run behind the selected
+        # comment. A fresh discovery re-reads the selected comment and
+        # revalidates its round and run before the update.
+        fresh = find_summary_comment(repo, number, author, marker["base"])
+        fresh_identity = (
+            parse_canonical_summary_marker(fresh.get("body", "")) if fresh else None
+        )
+        if (
+            fresh is None
+            or fresh.get("id") != comment_id
+            or fresh_identity is None
+            or fresh_identity != comment_identity
+        ):
+            raise SummaryError(
+                "The review summary marker identity changed before publication."
+            )
+        fresh_round = marker_round(fresh.get("body", ""), marker["base"])
+        if fresh_round > marker["round"] or (
+            fresh_round == marker["round"]
+            and footer_run_id(fresh.get("body", "")) >= footer_run_id(body)
+        ):
+            raise SummaryError("A current or newer review summary already exists.")
     result = run_gh([*arguments, "-f", f"body={body}"])
     if result.returncode != 0:
         verb = "create" if action == "created" else "update"
@@ -1283,11 +1468,14 @@ def publish_summary(body: str, repo: str, number: int, author: str) -> str:
         response = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise SummaryError("GitHub returned an invalid publication record.") from error
-    if comment_id is not None and response.get("id") != comment_id:
+    response_id = response.get("id") if isinstance(response, dict) else None
+    if type(response_id) is not int:
+        raise SummaryError("GitHub returned an invalid publication record.")
+    if comment_id is not None and response_id != comment_id:
         raise SummaryError("GitHub updated a different summary comment.")
     if response.get("body") != body:
         raise SummaryError("GitHub did not store the complete review summary.")
-    return action
+    return action, response_id
 
 
 def classify_failure(
@@ -1446,6 +1634,12 @@ def parse_transient_comment(
     user = value.get("user")
     login = user.get("login") if isinstance(user, dict) else None
     body = value.get("body")
+    if isinstance(body, str) and (
+        SUMMARY_MARKER in body or VERDICT_MARKER_RE.search(body) is not None
+    ):
+        # The review summary comment is permanent. A transient-notice marker
+        # inside it must never let a reconciler edit or delete the summary.
+        return None
     run_id = transient_notice_run(body, notice_type) if isinstance(body, str) else None
     if login != author or run_id is None:
         return None
@@ -1511,6 +1705,7 @@ def reconcile_transient_comment(
     review_round: int,
     run_id: int,
     notice_type: str,
+    summary_comment_id: int | None = None,
 ) -> str:
     """Create, update, or remove one transient Runeseer comment."""
     marker_re, _, notice_name = transient_notice_spec(notice_type)
@@ -1532,9 +1727,27 @@ def reconcile_transient_comment(
             raise SummaryError(f"The {notice_name} marker does not match this run.")
         if notice_type == "failure" and marker.group("stage") not in FAILURE_NOTICES:
             raise SummaryError("The failure notice marker has an invalid stage.")
-    if published_summary_is_newer(
-        repo, number, author, head, base, review_round, run_id
-    ):
+
+    def superseded() -> bool:
+        """Compare this run against the published summary right now.
+
+        Every mutation calls this again. A trusted summary comment ID
+        turns each comparison into one direct comment read; without one,
+        the comparison walks the full comment discovery. No mutation
+        reuses an earlier comparison result.
+        """
+        return published_summary_is_newer(
+            repo,
+            number,
+            author,
+            head,
+            base,
+            review_round,
+            run_id,
+            summary_comment_id,
+        )
+
+    if superseded():
         return "kept newer"
     comments = find_transient_comments(repo, number, author, notice_type)
     if any(comment["_runeseer_transient_run"] > run_id for comment in comments):
@@ -1544,9 +1757,7 @@ def reconcile_transient_comment(
             fresh = read_transient_comment(repo, comment["id"], author, notice_type)
             if fresh["_runeseer_transient_run"] > run_id:
                 return "kept newer"
-            if published_summary_is_newer(
-                repo, number, author, head, base, review_round, run_id
-            ):
+            if superseded():
                 return "kept newer"
             verify_live_pull_request(repo, number, head, base)
             result = run_gh(
@@ -1568,9 +1779,7 @@ def reconcile_transient_comment(
         default=None,
     )
     if current is None:
-        if published_summary_is_newer(
-            repo, number, author, head, base, review_round, run_id
-        ):
+        if superseded():
             return "kept newer"
         verify_live_pull_request(repo, number, head, base)
         arguments = ["api", "-X", "POST", f"repos/{repo}/issues/{number}/comments"]
@@ -1579,9 +1788,7 @@ def reconcile_transient_comment(
         fresh = read_transient_comment(repo, current["id"], author, notice_type)
         if fresh["_runeseer_transient_run"] > run_id:
             return "kept newer"
-        if published_summary_is_newer(
-            repo, number, author, head, base, review_round, run_id
-        ):
+        if superseded():
             return "kept newer"
         verify_live_pull_request(repo, number, head, base)
         arguments = [
@@ -1614,9 +1821,7 @@ def reconcile_transient_comment(
         fresh = read_transient_comment(repo, comment["id"], author, notice_type)
         if fresh["_runeseer_transient_run"] > run_id:
             raise SummaryError(f"A newer {notice_name} replaced a duplicate comment.")
-        if published_summary_is_newer(
-            repo, number, author, head, base, review_round, run_id
-        ):
+        if superseded():
             return "kept newer"
         verify_live_pull_request(repo, number, head, base)
         result = run_gh(
@@ -1638,10 +1843,20 @@ def reconcile_failure_notice(
     base: str,
     review_round: int,
     run_id: int,
+    summary_comment_id: int | None = None,
 ) -> str:
     """Reconcile the single Runeseer failure notice."""
     return reconcile_transient_comment(
-        body, repo, number, author, head, base, review_round, run_id, "failure"
+        body,
+        repo,
+        number,
+        author,
+        head,
+        base,
+        review_round,
+        run_id,
+        "failure",
+        summary_comment_id,
     )
 
 
@@ -1654,10 +1869,20 @@ def reconcile_owner_escalation(
     base: str,
     review_round: int,
     run_id: int,
+    summary_comment_id: int | None = None,
 ) -> str:
     """Reconcile the single Runeseer owner escalation."""
     return reconcile_transient_comment(
-        body, repo, number, author, head, base, review_round, run_id, "owner"
+        body,
+        repo,
+        number,
+        author,
+        head,
+        base,
+        review_round,
+        run_id,
+        "owner",
+        summary_comment_id,
     )
 
 
@@ -1665,7 +1890,12 @@ def write_output(body: str, output: Path | None) -> None:
     if output is None:
         print(body)
         return
-    output.write_text(body + "\n", encoding="utf-8")
+    try:
+        output.write_text(body + "\n", encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise SummaryError(
+            f"Could not write valid UTF-8 to {output}: {error}"
+        ) from error
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1752,6 +1982,7 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_parser.add_argument("--base", required=True)
     reconcile_parser.add_argument("--review-round", type=int, required=True)
     reconcile_parser.add_argument("--run-id", type=int, required=True)
+    reconcile_parser.add_argument("--summary-comment-id", type=int)
 
     owner_reconcile_parser = commands.add_parser("reconcile-owner-escalation")
     owner_body_group = owner_reconcile_parser.add_mutually_exclusive_group(
@@ -1766,6 +1997,7 @@ def build_parser() -> argparse.ArgumentParser:
     owner_reconcile_parser.add_argument("--base", required=True)
     owner_reconcile_parser.add_argument("--review-round", type=int, required=True)
     owner_reconcile_parser.add_argument("--run-id", type=int, required=True)
+    owner_reconcile_parser.add_argument("--summary-comment-id", type=int)
 
     newer_parser = commands.add_parser("newer-summary")
     newer_parser.add_argument("--repo", required=True)
@@ -1775,6 +2007,7 @@ def build_parser() -> argparse.ArgumentParser:
     newer_parser.add_argument("--base", required=True)
     newer_parser.add_argument("--review-round", type=int, required=True)
     newer_parser.add_argument("--run-id", type=int, required=True)
+    newer_parser.add_argument("--summary-comment-id", type=int)
 
     validate_parser = commands.add_parser("validate-verdict")
     validate_parser.add_argument("--verdict", type=Path, required=True)
@@ -1819,14 +2052,10 @@ def main() -> int:
             )
             return 0
         if arguments.command == "marker-round":
-            print(
-                marker_round(
-                    arguments.history.read_text(encoding="utf-8"), arguments.base
-                )
-            )
+            print(marker_round(read_utf8(arguments.history), arguments.base))
             return 0
         if arguments.command == "owner-from-codeowners":
-            print(repository_owner(arguments.codeowners.read_text(encoding="utf-8")))
+            print(repository_owner(read_utf8(arguments.codeowners)))
             return 0
         if arguments.command == "owner-escalation":
             print(
@@ -1870,7 +2099,7 @@ def main() -> int:
             return 0
         if arguments.command == "reconcile-failure-notice":
             body = (
-                arguments.body.read_text(encoding="utf-8").rstrip("\n")
+                read_utf8(arguments.body).rstrip("\n")
                 if arguments.body is not None
                 else None
             )
@@ -1883,6 +2112,7 @@ def main() -> int:
                 arguments.base,
                 arguments.review_round,
                 arguments.run_id,
+                arguments.summary_comment_id,
             )
             if action.startswith("removed "):
                 count = int(action.split()[1])
@@ -1896,7 +2126,7 @@ def main() -> int:
             return 0
         if arguments.command == "reconcile-owner-escalation":
             body = (
-                arguments.body.read_text(encoding="utf-8").rstrip("\n")
+                read_utf8(arguments.body).rstrip("\n")
                 if arguments.body is not None
                 else None
             )
@@ -1909,6 +2139,7 @@ def main() -> int:
                 arguments.base,
                 arguments.review_round,
                 arguments.run_id,
+                arguments.summary_comment_id,
             )
             if action.startswith("removed "):
                 count = int(action.split()[1])
@@ -1928,6 +2159,7 @@ def main() -> int:
                 arguments.base,
                 arguments.review_round,
                 arguments.run_id,
+                arguments.summary_comment_id,
             )
             print("true" if newer else "false")
             return 0
@@ -1960,9 +2192,9 @@ def main() -> int:
         if arguments.command != "publish":
             raise SummaryError(f"The command is not implemented: {arguments.command}")
 
-        body = arguments.body.read_text(encoding="utf-8").rstrip("\n")
+        body = read_utf8(arguments.body).rstrip("\n")
         try:
-            action = publish_summary(
+            action, summary_comment_id = publish_summary(
                 body, arguments.repo, arguments.pr, arguments.author
             )
         except SummaryError:
@@ -1973,6 +2205,7 @@ def main() -> int:
             print(body, file=sys.stderr)
             raise
         print(f"The workflow {action} the current review summary.")
+        print(f"summary-comment-id={summary_comment_id}")
         return 0
     except (OSError, SummaryError) as error:
         print(f"error: {error}", file=sys.stderr)
