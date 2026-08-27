@@ -1470,6 +1470,28 @@ class WorkflowSourceTests(unittest.TestCase):
             "The base-reset round stopped before Runeseer adjudication.", gate
         )
 
+    def test_base_reset_records_the_acknowledged_base(self):
+        # A reset round uploads no verdict, so latest_base would stay
+        # stale and every later round would reset again. The marker
+        # artifact records the acknowledged base, and the ledger reads
+        # it, so the round after a reset adjudicates.
+        ledger = self.step("- id: ledger")
+        self.assertIn('marker_name="runeseer-base-pr', ledger)
+        self.assertIn('[ "$reset_base" != "$BASE_SHA" ]', ledger)
+        self.assertIn("printf '%s\\n' \"$BASE_SHA\" > runeseer-base.txt", ledger)
+        marker = self.step("- id: base_marker")
+        self.assertIn("steps.ledger.outputs.base_reset == 'true'", marker)
+        self.assertIn("runeseer-base-pr${{ github.event.pull_request.number }}", marker)
+
+    def test_owner_override_reads_before_every_gate_exit(self):
+        # ignore:runeseer must work in every failure state, a base-reset
+        # round and a missing verdict included: the label read comes
+        # before the base-reset exit and the verdict-file exit.
+        gate = self.section("# The spec's word is binding", "# Metrics:")
+        override_index = gate.index("grep -qx 'ignore:runeseer'")
+        self.assertLess(override_index, gate.index('[ "$BASE_RESET" = "true" ]'))
+        self.assertLess(override_index, gate.index("no verdict file"))
+
     def test_review_prompt_states_every_size_boundary(self):
         adjudicate = self.step("- id: adjudicate")
         for boundary in (

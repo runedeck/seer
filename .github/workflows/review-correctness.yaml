@@ -410,7 +410,7 @@ jobs:
             # A reset round uploads no verdict, so this marker records the
             # base it acknowledged. The next round reads the marker and
             # adjudicates instead of resetting again.
-            - id: upload_base_marker
+            - id: base_marker
               name: Upload base marker
               if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset == 'true'
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
