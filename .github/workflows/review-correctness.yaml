@@ -84,11 +84,13 @@ jobs:
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
               run: |
                   pattern=$INSTRUCTION_PATTERN
-                  git ls-files -z | tr '\0' '\n' | grep -E "$pattern" | while IFS= read -r file; do
+                  # NUL separation end to end: a path that contains a newline
+                  # must not split into lines that dodge the pattern.
+                  git ls-files -z | grep -zE "$pattern" | while IFS= read -r -d '' file; do
                       rm -f "$file"
                   done
                   rm -rf .claude .cursor
-                  git ls-tree -r --name-only "$BASE_SHA" | grep -E "$pattern" | while IFS= read -r file; do
+                  git ls-tree -r --name-only -z "$BASE_SHA" | grep -zE "$pattern" | while IFS= read -r -d '' file; do
                       git checkout "$BASE_SHA" -- "$file" 2>/dev/null || true
                   done
                   echo "instruction surface pinned to the base branch."
@@ -177,8 +179,13 @@ jobs:
                   for _ in $(seq 1 "$POLL_ROUNDS"); do
                       settled=true
                       for app in $expected; do
-                          runs=$(gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs?per_page=100" \
-                              --jq "[.check_runs[] | select(.app.slug == \"$app\")]" | jq -s 'add // []')
+                          # A failed read must count as unsettled: empty totals
+                          # compare equal and would declare the lane settled.
+                          if ! runs=$(gh api --paginate "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+                              --jq "[.check_runs[] | select(.app.slug == \"$app\")]" | jq -s 'add // []'); then
+                              settled=false
+                              continue
+                          fi
                           total=$(printf '%s' "$runs" | jq 'length')
                           done_count=$(printf '%s' "$runs" | jq '[.[] | select(.status == "completed")] | length')
                           if [ "$total" = "0" ] || [ "$done_count" != "$total" ]; then
@@ -292,10 +299,33 @@ jobs:
                       fi
                   fi
                   command rm -rf .candidate-verdict .previous-verdict candidate-verdict.zip
+                  # The base marker records the base the latest reset round
+                  # acknowledged. A reset round uploads no verdict, so without
+                  # the marker latest_base stays stale forever and every later
+                  # round resets again: a deadlock no summon can clear.
+                  reset_base=""
+                  marker_name="runeseer-base-pr${{ github.event.pull_request.number }}"
+                  marker_id=$(gh api --paginate "repos/${{ github.repository }}/actions/artifacts?name=$marker_name&per_page=100" \
+                      --jq '[.artifacts[] | select(.expired == false)]' \
+                      | jq -s -r 'add // [] | sort_by(.created_at) | reverse | .[0].id // empty')
+                  if [ -n "$marker_id" ]; then
+                      command rm -rf .base-marker base-marker.zip
+                      if gh api "repos/${{ github.repository }}/actions/artifacts/$marker_id/zip" > base-marker.zip \
+                          && unzip -o base-marker.zip runeseer-base.txt -d .base-marker >/dev/null; then
+                          marker_base=$(tr -cd '0-9a-f' < .base-marker/runeseer-base.txt | head -c 40)
+                          if grep -Eq '^[0-9a-f]{40}$' <<<"$marker_base"; then
+                              reset_base="$marker_base"
+                          fi
+                      fi
+                      command rm -rf .base-marker base-marker.zip
+                  fi
                   # A base change invalidates the settled free-lane stages.
                   # The guarded reset runs after this step computes its round.
+                  # A marker that already names the current base means the
+                  # reset happened; this round adjudicates instead.
                   base_reset=false
-                  if [ -n "$latest_base" ] && [ "$latest_base" != "$BASE_SHA" ]; then
+                  if [ -n "$latest_base" ] && [ "$latest_base" != "$BASE_SHA" ] \
+                      && [ "$reset_base" != "$BASE_SHA" ]; then
                       base_reset=true
                   fi
                   # The artifact and sticky marker both store the current round.
@@ -370,11 +400,25 @@ jobs:
                       echo "The newest ledger uses another base."
                       clear_stage "$LABEL_STAGE_CURSOR" || exit 1
                       clear_stage "$LABEL_STAGE_MACROSCOPE" || exit 1
+                      printf '%s\n' "$BASE_SHA" > runeseer-base.txt
                       echo "The workflow reset the settled stages."
                   fi
                   echo "base_reset=${base_reset}" >> "$GITHUB_OUTPUT"
                   echo "prev_sha=${prev_sha}" >> "$GITHUB_OUTPUT"
                   echo "previous verdict: ${prev_sha:-none}"
+
+            # A reset round uploads no verdict, so this marker records the
+            # base it acknowledged. The next round reads the marker and
+            # adjudicates instead of resetting again.
+            - id: base_marker
+              name: Upload base marker
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset == 'true'
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+              with:
+                  name: runeseer-base-pr${{ github.event.pull_request.number }}
+                  path: runeseer-base.txt
+                  retention-days: 30
+                  if-no-files-found: error
 
             # Only the lane bots' own words reach the model: any other
             # commenter's text is a prompt-injection vector into the
@@ -1577,6 +1621,21 @@ jobs:
                   BASE_RESET: ${{ steps.ledger.outputs.base_reset }}
               run: |
                   set -o pipefail
+                  # The owner override reads first: ignore:runeseer withdraws
+                  # the lane's power to hold the merge in every state, a
+                  # base-reset round and a missing verdict included. Any
+                  # findings stand as a record on the pull request. A failed
+                  # label read must not read as an applied ignore.
+                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
+                      || { echo "could not read the live labels; rerun the check"; exit 1; }
+                  if printf '%s\n' "$labels" | grep -qx 'ignore:runeseer'; then
+                      echo "ignore:runeseer present; any findings stand as a record and no longer hold the merge."
+                      if [ -f runeseer-verdict.json ]; then
+                          jq -c '{verdict, count, sha, restart}' runeseer-verdict.json || true
+                      fi
+                      exit 0
+                  fi
                   if [ "$BASE_RESET" = "true" ]; then
                       echo "The base-reset round stopped before Runeseer adjudication."
                       echo "The workflow reset the free-lane stages and consumed the review labels."
@@ -1593,18 +1652,6 @@ jobs:
                       and (.findings | type == "array" and length == 0)
                       and .restart == "none"
                       and .sha == $sha and .base == $base' runeseer-verdict.json >/dev/null; then
-                      exit 0
-                  fi
-                  # The verdict, its findings, and its inline comments all
-                  # stand: ignore: withdraws only their power to hold the
-                  # merge, and the record stays on the pull request. A failed
-                  # label read must not read as an applied ignore.
-                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
-                      --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
-                      || { echo "could not read the live labels; rerun the check"; exit 1; }
-                  if printf '%s\n' "$labels" | grep -qx 'ignore:runeseer'; then
-                      echo "ignore:runeseer present; the findings below stand as a record and no longer hold the merge."
-                      jq -c '{verdict, count, sha, restart}' runeseer-verdict.json || true
                       exit 0
                   fi
                   echo "the verdict is not an explicit no-restart clean for this head; the check stays red."
