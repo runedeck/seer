@@ -72,11 +72,17 @@ for repo in $(gh api --paginate "orgs/$ORG/repos" --jq '.[].name'); do
         if [ "$rollup" = "$ROLLUP_GREEN" ] && [ "$mergeable" != "$MERGEABLE_BLOCKED" ] \
             && [ -n "$reviewer_at" ] && [ "$owner_after" = "0" ] && [ "$age" -ge "$STALE_HOURS" ]; then
             waiting="$waiting $ORG/$repo#$n(${age}h)"
-            last_bump=$(gh api --paginate "$api/issues/$n/comments" \
-                --jq "[.[] | select(.user.login == \"$BOT_LOGIN\" and (.body | startswith(\"$BUMP_PREFIX\")))] | last | .created_at // empty")
-            if [ -z "$last_bump" ] || [ "$(hours_since "$last_bump")" -ge "$BUMP_HOURS" ]; then
-                gh api -X POST "$api/issues/$n/comments" \
-                    -f body="$BUMP_PREFIX's review: this pull request cleared every lane ${age}h ago. The merge waits only on @$OWNER." >/dev/null
+            # One reminder per pull request: the existing comment updates
+            # its age in place, so the thread never accumulates reminders.
+            bump=$(gh api --paginate "$api/issues/$n/comments" \
+                --jq "[.[] | select(.user.login == \"$BOT_LOGIN\" and (.body | startswith(\"$BUMP_PREFIX\")))] | last | \"\\(.id) \\(.updated_at)\" // empty")
+            bump_id=${bump%% *}
+            bump_at=${bump#* }
+            body="$BUMP_PREFIX's review: this pull request cleared every lane ${age}h ago. The merge waits only on @$OWNER."
+            if [ -z "$bump_id" ]; then
+                gh api -X POST "$api/issues/$n/comments" -f body="$body" >/dev/null
+            elif [ "$(hours_since "$bump_at")" -ge "$BUMP_HOURS" ]; then
+                gh api -X PATCH "$api/issues/comments/$bump_id" -f body="$body" >/dev/null
             fi
         fi
     done
