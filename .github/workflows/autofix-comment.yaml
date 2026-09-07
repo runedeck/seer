@@ -68,13 +68,12 @@ jobs:
                   private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
 
             # The patch is a suggestion for the author to apply and commit
-            # under their own identity; nothing here commits.
-            - name: Comment the suggestion
+            # under their own identity; nothing here commits. The marker
+            # keys the upsert, so a later patch replaces the comment.
+            - name: Write the suggestion
               if: steps.patch.outputs.present == 'true'
-              env:
-                  GH_TOKEN: ${{ steps.runewright.outputs.token }}
-                  PR: ${{ steps.patch.outputs.pr }}
               run: |
+                  printf '%s\n' '<!-- autofix-suggestion -->' > comment.md
                   lines=$(wc -l < autofix.patch)
                   if [ "$lines" -le 120 ]; then
                       # The fence outruns the longest backtick run inside the
@@ -87,9 +86,27 @@ jobs:
                           printf 'Mechanical fixes available; apply with `git apply autofix.patch` and commit as yourself:\n\n%sdiff\n' "$fence"
                           cat autofix.patch
                           printf '%s\n' "$fence"
-                      } > comment.md
+                      } >> comment.md
                   else
                       printf 'Mechanical fixes available (%s lines); download the autofix-patch artifact from https://github.com/%s/actions/runs/%s and apply with `git apply autofix.patch`, committing as yourself.\n' \
-                          "$lines" "${{ github.repository }}" "${{ github.event.workflow_run.id }}" > comment.md
+                          "$lines" "${{ github.repository }}" "${{ github.event.workflow_run.id }}" >> comment.md
                   fi
-                  gh api -X POST "repos/${{ github.repository }}/issues/${PR}/comments" -F body=@comment.md >/dev/null
+
+            - name: Find the existing suggestion
+              if: steps.patch.outputs.present == 'true'
+              id: existing
+              uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
+              with:
+                  token: ${{ steps.runewright.outputs.token }}
+                  issue-number: ${{ steps.patch.outputs.pr }}
+                  body-includes: "<!-- autofix-suggestion -->"
+
+            - name: Comment the suggestion
+              if: steps.patch.outputs.present == 'true'
+              uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
+              with:
+                  token: ${{ steps.runewright.outputs.token }}
+                  issue-number: ${{ steps.patch.outputs.pr }}
+                  comment-id: ${{ steps.existing.outputs.comment-id }}
+                  body-path: comment.md
+                  edit-mode: replace

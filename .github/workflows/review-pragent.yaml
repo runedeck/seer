@@ -1,0 +1,105 @@
+name: Review PR-Agent
+
+# Reusable body of the pr-agent lane: one PR-Agent `review` call per
+# summon, in command mode from a pinned image, never from PR-Agent's own
+# Action, which reviews on pull request events the ceremony forbids. The
+# lane posts under the workflow token, consumes its summon label, and
+# records a persistent blocker on provider failure like every other lane.
+on:
+    workflow_call:
+        inputs:
+            model:
+                description: LiteLLM model name PR-Agent reviews with
+                type: string
+                default: anthropic/claude-sonnet-5
+        secrets:
+            PR_AGENT_MODEL_KEY:
+                description: API key for the model provider named by `model`
+                required: true
+
+env:
+    LABEL_SUMMON: review:pr-agent
+    LABEL_SKIP: skip:pr-agent
+    LABEL_BLOCKED: issue:pr-agent
+    # Pin by digest before the first live round (task 1.2 of review-tooling).
+    IMAGE: pragent/pr-agent:0.44.0
+
+permissions: {}
+
+jobs:
+    review:
+        name: pr-agent
+        # Same-repository, non-draft heads only: the model key is a secret,
+        # and a fork head must never reach a secret-bearing step.
+        if: >
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.draft == false
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: read
+            pull-requests: write
+        steps:
+            - name: Read the live labels
+              id: scope
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  labels=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
+                  if printf '%s\n' "$labels" | grep -qx "$LABEL_SKIP"; then
+                      echo "skip=true" >> "$GITHUB_OUTPUT"
+                      echo "$LABEL_SKIP stands the lane down."
+                  elif printf '%s\n' "$labels" | grep -qx "$LABEL_BLOCKED"; then
+                      echo "$LABEL_BLOCKED is set: clear the blocker before summoning this lane."
+                      exit 1
+                  else
+                      echo "skip=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Require the model key
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  MODEL_KEY: ${{ secrets.PR_AGENT_MODEL_KEY }}
+              run: |
+                  if [ -z "$MODEL_KEY" ]; then
+                      echo "PR_AGENT_MODEL_KEY is not configured; the lane cannot review."
+                      exit 1
+                  fi
+
+            # PR-Agent reads nested settings from double-underscore variables.
+            # publish_output keeps the review on the pull request; the marker
+            # header PR-Agent writes identifies these comments to the
+            # adjudicator as lane inputs.
+            - name: Run the PR-Agent review
+              id: run
+              if: steps.scope.outputs.skip == 'false'
+              env:
+                  GITHUB__USER_TOKEN: ${{ github.token }}
+                  ANTHROPIC__KEY: ${{ secrets.PR_AGENT_MODEL_KEY }}
+                  CONFIG__MODEL: ${{ inputs.model }}
+                  CONFIG__FALLBACK_MODELS: '["${{ inputs.model }}"]'
+                  CONFIG__PUBLISH_OUTPUT: "true"
+                  PR_URL: ${{ github.event.pull_request.html_url }}
+              run: |
+                  docker run --rm \
+                      -e GITHUB__USER_TOKEN -e ANTHROPIC__KEY \
+                      -e CONFIG__MODEL -e CONFIG__FALLBACK_MODELS -e CONFIG__PUBLISH_OUTPUT \
+                      "$IMAGE" --pr_url "$PR_URL" review
+
+            # A failed run is a provider fault: the blocker label stops repeat
+            # summons until an owner clears it, and the summon label is
+            # consumed on every path so a cancelled round cannot re-fire.
+            - name: Consume the summon label and record faults
+              if: always()
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  OUTCOME: ${{ steps.run.outcome }}
+                  SKIP: ${{ steps.scope.outputs.skip }}
+              run: |
+                  api="repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels"
+                  gh api -X DELETE "$api/$(printf '%s' "$LABEL_SUMMON" | jq -sRr @uri)" >/dev/null 2>&1 || true
+                  if [ "$SKIP" != "true" ] && [ "$OUTCOME" = "failure" ]; then
+                      gh api -X POST "$api" -f "labels[]=$LABEL_BLOCKED" >/dev/null
+                      echo "PR-Agent failed before a review; $LABEL_BLOCKED applied."
+                      exit 1
+                  fi

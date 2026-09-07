@@ -47,6 +47,9 @@ jobs:
             - name: Test review summary formatter
               run: python3 .github/scripts/test_runeseer_summary.py
 
+            - name: Test dashboard reminder selection
+              run: python3 .github/scripts/test_dashboard_reminder.py
+
             - name: Actionlint workflows
               run: |
                   curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
