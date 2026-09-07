@@ -75,7 +75,8 @@ for repo in $(gh api --paginate "orgs/$ORG/repos" --jq '.[].name'); do
             # One reminder per pull request: the existing comment updates
             # its age in place, so the thread never accumulates reminders.
             bump=$(gh api --paginate "$api/issues/$n/comments" \
-                --jq "[.[] | select(.user.login == \"$BOT_LOGIN\" and (.body | startswith(\"$BUMP_PREFIX\")))] | last | \"\\(.id) \\(.updated_at)\" // empty")
+                --jq "[.[] | select(.user.login == \"$BOT_LOGIN\" and (.body | startswith(\"$BUMP_PREFIX\")))]" \
+                | jq -s -r 'add // [] | last // empty | "\(.id) \(.updated_at)"')
             bump_id=${bump%% *}
             bump_at=${bump#* }
             body="$BUMP_PREFIX's review: this pull request cleared every lane ${age}h ago. The merge waits only on @$OWNER."
