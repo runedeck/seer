@@ -56,6 +56,8 @@ MAX_OPEN_FINDINGS = 50
 MAX_LANE_JUDGMENTS = 200
 MAX_RDJSONL_RECORD_BYTES = 16384
 MAX_GITHUB_COMMENT_BYTES = 60000
+MAX_CONTEXT_RECORDS = 40
+MAX_CONTEXT_BYTES = 65536
 VERDICT_PREFIXES = {
     "clean": "**Looks good.**",
     "findings": "**Request changes.**",
@@ -462,6 +464,96 @@ def collect_lane_evidence(
         raise SummaryError(
             "A carried review-body finding has no submitted source review."
         )
+    return result
+
+
+def collect_rebuttal_context(
+    inline: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+    head: str,
+    lane_comments: list[dict[str, Any]],
+    previous_findings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Collect bounded discussion data without granting finding authority."""
+    roots = {
+        item["id"] for item in lane_comments
+        if item.get("in_reply_to_id") is None
+    } | {
+        item["comment_id"] for item in previous_findings
+        if item.get("source_kind", "comment") == "comment"
+        and type(item.get("comment_id")) is int
+        and item["comment_id"] > 0
+    }
+    entries = []
+    for record in [*inline, *issues]:
+        user = record.get("user")
+        body = record.get("body")
+        if (
+            not isinstance(user, dict)
+            or not isinstance(user.get("login"), str)
+            or type(record.get("id")) is not int
+            or record["id"] <= 0
+            or not isinstance(body, str)
+            or utf8_size(body) > MAX_GITHUB_COMMENT_BYTES
+        ):
+            continue
+        entry = {
+            "id": record["id"],
+            "author": user["login"][:100],
+            "url": str(record.get("html_url", ""))[:1024],
+            "updated_at": str(record.get("updated_at", ""))[:40],
+        }
+        if (
+            user.get("type") == "User"
+            and type(record.get("in_reply_to_id")) is int
+            and record["in_reply_to_id"] in roots
+        ):
+            encoded = body.encode("utf-8")
+            entry.update(
+                kind="finding_reply",
+                root_comment_id=record["in_reply_to_id"],
+                body=encoded[:MODEL_TEXT_BYTE_LIMIT].decode("utf-8", errors="ignore"),
+                truncated=len(encoded) > MODEL_TEXT_BYTE_LIMIT,
+            )
+        elif user.get("login") == "coderabbitai[bot]" and user.get("type") == "Bot":
+            # Keep configuration metadata, not the walkthrough or echoed PR text.
+            if "<!-- This is an auto-generated comment: skip review by coderabbit.ai -->" not in body:
+                continue
+            source = re.search(
+                r"(?m)^>\s*\*\*Configuration used\*\*:\s*"
+                r"(Organization UI|Repository UI|Central YAML|Repository YAML)\s*$",
+                body,
+            )
+            labels = re.search(
+                r"<summary>[^\n]*Required labels[^\n]*</summary>(.*?)</details>",
+                body, re.DOTALL,
+            )
+            if source is None or labels is None:
+                continue
+            required = re.findall(r"(?m)^>\s*\* ([^\r\n]{1,100})$", labels[1])
+            if not required or len(required) > 20:
+                continue
+            entry.update(
+                kind="coderabbit_configuration_notice",
+                configuration_source=source[1],
+                required_labels=required,
+            )
+        else:
+            continue
+        entries.append(entry)
+    entries.sort(key=lambda item: (item["updated_at"], item["id"]), reverse=True)
+    result: dict[str, Any] = {
+        "schema_version": 1, "head": head, "trust": "untrusted",
+        "entries": [], "omitted_records": 0,
+    }
+    for entry in entries:
+        result["entries"].append(entry)
+        if (
+            len(result["entries"]) > MAX_CONTEXT_RECORDS
+            or utf8_size(json.dumps(result, ensure_ascii=False)) > MAX_CONTEXT_BYTES - 128
+        ):
+            result["entries"].pop()
+            result["omitted_records"] += 1
     return result
 
 
@@ -2302,18 +2394,27 @@ def main() -> int:
     arguments = build_parser().parse_args()
     try:
         if arguments.command == "collect-lanes":
+            inline = load_json(arguments.inline)
+            issues = load_json(arguments.issues)
+            previous = load_previous_findings(arguments.previous_verdict)
             evidence = collect_lane_evidence(
-                load_json(arguments.inline),
-                load_json(arguments.issues),
+                inline,
+                issues,
                 load_json(arguments.reviews),
                 arguments.head,
-                load_previous_findings(arguments.previous_verdict),
+                previous,
             )
             arguments.output_dir.mkdir(parents=True, exist_ok=True)
             for name, records in evidence.items():
                 (arguments.output_dir / f"{name}.json").write_text(
                     json.dumps(records, indent=2) + "\n", encoding="utf-8"
                 )
+            context = collect_rebuttal_context(
+                inline, issues, arguments.head, evidence["inline-comments"], previous
+            )
+            (arguments.output_dir / "rebuttal-context.json").write_text(
+                json.dumps(context, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
             return 0
         if arguments.command == "match-lane-thread":
             thread = matching_lane_thread(
