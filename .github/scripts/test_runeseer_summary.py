@@ -131,13 +131,55 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("verdict=findings", body)
 
     def test_restart_requires_request_changes_language(self):
-        data = verdict(restart="cursor")
+        data = verdict(restart="macroscope")
         body = self.format_case(
             data,
-            "**Request changes.** Cursor and Macroscope will review this head again because the workflow structure changed.",
+            "**Request changes.** Macroscope will review this head again because the workflow structure changed.",
         )
         self.assertIn("No open findings", body)
-        self.assertIn("verdict=clean restart=cursor", body)
+        self.assertIn("verdict=clean restart=macroscope", body)
+
+    def test_stored_cursor_restart_preserves_findings_head_base_and_round(self):
+        finding = {
+            "path": "file.py",
+            "line": 12,
+            "summary": "Guard accepts stale state",
+            "lane": "runeseer",
+            "judgment": "confirmed",
+            "severity": "high",
+            "comment_id": 5,
+        }
+        original = verdict(findings=[finding], restart="cursor", round_number=7)
+        original["lane_judgments"] = [
+            {**finding, "reason": "The guard still accepts stale state."}
+        ]
+        loaded = SUMMARY.read_stored_ledger(original, SHA, 7)
+        self.assertEqual(
+            loaded, {**original, "restart": "none", "historical_restart": "cursor"}
+        )
+        self.assertEqual(original["restart"], "cursor")
+        self.assertIsNot(loaded["findings"], original["findings"])
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "restart"):
+            SUMMARY.validate_verdict(original, SHA, 7)
+
+    def test_stored_ledger_reader_keeps_current_schema_validation(self):
+        for changes, error in (
+            ({"restart": "coderabbit"}, "restart"),
+            ({"sha": "f" * 40}, "SHA"),
+            ({"round": 9}, "round"),
+            ({"count": 1}, "count"),
+        ):
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(SUMMARY.SummaryError, error),
+            ):
+                SUMMARY.read_stored_ledger(
+                    {**verdict(restart="cursor"), **changes}, SHA, 1
+                )
+
+    def test_stored_current_verdict_does_not_gain_migration_metadata(self):
+        current = verdict(restart="macroscope")
+        self.assertEqual(SUMMARY.read_stored_ledger(current, SHA, 1), current)
 
     def test_internal_headings_use_normalized_summary(self):
         invalid = "**Looks good.** The checksum digest is correct.\n\n#### Digest"

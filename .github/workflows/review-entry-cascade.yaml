@@ -9,19 +9,19 @@ on:
         types: [opened, labeled, unlabeled, ready_for_review]
 
 # The body uses the workflow token to read check runs, the live head, and
-# review threads. issues: write lets it consume labels with the same token;
+# review threads. Write access lets it consume PR labels with the same token;
 # those removals emit no events and cannot cancel a lane.
 permissions:
     contents: read
     checks: read
-    pull-requests: read
+    pull-requests: write
     issues: write
 
-# Applying or removing a fresh bare review label may cancel a cascade. Every
-# other label re-enters this group without interrupting the active round.
+# Only a new bare review request replaces an active cascade.
+# Consuming a request never cancels its dispatching run.
 concurrency:
     group: review-cascade-${{ github.event.pull_request.number }}
-    cancel-in-progress: ${{ contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) && github.event.label.name == 'review' }}
+    cancel-in-progress: ${{ github.event.action == 'labeled' && github.event.label.name == 'review' }}
 
 jobs:
     # A queued ready event keeps its label payload after another round
@@ -60,9 +60,8 @@ jobs:
         needs: release
         if: '!cancelled() && github.event.pull_request.draft == false && (github.event.action == ''opened'' || (github.event.action == ''labeled'' && github.event.label.name == ''review'') || (github.event.action == ''ready_for_review'' && needs.release.outputs.summoned == ''true''))'
         uses: runedeck/seer/.github/workflows/review-cascade.yaml@main
+        with:
+            macroscope_correctness_check: ${{ vars.MACROSCOPE_CORRECTNESS_CHECK }}
         secrets:
             RUNEWRIGHT_APP_ID: ${{ secrets.RUNEWRIGHT_APP_ID }}
             RUNEWRIGHT_APP_KEY: ${{ secrets.RUNEWRIGHT_APP_KEY }}
-            # Cursor ignores bot-authored review comments; the cascade posts
-            # its trigger comment with this owner-minted token instead.
-            RUNEWRIGHT_GITHUB_TOKEN: ${{ secrets.RUNEWRIGHT_GITHUB_TOKEN }}
