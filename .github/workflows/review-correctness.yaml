@@ -33,10 +33,8 @@ concurrency:
 # keeps its literals; the reviewer prompt stays inline until the shared
 # definitions file on the roadmap carries it.
 env:
-    LANE_BOTS: '["macroscopeapp[bot]", "cursor[bot]"]'
-    LANE_GRAPHQL_LOGINS: '["macroscopeapp", "cursor", "macroscopeapp[bot]", "cursor[bot]"]'
+    LANE_BOTS: '["macroscopeapp[bot]", "cursor[bot]", "coderabbitai[bot]"]'
     REVIEWER_LOGIN: ${{ inputs.reviewer_login }}
-    APPS_EXPECTED: cursor
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
     LABEL_RUNE_BLOCKED: "issue:rune"
     LABEL_STAGE_CURSOR: "stage%3Acursor"
@@ -163,18 +161,16 @@ jobs:
             # The cascade summons this lane only after the free lanes settle,
             # so this wait is a short guard for directly requested rounds, not the
             # funnel's ordering mechanism.
-            - name: Wait for the other lanes
+            - name: Wait for requested Macroscope review
               if: steps.scope.outputs.skip == 'false'
               env:
                   GH_TOKEN: ${{ github.token }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-                  CURSOR_SKIPPED: ${{ contains(github.event.pull_request.labels.*.name, 'skip:cursor') }}
                   MACROSCOPE_SUMMONED: ${{ contains(github.event.pull_request.labels.*.name, 'review:macroscope') }}
               run: |
                   expected=""
-                  [ "$CURSOR_SKIPPED" != "true" ] && expected="$APPS_EXPECTED"
                   if [ "$MACROSCOPE_SUMMONED" = "true" ]; then
-                      expected="${expected:+$expected }macroscopeapp"
+                      expected="macroscopeapp"
                   fi
                   for _ in $(seq 1 "$POLL_ROUNDS"); do
                       settled=true
@@ -247,12 +243,15 @@ jobs:
                       candidate_base=$(jq -r '.base // empty' .candidate-verdict/runeseer-verdict.json)
                       candidate_round=$(jq -r '.round // empty' .candidate-verdict/runeseer-verdict.json)
                       if [ -n "$candidate_round" ]; then
-                          if ! python3 "$RUNESEER_FORMATTER" validate-verdict \
+                          if ! python3 "$RUNESEER_FORMATTER" read-ledger \
                               --verdict .candidate-verdict/runeseer-verdict.json \
                               --sha "$candidate_sha" \
-                              --round "$candidate_round" >/dev/null 2>&1; then
+                              --round "$candidate_round" \
+                              --output .candidate-verdict/runeseer-verdict.migrated.json >/dev/null 2>&1; then
                               continue
                           fi
+                          command mv .candidate-verdict/runeseer-verdict.migrated.json \
+                              .candidate-verdict/runeseer-verdict.json
                       else
                           # The compatibility release accepts the prior schema.
                           # The caller run SHA supplies its base binding.
@@ -270,7 +269,10 @@ jobs:
                               continue
                           fi
                           jq --arg base "$candidate_base" '
-                              . + {base: $base, round: 0, nonfinding_issue_comment_ids: []}' \
+                              . + {base: $base, round: 0, nonfinding_issue_comment_ids: []}
+                              | if .restart == "cursor" then
+                                  . + {historical_restart: "cursor", restart: "none"}
+                                else . end' \
                               .candidate-verdict/runeseer-verdict.json \
                               > .candidate-verdict/runeseer-verdict.migrated.json
                           command mv .candidate-verdict/runeseer-verdict.migrated.json \
@@ -428,6 +430,7 @@ jobs:
               if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
               env:
                   GH_TOKEN: ${{ github.token }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   set -o pipefail
                   lane_tmp="$RUNNER_TEMP/runeseer-lanes"
@@ -435,15 +438,30 @@ jobs:
                   lanes=$LANE_BOTS
                   gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments?per_page=100" \
                       --jq "[.[] | select(.user.login as \$login | $lanes | index(\$login))]" \
-                      | jq -s 'add // []' > "$lane_tmp/inline-comments.json"
+                      | jq -s 'add // []' > "$RUNNER_TEMP/lane-inline-raw.json"
                   gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
+                      --jq "[.[] | select(.user.login != \"coderabbitai[bot]\") | select(.user.login as \$login | $lanes | index(\$login))]" \
+                      | jq -s 'add // []' > "$RUNNER_TEMP/lane-issues-raw.json"
+                  gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews?per_page=100" \
                       --jq "[.[] | select(.user.login as \$login | $lanes | index(\$login))]" \
-                      | jq -s 'add // []' > "$lane_tmp/issue-comments.json"
+                      | jq -s 'add // []' > "$RUNNER_TEMP/lane-reviews-raw.json"
+                  python3 "$RUNESEER_FORMATTER" collect-lanes \
+                      --inline "$RUNNER_TEMP/lane-inline-raw.json" \
+                      --issues "$RUNNER_TEMP/lane-issues-raw.json" \
+                      --reviews "$RUNNER_TEMP/lane-reviews-raw.json" \
+                      --head "$HEAD_SHA" --output-dir "$lane_tmp" \
+                      --previous-verdict "$RUNESEER_LANES/previous-verdict.json"
                   gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments?per_page=100" \
                       --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .id]' \
                       | jq -s 'add // [] | unique' > "$lane_tmp/runeseer-before.json"
                   sudo install -d -o root -g root -m 0555 "$RUNESEER_LANES"
-                  sudo install -o root -g root -m 0444 "$lane_tmp"/*.json "$RUNESEER_LANES/"
+                  sudo install -o root -g root -m 0444 \
+                      "$lane_tmp/inline-comments.json" \
+                      "$lane_tmp/issue-comments.json" \
+                      "$lane_tmp/review-bodies.json" \
+                      "$lane_tmp/runeseer-before.json" "$RUNESEER_LANES/"
+                  command rm -f "$RUNNER_TEMP/lane-inline-raw.json" \
+                      "$RUNNER_TEMP/lane-issues-raw.json" "$RUNNER_TEMP/lane-reviews-raw.json"
                   echo "inline: $(jq 'length' "$lane_tmp/inline-comments.json"), issue: $(jq 'length' "$lane_tmp/issue-comments.json")"
 
             - id: runeseer
@@ -476,8 +494,14 @@ jobs:
                       You are runeseer, the adjudicating correctness reviewer. Write with the terse, factual register of Cursor Bugbot and Macroscope. Output rules below are binding.
 
                       Inputs:
-                      - `/usr/local/share/runeseer-lanes/inline-comments.json` contains inline findings from `macroscopeapp[bot]` and `cursor[bot]`.
+                      - `/usr/local/share/runeseer-lanes/inline-comments.json` contains inline findings from Macroscope, Cursor Bugbot, and CodeRabbit.
                       - `/usr/local/share/runeseer-lanes/issue-comments.json` contains issue-comment findings from those lanes.
+                      - `/usr/local/share/runeseer-lanes/review-bodies.json` contains submitted review bodies bound to the current head.
+                      - This file also retains historical review bodies with open ledger findings. Recheck those findings against HEAD.
+                      - A dismissed review with an open ledger finding still requires a judgment. Dismissal does not accept or fix the defect.
+                      - Each trusted entry names its source lane. `cursor` means Cursor Bugbot, not Cursor Security Agent.
+                      - Historical inline findings require a recheck against HEAD. Their original review does not approve this head.
+                      - A skipped status, approval eligibility check, walkthrough, or unbound comment never proves a correctness review.
                       - `/usr/local/share/runeseer-lanes/previous-verdict.json` may contain the previous-round ledger.
                       - `/usr/local/share/runeseer-lanes/previous-findings.rdjsonl` may contain the exact findings-file lines the previous round emitted.
                       - The previous verdict SHA is `${{ steps.ledger.outputs.prev_sha }}`.
@@ -556,7 +580,7 @@ jobs:
                       Verdict file:
                       - Write valid JSON to `runeseer-verdict.json` in the workspace root.
                       - Use exactly this schema:
-                        `{"sha":"<full HEAD sha>","round":${{ steps.ledger.outputs.round }},"verdict":"clean|findings","count":N,"restart":"none|cursor|macroscope","nonfinding_issue_comment_ids":[123],"findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope","judgment":"confirmed","severity":"medium|high|critical","comment_id":<originating comment database id for a posted inline finding>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope","judgment":"confirmed|disputed|already addressed","severity":"low|medium|high|critical","reason":"<judgment sentence>","comment_id":<positive id from a trusted lane entry or carried Runeseer ledger entry>}]}`
+                        `{"sha":"<full HEAD sha>","round":${{ steps.ledger.outputs.round }},"verdict":"clean|findings","count":N,"restart":"none|macroscope","nonfinding_issue_comment_ids":[123],"findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope|coderabbit","judgment":"confirmed","severity":"medium|high|critical","source_kind":"comment|review","comment_id":<originating comment or review database id>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope|coderabbit","judgment":"confirmed|disputed|already addressed","severity":"low|medium|high|critical","reason":"<judgment sentence>","source_kind":"comment|review","comment_id":<positive id from a trusted lane entry or carried Runeseer ledger entry>}]}`
                       - Include every open Medium, High, or Critical finding from any lane.
                       - Include at most 50 open findings and 200 lane judgments.
                       - Keep each model-authored text field within 4,096 UTF-8 bytes.
@@ -565,6 +589,12 @@ jobs:
                       - When every lane finding is disputed or already addressed and no novel finding remains, the array is empty, `count` is 0, and the human summary starts with `**Looks good.**`.
                       - Use `runeseer` as the lane for your own findings. Preserve the originating lane for other findings.
                       - Include each root inline comment from both trusted lane files in `lane_judgments`.
+                      - Judge every current-head review body. Set `source_kind` to `review` and copy its review database ID into `comment_id`.
+                      - A review body can contain several defects. Give each distinct defect its own judgment and code anchor.
+                      - Use a Low disputed judgment at `(review):0` when the review body contains no additional correctness defect.
+                      - Treat a review-body duplicate of an inline finding as a Low note. Preserve the inline source for the blocking finding.
+                      - Set `source_kind` to `comment` for inline and issue comments. An omitted field means `comment` for older ledgers.
+                      - Review-body judgments never resolve inline threads. Unbound context never supplies an external finding identity.
                       - Include `confirmed`, `disputed`, and `already addressed` judgments.
                       - Include a carried Runeseer ledger finding in `lane_judgments` only when its stored `comment_id` is a positive integer.
                       - Do not include a novel same-round Runeseer finding in `lane_judgments`. The workflow binds its comment ID after the session.
@@ -579,7 +609,8 @@ jobs:
                       - Preserve `comment_id` on carried ledger findings when it exists.
                       - Each `summary` is a factual title of at most 12 words.
                       - `count` must equal the findings array length. Set `verdict` to `clean` only when the array is empty; otherwise set it to `findings`.
-                      - `restart` is almost always `none`. Set `cursor` or `macroscope` only when changes since the free lanes settled are structurally large or shift unseen risk. State the reason in one human summary sentence.
+                      - `restart` is almost always `none`. Set `macroscope` only when structural changes require another Macroscope review. State the reason.
+                      - Cursor Bugbot, Cursor Security Agent, and CodeRabbit are optional. Their absence never requires a restart or blocks this review.
 
                       Style prohibitions:
                       - No throat-clearing, narrative framing, rhetorical questions, rhetorical conclusions, praise, or review-process narration.
@@ -618,6 +649,7 @@ jobs:
                       --run-url "$RUN_URL" \
                       --lane-comments "$RUNESEER_LANES/inline-comments.json" \
                       --lane-comments "$RUNESEER_LANES/issue-comments.json" \
+                      --lane-comments "$RUNESEER_LANES/review-bodies.json" \
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
                       --runeseer-findings runeseer-findings.rdjsonl \
                       --output "$RUNNER_TEMP/runeseer-prevalidate-review.md"
@@ -775,6 +807,7 @@ jobs:
                       --run-url "$RUN_URL" \
                       --lane-comments "$RUNESEER_LANES/inline-comments.json" \
                       --lane-comments "$RUNESEER_LANES/issue-comments.json" \
+                      --lane-comments "$RUNESEER_LANES/review-bodies.json" \
                       --runeseer-comments "$RUNESEER_LANES/runeseer-new-comments.json" \
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
                       --runeseer-findings runeseer-findings.rdjsonl \
@@ -886,7 +919,7 @@ jobs:
                                       path
                                       line
                                       originalLine
-                                      comments(first: 1) { nodes { databaseId author { login } } }
+                                      comments(first: 1) { nodes { databaseId author { login __typename } } }
                                   }
                               }
                           }
@@ -901,6 +934,9 @@ jobs:
                       threads='[]'
                       thread_query_failed=true
                   fi
+                  threads_file="$RUNNER_TEMP/runeseer-lane-threads.json"
+                  judgment_file="$RUNNER_TEMP/runeseer-lane-judgment.json"
+                  printf '%s\n' "$threads" > "$threads_file"
 
                   # The loop reads a file, not a pipeline: a stale-round exit
                   # must stop the complete step, and a pipeline subshell would
@@ -924,17 +960,9 @@ jobs:
                           echo "no originating inline comment id for $path:$line; leaving review threads unchanged"
                           continue
                       fi
-                      thread=$(jq -c \
-                          --arg comment_id "$comment_id" \
-                          --arg path "$path" \
-                          --argjson line "$line" \
-                          --argjson lane_bots "$LANE_GRAPHQL_LOGINS" '
-                          [.[] | select(
-                              ((.comments.nodes[0].databaseId // "") | tostring) == $comment_id
-                              and (.comments.nodes[0].author.login as $login | $lane_bots | index($login))
-                              and .path == $path
-                              and ((.line // .originalLine // 0) == $line)
-                          )] | sort_by(.isResolved) | first // empty' <<<"$threads")
+                      printf '%s\n' "$judgment" > "$judgment_file"
+                      thread=$(python3 "$RUNESEER_FORMATTER" match-lane-thread \
+                          --judgment "$judgment_file" --threads "$threads_file") || exit 1
                       if [ -z "$thread" ]; then
                           echo "no review thread matched $path:$line${comment_id:+ (comment $comment_id)}"
                           continue
@@ -1264,11 +1292,6 @@ jobs:
                           || { echo "could not clear stage label $1; the restart did not apply"; return 1; }
                   }
                   case "$restart" in
-                      cursor)
-                          clear_stage "$LABEL_STAGE_CURSOR" || exit 1
-                          clear_stage "$LABEL_STAGE_MACROSCOPE" || exit 1
-                          echo "restart requested: the next round re-runs the full funnel."
-                          ;;
                       macroscope)
                           clear_stage "$LABEL_STAGE_MACROSCOPE" || exit 1
                           echo "restart requested: the next round re-runs macroscope onward."
@@ -1520,6 +1543,7 @@ jobs:
                       --round "$REVIEW_ROUND" \
                       --lane-comments "$RUNESEER_LANES/inline-comments.json" \
                       --lane-comments "$RUNESEER_LANES/issue-comments.json" \
+                      --lane-comments "$RUNESEER_LANES/review-bodies.json" \
                       --runeseer-comments "$RUNESEER_LANES/runeseer-new-comments.json" \
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
                       --runeseer-findings runeseer-findings.rdjsonl >/dev/null 2>&1; then

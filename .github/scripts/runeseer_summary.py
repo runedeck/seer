@@ -30,10 +30,17 @@ REVIEW_FOOTER_RE = re.compile(
     r"(?: · [^\r\n]+)?$"
 )
 VERDICTS = {"clean", "findings"}
-RESTARTS = {"none", "cursor", "macroscope"}
+RESTARTS = {"none", "macroscope"}
 LANE_LOGINS = {
     "cursor[bot]": "cursor",
     "macroscopeapp[bot]": "macroscope",
+    "coderabbitai[bot]": "coderabbit",
+}
+LANE_NAMES = {
+    "runeseer": "Runeseer",
+    "cursor": "Cursor Bugbot",
+    "macroscope": "Macroscope",
+    "coderabbit": "CodeRabbit",
 }
 PROHIBITED_LINES = (
     "lane judgments",
@@ -347,6 +354,167 @@ def load_lane_comments(paths: list[Path] | None) -> list[dict[str, Any]] | None:
     return comments
 
 
+def collect_lane_evidence(
+    inline: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    head: str,
+    previous_findings: list[dict[str, Any]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Bind bot evidence to its source and the head under adjudication."""
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        raise SummaryError("Lane collection needs a full head SHA.")
+    for records in (inline, issues, reviews):
+        if not isinstance(records, list) or not all(
+            isinstance(record, dict) for record in records
+        ):
+            raise SummaryError("Each lane response must contain an array of objects.")
+
+    def trusted(record: dict[str, Any]) -> bool:
+        user = record.get("user")
+        return (
+            isinstance(user, dict)
+            and user.get("type") == "Bot"
+            and user.get("login") in LANE_LOGINS
+            and type(record.get("id")) is int
+            and record["id"] > 0
+        )
+
+    result: dict[str, list[dict[str, Any]]] = {
+        "inline-comments": [],
+        "issue-comments": [],
+        "review-bodies": [],
+    }
+    for record in inline:
+        if not trusted(record):
+            continue
+        commit = record.get("commit_id")
+        if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+            continue
+        item = copy.deepcopy(record)
+        item["lane"] = LANE_LOGINS[item["user"]["login"]]
+        item["adjudication_head"] = head
+        item["head_binding"] = "current" if commit == head else "historical"
+        # Historical findings still need a code-level judgment. A new head
+        # must not erase an unresolved finding from the previous head.
+        result["inline-comments"].append(item)
+    for record in issues:
+        if not trusted(record):
+            continue
+        # CodeRabbit walkthrough and skipped-review comments have no GitHub
+        # commit binding. Its submitted reviews and inline findings do.
+        if record["user"]["login"] == "coderabbitai[bot]":
+            continue
+        item = copy.deepcopy(record)
+        item["lane"] = LANE_LOGINS[item["user"]["login"]]
+        item["adjudication_head"] = head
+        item["head_binding"] = "unbound"
+        result["issue-comments"].append(item)
+    carried_inline = {
+        (finding.get("lane"), finding.get("comment_id"))
+        for finding in previous_findings or []
+        if finding.get("source_kind", "comment") == "comment"
+        and finding.get("lane") in LANE_LOGINS.values()
+    }
+    collected_inline = {
+        (record["lane"], record["id"]) for record in result["inline-comments"]
+    }
+    if not carried_inline <= collected_inline:
+        raise SummaryError("A carried inline finding has no bound source comment.")
+    carried_reviews = {
+        (finding.get("lane"), finding.get("comment_id"))
+        for finding in previous_findings or []
+        if finding.get("source_kind") == "review"
+    }
+    for record in reviews:
+        if not trusted(record):
+            continue
+        user = record["user"]
+        carried = (
+            LANE_LOGINS.get(user.get("login")),
+            record.get("id"),
+        ) in carried_reviews
+        commit = record.get("commit_id")
+        if (
+            not isinstance(commit, str)
+            or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+            or (commit != head and not carried)
+            or not (
+                record.get("state") in {"COMMENTED", "CHANGES_REQUESTED", "APPROVED"}
+                or (carried and record.get("state") == "DISMISSED")
+            )
+            or not record.get("submitted_at")
+            or not isinstance(record.get("body"), str)
+            or not record["body"].strip()
+        ):
+            continue
+        item = copy.deepcopy(record)
+        item["source_kind"] = "review"
+        item["lane"] = LANE_LOGINS[item["user"]["login"]]
+        item["adjudication_head"] = head
+        item["head_binding"] = "current" if commit == head else "historical"
+        item["carried"] = carried
+        result["review-bodies"].append(item)
+    collected_reviews = {
+        (record["lane"], record["id"]) for record in result["review-bodies"]
+    }
+    if not carried_reviews <= collected_reviews:
+        raise SummaryError(
+            "A carried review-body finding has no submitted source review."
+        )
+    return result
+
+
+def lane_source_key(item: dict[str, Any], *, source: bool = False) -> tuple[str, int]:
+    """Keep review IDs separate from comment IDs."""
+    return item.get("source_kind", "comment"), item["id" if source else "comment_id"]
+
+
+def finding_identity(item: dict[str, Any]) -> tuple[Any, ...]:
+    """Distinguish defects in one review body and retain strict inline identity."""
+    source_kind = item.get("source_kind", "comment")
+    return (
+        item.get("lane"),
+        item.get("path"),
+        item.get("line"),
+        item.get("comment_id"),
+        source_kind,
+        item.get("summary") if source_kind == "review" else None,
+    )
+
+
+def matching_lane_thread(
+    judgment: dict[str, Any], threads: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Match one inline judgment to the same provider and root comment."""
+    validate_lane_judgment(judgment)
+    if judgment.get("source_kind", "comment") != "comment":
+        return None
+    logins = {
+        identity
+        for login, lane in LANE_LOGINS.items()
+        if lane == judgment["lane"]
+        for identity in (login, login.removesuffix("[bot]"))
+    }
+    matches = []
+    for thread in threads:
+        comments = thread.get("comments", {}).get("nodes", [])
+        root = comments[0] if comments else {}
+        author = root.get("author") or {}
+        if (
+            author.get("__typename") == "Bot"
+            and author.get("login") in logins
+            and root.get("databaseId") == judgment["comment_id"]
+            and thread.get("path") == judgment["path"]
+            and (thread.get("line") or thread.get("originalLine") or 0)
+            == judgment["line"]
+        ):
+            matches.append(thread)
+    if len(matches) > 1:
+        raise SummaryError("A lane judgment matches more than one review thread.")
+    return matches[0] if matches else None
+
+
 def load_previous_findings(path: Path | None) -> list[dict[str, Any]]:
     if path is None or not path.exists():
         return []
@@ -357,6 +525,17 @@ def load_previous_findings(path: Path | None) -> list[dict[str, Any]]:
     ):
         raise SummaryError("The previous verdict has no valid findings array.")
     return findings
+
+
+def read_stored_ledger(
+    verdict: Any, expected_sha: str, expected_round: int
+) -> dict[str, Any]:
+    """Normalize an obsolete restart only when reading a stored ledger."""
+    stored = copy.deepcopy(verdict)
+    if isinstance(stored, dict) and stored.get("restart") == "cursor":
+        stored["historical_restart"] = "cursor"
+        stored["restart"] = "none"
+    return validate_verdict(stored, expected_sha, expected_round)
 
 
 def load_runeseer_records(path: Path | None) -> list[dict[str, Any]] | None:
@@ -432,9 +611,11 @@ def validate_lane_bindings(
     judgments: list[dict[str, Any]],
     lane_comments: list[dict[str, Any]],
     nonfinding_issue_ids: list[int],
+    expected_sha: str | None = None,
 ) -> None:
-    sources: dict[int, tuple[str, dict[str, Any]]] = {}
+    sources: dict[tuple[str, int], tuple[str, dict[str, Any]]] = {}
     required_inline_ids: set[int] = set()
+    review_ids: set[int] = set()
     issue_ids: set[int] = set()
     for comment in lane_comments:
         comment_id = comment.get("id")
@@ -443,14 +624,40 @@ def validate_lane_bindings(
         lane = LANE_LOGINS.get(login)
         if type(comment_id) is not int or lane is None:
             continue
-        sources[comment_id] = (lane, comment)
-        if isinstance(comment.get("path"), str):
+        if (
+            expected_sha is not None
+            and comment.get("adjudication_head", expected_sha) != expected_sha
+        ):
+            raise SummaryError(
+                "Lane evidence belongs to a different adjudication head."
+            )
+        key = lane_source_key(comment, source=True)
+        if key in sources:
+            raise SummaryError("A trusted lane comment ID is ambiguous.")
+        sources[key] = (lane, comment)
+        if key[0] == "review":
+            current = (
+                comment.get("head_binding") == "current"
+                and comment.get("commit_id") == expected_sha
+            )
+            carried = (
+                comment.get("head_binding") == "historical"
+                and comment.get("carried") is True
+                and isinstance(comment.get("commit_id"), str)
+                and re.fullmatch(r"[0-9a-f]{40}", comment["commit_id"]) is not None
+            )
+            if not current and not carried:
+                raise SummaryError("Each review body must bind to the current head.")
+            review_ids.add(comment_id)
+        elif isinstance(comment.get("path"), str):
             if comment.get("in_reply_to_id") is None:
                 required_inline_ids.add(comment_id)
         else:
             issue_ids.add(comment_id)
 
     judged_ids: set[int] = set()
+    judged_reviews: set[int] = set()
+    review_anchors: set[tuple[Any, ...]] = set()
     for judgment in judgments:
         # Ledger rechecks judge Runeseer's own earlier findings. Those
         # comments live outside the external lane files, so the external
@@ -458,9 +665,10 @@ def validate_lane_bindings(
         if judgment.get("lane") == "runeseer":
             continue
         comment_id = judgment["comment_id"]
-        if comment_id in judged_ids:
+        key = lane_source_key(judgment)
+        if key[0] == "comment" and comment_id in judged_ids:
             raise SummaryError("Each lane comment can have only one judgment.")
-        source = sources.get(comment_id)
+        source = sources.get(key)
         if source is None:
             raise SummaryError(
                 "Each lane judgment comment ID must identify a fetched lane comment."
@@ -468,6 +676,13 @@ def validate_lane_bindings(
         source_lane, comment = source
         if judgment["lane"] != source_lane:
             raise SummaryError("Each lane judgment must preserve its source lane.")
+        if key[0] == "review":
+            anchor = finding_identity(judgment)
+            if anchor in review_anchors:
+                raise SummaryError("Each review-body finding needs a unique anchor.")
+            review_anchors.add(anchor)
+            judged_reviews.add(comment_id)
+            continue
         source_path = comment.get("path")
         source_line = comment.get("line") or comment.get("original_line")
         if isinstance(source_path, str) and judgment["path"] != source_path:
@@ -479,6 +694,8 @@ def validate_lane_bindings(
     missing = required_inline_ids - judged_ids
     if missing:
         raise SummaryError("Every fetched lane inline finding needs a lane judgment.")
+    if review_ids != judged_reviews:
+        raise SummaryError("Every fetched review body needs a lane judgment.")
 
     nonfinding = set(nonfinding_issue_ids)
     judged_issues = judged_ids & issue_ids
@@ -638,6 +855,12 @@ def validate_lane_judgment(item: Any) -> dict[str, Any]:
     validate_plain_text(item.get("summary"), "Each lane judgment summary")
     if item.get("lane") not in set(LANE_LOGINS.values()) | {"runeseer"}:
         raise SummaryError("Each lane judgment needs a known source lane.")
+    if item.get("source_kind", "comment") not in {"comment", "review"}:
+        raise SummaryError("Each lane judgment needs a known source kind.")
+    if item.get("source_kind") == "review" and item.get("lane") == "runeseer":
+        raise SummaryError(
+            "A Runeseer ledger judgment must identify an inline comment."
+        )
     comment_id = item.get("comment_id")
     if type(comment_id) is not int or comment_id < 1:
         raise SummaryError("Each lane judgment comment ID must be a positive integer.")
@@ -648,7 +871,7 @@ def validate_lane_judgment(item: Any) -> dict[str, Any]:
 def canonicalize_external_findings(
     verdict: Any, lane_comments: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Derive external findings from unique, trusted root inline judgments."""
+    """Derive external findings from trusted inline and review-body judgments."""
     if not isinstance(verdict, dict):
         raise SummaryError("The verdict must be a JSON object.")
     findings = verdict.get("findings")
@@ -676,9 +899,11 @@ def canonicalize_external_findings(
 
     for judgment in judgments:
         validate_lane_judgment(judgment)
-    validate_lane_bindings(judgments, lane_comments, nonfinding_issue_ids)
+    validate_lane_bindings(
+        judgments, lane_comments, nonfinding_issue_ids, verdict.get("sha")
+    )
 
-    sources: dict[int, tuple[str, dict[str, Any]]] = {}
+    sources: dict[tuple[str, int], tuple[str, dict[str, Any]]] = {}
     for comment in lane_comments:
         comment_id = comment.get("id")
         user = comment.get("user")
@@ -686,18 +911,23 @@ def canonicalize_external_findings(
         lane = LANE_LOGINS.get(login)
         if type(comment_id) is not int or lane is None:
             continue
-        if comment_id in sources:
+        key = lane_source_key(comment, source=True)
+        if key in sources:
             raise SummaryError("A trusted lane comment ID is ambiguous.")
-        sources[comment_id] = (lane, comment)
+        sources[key] = (lane, comment)
 
-    def require_inline_source(item: dict[str, Any]) -> None:
+    def require_finding_source(item: dict[str, Any]) -> None:
         comment_id = item.get("comment_id")
         if type(comment_id) is not int or comment_id < 1:
             raise SummaryError("Each lane finding needs its source comment ID.")
-        source = sources.get(comment_id)
+        source = sources.get(lane_source_key(item))
         if source is None:
             raise SummaryError("Each lane finding needs a trusted source comment.")
         source_lane, comment = source
+        if comment.get("source_kind") == "review":
+            if item.get("lane") != source_lane:
+                raise SummaryError("Each review finding must preserve its source lane.")
+            return
         source_path = comment.get("path")
         source_line = comment.get("line")
         if type(source_line) is not int:
@@ -743,7 +973,7 @@ def canonicalize_external_findings(
             or judgment["severity"] == "low"
         ):
             continue
-        require_inline_source(judgment)
+        require_finding_source(judgment)
         external_findings.append(
             {
                 "path": judgment["path"],
@@ -753,6 +983,11 @@ def canonicalize_external_findings(
                 "judgment": "confirmed",
                 "severity": judgment["severity"],
                 "comment_id": judgment["comment_id"],
+                **(
+                    {"source_kind": "review"}
+                    if judgment.get("source_kind") == "review"
+                    else {}
+                ),
             }
         )
 
@@ -775,10 +1010,12 @@ def canonicalize_external_findings(
         declared_id = declared.get("comment_id")
         if type(declared_id) is not int or declared_id < 1:
             return False
-        source = sources.get(declared_id)
+        source = sources.get(lane_source_key(declared))
         if source is None:
             return False
         source_lane, comment = source
+        if comment.get("source_kind") == "review":
+            return declared["lane"] == source_lane
         source_line = comment.get("line")
         if type(source_line) is not int:
             source_line = comment.get("original_line")
@@ -797,15 +1034,15 @@ def canonicalize_external_findings(
     # external findings, so an invalid entry carries no authority. A complete
     # entry names one trusted root inline comment. When the judgments removed
     # that finding, the declaration and the judgments contradict each other.
-    rebuilt_ids = {finding["comment_id"] for finding in external_findings}
+    rebuilt_ids = {finding_identity(finding) for finding in external_findings}
     complete_declarations = [
         declared
         for declared in declared_external
         if complete_external_declaration(declared)
     ]
     for declared in complete_declarations:
-        declared_id = declared["comment_id"]
-        if declared_id not in rebuilt_ids:
+        declared_key = finding_identity(declared)
+        if declared_key not in rebuilt_ids:
             raise SummaryError(
                 "The lane judgments removed a declared external finding. "
                 "Runeseer rejects the contradiction instead of repairing it."
@@ -890,8 +1127,12 @@ def validate_verdict(
         if type(item.get("line")) is not int or item["line"] < 0:
             raise SummaryError("Each finding needs a nonnegative line number.")
         validate_plain_text(item.get("summary"), "Each finding summary")
-        if item.get("lane") not in {"runeseer", "cursor", "macroscope"}:
+        if item.get("lane") not in set(LANE_LOGINS.values()) | {"runeseer"}:
             raise SummaryError("Each finding needs a known source lane.")
+        if item.get("source_kind", "comment") not in {"comment", "review"}:
+            raise SummaryError("Each finding needs a known source kind.")
+        if item.get("source_kind") == "review" and item.get("lane") == "runeseer":
+            raise SummaryError("A Runeseer finding must identify an inline comment.")
         if item.get("judgment") != "confirmed":
             raise SummaryError("Each open finding needs a confirmed judgment.")
         comment_id = item.get("comment_id")
@@ -902,7 +1143,9 @@ def validate_verdict(
     for item in judgments:
         validate_lane_judgment(item)
     if lane_comments is not None:
-        validate_lane_bindings(judgments, lane_comments, nonfinding_issue_ids)
+        validate_lane_bindings(
+            judgments, lane_comments, nonfinding_issue_ids, expected_sha
+        )
     if runeseer_records is not None:
         validate_runeseer_records(findings, runeseer_records)
     if runeseer_comments is not None:
@@ -912,10 +1155,7 @@ def validate_verdict(
             previous_findings or [],
             allow_unposted=runeseer_records is not None,
         )
-    finding_keys = [
-        (item.get("lane"), item.get("path"), item.get("line"), item.get("comment_id"))
-        for item in findings
-    ]
+    finding_keys = [finding_identity(item) for item in findings]
     if len(finding_keys) != len(set(finding_keys)):
         raise SummaryError("Each open finding needs a unique identity.")
     lane_findings = {
@@ -924,12 +1164,7 @@ def validate_verdict(
         if key[0] != "runeseer"
     }
     confirmed = {
-        (
-            item.get("lane"),
-            item.get("path"),
-            item.get("line"),
-            item.get("comment_id"),
-        ): item
+        finding_identity(item): item
         for item in judgments
         if item.get("judgment") == "confirmed"
         and item.get("severity") != "low"
@@ -1073,11 +1308,17 @@ def findings_table(findings: list[dict[str, Any]]) -> list[str]:
             item.get("line") or 0,
         ),
     )
-    lines = ["| Risk | Finding | Location |", "| --- | --- | --- |"]
+    show_source = any(item.get("lane") != "runeseer" for item in findings)
+    lines = (
+        ["| Risk | Finding | Location | Source |", "| --- | --- | --- | --- |"]
+        if show_source
+        else ["| Risk | Finding | Location |", "| --- | --- | --- |"]
+    )
     for item in ordered:
         risk = str(item.get("severity", "")).capitalize()
         title = str(item.get("summary", "")).replace("|", "\\|")
-        lines.append(f"| {risk} | {title} | `{item['path']}:{item['line']}` |")
+        source = f" {LANE_NAMES[item['lane']]} |" if show_source else ""
+        lines.append(f"| {risk} | {title} | `{item['path']}:{item['line']}` |{source}")
     return lines
 
 
@@ -1902,6 +2143,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
+    collect_parser = commands.add_parser("collect-lanes")
+    collect_parser.add_argument("--inline", type=Path, required=True)
+    collect_parser.add_argument("--issues", type=Path, required=True)
+    collect_parser.add_argument("--reviews", type=Path, required=True)
+    collect_parser.add_argument("--head", required=True)
+    collect_parser.add_argument("--previous-verdict", type=Path)
+    collect_parser.add_argument("--output-dir", type=Path, required=True)
+
+    thread_parser = commands.add_parser("match-lane-thread")
+    thread_parser.add_argument("--judgment", type=Path, required=True)
+    thread_parser.add_argument("--threads", type=Path, required=True)
+
     round_parser = commands.add_parser("next-round")
     round_parser.add_argument("--previous-verdict", type=Path)
     round_parser.add_argument("--legacy-rounds", type=int, required=True)
@@ -2018,6 +2271,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--previous-verdict", type=Path)
     validate_parser.add_argument("--runeseer-findings", type=Path)
 
+    ledger_parser = commands.add_parser("read-ledger")
+    ledger_parser.add_argument("--verdict", type=Path, required=True)
+    ledger_parser.add_argument("--sha", required=True)
+    ledger_parser.add_argument("--round", type=int, required=True)
+    ledger_parser.add_argument("--output", type=Path)
+
     format_parser = commands.add_parser("format")
     format_parser.add_argument("--verdict", type=Path, required=True)
     format_parser.add_argument("--summary", type=Path, required=True)
@@ -2042,6 +2301,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     arguments = build_parser().parse_args()
     try:
+        if arguments.command == "collect-lanes":
+            evidence = collect_lane_evidence(
+                load_json(arguments.inline),
+                load_json(arguments.issues),
+                load_json(arguments.reviews),
+                arguments.head,
+                load_previous_findings(arguments.previous_verdict),
+            )
+            arguments.output_dir.mkdir(parents=True, exist_ok=True)
+            for name, records in evidence.items():
+                (arguments.output_dir / f"{name}.json").write_text(
+                    json.dumps(records, indent=2) + "\n", encoding="utf-8"
+                )
+            return 0
+        if arguments.command == "match-lane-thread":
+            thread = matching_lane_thread(
+                load_json(arguments.judgment), load_json(arguments.threads)
+            )
+            if thread is not None:
+                print(json.dumps(thread))
+            return 0
         if arguments.command == "next-round":
             print(
                 next_round(
@@ -2162,6 +2442,12 @@ def main() -> int:
                 arguments.summary_comment_id,
             )
             print("true" if newer else "false")
+            return 0
+        if arguments.command == "read-ledger":
+            stored = read_stored_ledger(
+                load_json(arguments.verdict), arguments.sha, arguments.round
+            )
+            write_output(json.dumps(stored, indent=2), arguments.output)
             return 0
         if arguments.command == "validate-verdict":
             validate_verdict(

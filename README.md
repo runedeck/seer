@@ -8,9 +8,9 @@ Seer is the review machinery behind two GitHub Apps: **runeseer**, the reviewing
 
 | Workflow             | Summoned by                     | What it does                                                              |
 | -------------------- | ------------------------------- | ------------------------------------------------------------------------- |
-| `review-cascade`     | bare `review` label             | Runs the cascade: `@cursor review`, cursor settles, `review:macroscope`,   |
-|                      |                                 | settles clean, `review:runeseer`. Findings and moved heads stop it.        |
-|                      |                                 | Terminal review failures set a lane blocker and stop repeat requests.      |
+| `review-cascade`     | bare `review` label             | Runs Macroscope correctness, then sends its findings to Runeseer. |
+|                      |                                 | Missing reviews, provider failures, and moved heads preserve the request. |
+| `review-cursor`      | `review:cursor` label           | Dispatches optional Bugbot. A failed dispatch preserves the request. |
 | `review-correctness` | `review:runeseer` label         | Adjudicates the free lanes' findings, reviews the diff, records a          |
 |                      |                                 | machine-readable verdict, earns the approval on an explicit clean          |
 |                      |                                 | verdict for the live head, and consumes the review labels.                 |
@@ -22,9 +22,28 @@ Seer is the review machinery behind two GitHub Apps: **runeseer**, the reviewing
 | `dashboard`          | schedule, runs here             | Sweeps the org for pull requests waiting only on the owner and keeps       |
 |                      |                                 | the "Awaiting owner review" issue current.                                 |
 
+Bugbot, Cursor Security Agent, and CodeRabbit are optional, independent reviews.
+Their absence or failure does not block the default cascade.
+A Bugbot dispatch records a request, not a completed review.
+A Cursor Security Agent check never supplies Bugbot completion evidence.
+
+The cascade requires Macroscope core correctness evidence for the current head.
+A `success` result means clean. A `neutral` result sends findings to Runeseer for adjudication.
+Skipped checks, approvability, and custom agents supply no core correctness evidence.
+Existing stage labels are informational. Each round checks the current head again.
+Runeseer remains the adjudicating lane.
+
 ## Caller contract
 
 A repository subscribes through workflow files: GitHub triggers only what exists in a repo's own `.github/workflows/`, so each repo carries a stub per lane that delegates with `uses: runedeck/seer/.github/workflows/<lane>.yaml@main`. Callers own the triggers, the concurrency, and the permissions; bodies own the logic and declare the secrets they need explicitly. First-party references ride `@main`: the trust boundary is push access to this repository, and its rulesets and history answer for every lane.
+
+Pass the trusted `MACROSCOPE_CORRECTNESS_CHECK` repository variable to the `macroscope_correctness_check` input.
+The value must identify the observed core correctness check, not an approvability or custom-agent check.
+An empty value blocks the cascade with a configuration error. [INSTALL.md](INSTALL.md) describes the required provider verification.
+
+The cascade caller grants `contents: read`, `checks: read`, `issues: write`, and `pull-requests: write`.
+Workflow-token consumption emits no workflow event. App tokens dispatch downstream labels but never consume the entry request.
+Only a new `review` label event cancels an active cascade. An `unlabeled` event does not cancel it.
 
 ## Canon
 

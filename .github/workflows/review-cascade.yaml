@@ -1,70 +1,38 @@
 name: Review Cascade
 
-# Reusable review cascade: cursor first, then macroscope, then runeseer,
-# each stage summoned only after the previous one settles clean on an unmoved
-# head. Stages settle once per pull request: a settled stage is recorded as a
-# stage label and later rounds go straight to the adjudicator, provided the
-# stage's findings stay resolved. Runeseer clears stage labels when a delta
-# warrants a fresh pass, and the owner clears them to force one. Findings or a
-# head change stop the cascade and fail this check; runeseer's own verdict
-# gates review/correctness, not this job. Callers trigger on
-# pull_request_target opened, ready_for_review, and labeled: every ready pull
-# request runs the cascade once automatically, and the review label re-summons
-# it after fixes. The cascade is API-only, checks out nothing, and fork pull
-# requests need the base-context secrets.
-#
-# Cursor has no label trigger, so stage 1 is a standalone runewright
-# `@cursor review` comment; runewright's token also applies stage labels, because
-# label events created by the workflow token would not trigger the lanes
-# listening for them.
-#
-# Callers must grant issues: write. The cascade removes the entry label
-# with the caller's workflow token. If the grant is missing, the cascade
-# warns and uses runewright instead.
+# The default path runs Macroscope correctness before Runeseer adjudication.
+# Bugbot, Cursor Security Agent, and CodeRabbit are independent optional reviews.
+# This workflow uses APIs only. It never checks out pull request content.
+# Callers own triggers, concurrency, and workflow-token permissions.
 on:
     workflow_call:
+        inputs:
+            macroscope_correctness_check:
+                description: Exact core correctness check name verified in Macroscope. Approvability and custom-agent checks are excluded.
+                type: string
+                required: false
+                default: ""
         secrets:
             RUNEWRIGHT_APP_ID:
                 required: true
             RUNEWRIGHT_APP_KEY:
                 required: true
-            # Cursor ignores bot-authored trigger comments, so the request
-            # rides an owner-minted fine-grained token when one is provided.
+            # Accept older callers. Optional Bugbot authentication is unused here.
             RUNEWRIGHT_GITHUB_TOKEN:
                 required: false
 
-# Single declaration point for every identity, label, and tunable this
-# body uses. Job-level if expressions cannot read env, so the entry
-# label stays literal in the guard below.
 env:
     LABEL_ENTRY: review
-    LABEL_CURSOR_BLOCKED: "issue:cursor"
     LABEL_MACROSCOPE: "review:macroscope"
     LABEL_MACROSCOPE_BLOCKED: "issue:macroscope"
     LABEL_RUNE_BLOCKED: "issue:rune"
     LABEL_RUNESEER: "review:runeseer"
-    LABEL_STAGE_CURSOR: "stage:cursor"
     LABEL_STAGE_MACROSCOPE: "stage:macroscope"
-    # Two owner overrides per lane, and the difference is what survives.
-    # skip: the lane never runs, so no finding is ever produced. ignore: the
-    # lane runs and reports in full, and its findings stay on the pull
-    # request as a record while losing their power to hold the merge.
-    LABEL_SKIP_CURSOR: "skip:cursor"
     LABEL_SKIP_MACROSCOPE: "skip:macroscope"
     LABEL_SKIP_RUNESEER: "skip:runeseer"
-    LABEL_IGNORE_CURSOR: "ignore:cursor"
-    LABEL_IGNORE_MACROSCOPE: "ignore:macroscope"
-    LABEL_COLOR: "5319e7"
-    LABEL_DESCRIPTION: Summons this review lane
-    APP_CURSOR: cursor
     APP_MACROSCOPE: macroscopeapp
-    BOT_CURSOR: cursor
-    BOT_MACROSCOPE: macroscopeapp
-    REST_BOT_CURSOR: "cursor[bot]"
-    REST_BOT_MACROSCOPE: "macroscopeapp[bot]"
-    SUMMON_COMMENT: "@cursor review"
+    CHECK_MACROSCOPE: ${{ inputs.macroscope_correctness_check }}
     POLL_SECONDS: 20
-    POLL_ROUNDS_CURSOR: 54
     POLL_ROUNDS_MACROSCOPE: 30
 
 jobs:
@@ -74,25 +42,20 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 45
         steps:
-            # A queued run keeps its event payload after the labels moved on,
-            # so the live labels decide whether the requested round still stands; a
-            # consumed review label stops the cascade without a failure.
             - id: live
               name: Verify the review label is live
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  if [ "${{ github.event.action }}" = "opened" ]; then
-                      echo "live=true" >> "$GITHUB_OUTPUT"
-                      echo "a newly opened pull request runs its first cascade without a label."
-                      exit 0
-                  fi
-                  labels=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
-                  if printf '%s\n' "$labels" | grep -qx review; then
+                  set -o pipefail
+                  # Every event requires the maintainer's live request label.
+                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s 'add // []')
+                  if jq -e 'index("review") != null' <<<"$labels" >/dev/null; then
                       echo "live=true" >> "$GITHUB_OUTPUT"
                   else
                       echo "live=false" >> "$GITHUB_OUTPUT"
-                      echo "no live review label on this pull request; the cascade stands down."
+                      echo "No live review request."
                   fi
 
             - id: runewright
@@ -106,340 +69,202 @@ jobs:
               if: steps.live.outputs.live == 'true'
               env:
                   GH_TOKEN: ${{ steps.runewright.outputs.token }}
-                  # Cursor drops bot-authored trigger comments, so the request
-                  # prefers the owner-minted token and falls back to runewright
-                  # only where no owner-minted token is configured.
-                  SUMMON_TOKEN: ${{ secrets.RUNEWRIGHT_GITHUB_TOKEN }}
-                  # Reads ride the workflow token; label writes ride
-                  # runewright, because the callers' grants stop at issues and
-                  # pull-request label writes 403 under the workflow token.
                   CALLER_TOKEN: ${{ github.token }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
               run: |
-                  # Remove the entry label with the caller's workflow token.
-                  # Workflow-token events do not start workflows, so the
-                  # removal cannot cancel the running cascade. A runewright
-                  # removal emits a real unlabeled event; the caller's cancel
-                  # rule matches that event and cancels this run.
-                  # A 404 means the label is already gone; that is success.
-                  # Any other error means the caller does not grant
-                  # issues: write; then warn and use runewright instead.
-                  # Stage and blocker labels stay on runewright, because the
-                  # lanes need their events.
-                  consume_entry_label() {
-                      local consume_error
-                      if consume_error=$(GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
-                          "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" 2>&1 >/dev/null); then
-                          return 0
-                      fi
-                      case "$consume_error" in
-                          *"HTTP 404"*) return 0 ;;
-                      esac
-                      echo "::warning::could not remove the review label with the workflow token ($consume_error). Grant issues: write in the caller. Using runewright instead; its unlabeled event can cancel this run."
-                      gh api -X DELETE \
-                          "repos/$REPO/issues/$PR/labels/$LABEL_ENTRY" >/dev/null 2>&1 || true
-                  }
-
+                  set -o pipefail
                   fail_cascade() {
-                      echo "$1"
-                      # Consuming the entry label makes re-applying it restart
-                      # the cascade after fixes.
-                      consume_entry_label
+                      echo "::error::$1"
+                      echo "The review request remains available. Repair the cause. Remove and reapply review on the final head."
                       exit 1
                   }
 
+                  api_failure() {
+                      case "$2" in
+                          *"HTTP 401"*) fail_cascade "GitHub rejected authentication during $1 (HTTP 401). The owner must inspect the relevant token." ;;
+                          *"HTTP 403"*) fail_cascade "GitHub denied $1 (HTTP 403). Inspect token permissions, installation access, and repository policy." ;;
+                          *) fail_cascade "GitHub did not confirm $1. Inspect the workflow log before retrying." ;;
+                      esac
+                  }
+
                   head_still() {
-                      live=$(GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
-                      [ "$live" = "$HEAD_SHA" ] || fail_cascade "the head moved from $HEAD_SHA to $live during the cascade; re-apply $LABEL_ENTRY on the new head."
+                      live=$(GH_TOKEN=$CALLER_TOKEN gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>&1) \
+                          || api_failure "the current-head read" "$live"
+                      [ "$live" = "$HEAD_SHA" ] \
+                          || fail_cascade "The head moved from $HEAD_SHA to $live. Request review on the final head."
                   }
 
-                  # Reads ride the caller token: runewright's app permissions
-                  # deliberately exclude Checks, and its writes stay scoped to
-                  # comments and label adds.
-                  unresolved_by() {
-                      cursor=""
-                      open=0
-                      while :; do
-                          cursor_arg=()
-                          [ -n "$cursor" ] && cursor_arg=(-f cursor="$cursor")
-                          page=$(GH_TOKEN=$CALLER_TOKEN gh api graphql -f query='query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-                              repository(owner: $owner, name: $repo) {
-                                  pullRequest(number: $number) {
-                                      reviewThreads(first: 100, after: $cursor) {
-                                          pageInfo { hasNextPage endCursor }
-                                          nodes { isResolved comments(first: 1) { nodes { author { login } } } }
-                                      }
-                                  }
-                              }
-                          }' -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" "${cursor_arg[@]}" \
-                              --jq '.data.repository.pullRequest.reviewThreads')
-                          open=$(( open + $(jq "[.nodes[] | select(.isResolved == false) | select(.comments.nodes[0].author.login == \"$1\")] | length" <<<"$page") ))
-                          [ "$(jq -r '.pageInfo.hasNextPage' <<<"$page")" = "true" ] || break
-                          cursor=$(jq -r '.pageInfo.endCursor' <<<"$page")
-                      done
-                      echo "$open"
+                  refresh_labels() {
+                      labels=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
+                          --jq '[.[].name]' | jq -s 'add // []') \
+                          || fail_cascade "Cannot read the current labels."
                   }
 
-                  # Per-page jq output is merged with jq -s because the runner's
-                  # gh predates --slurp.
-                  latest_runs() {
-                      GH_TOKEN=$CALLER_TOKEN gh api --paginate \
-                          "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
-                          --jq "[.check_runs[] | select(.app.slug == \"$1\")]" \
-                          | jq -s 'add // [] | group_by(.name) | map(sort_by(.started_at) | last)'
+                  has_label() {
+                      jq -e --arg label "$1" 'index($label) != null' <<<"$labels" >/dev/null
                   }
 
-                  # A lane that declines one of its own checks reports it
-                  # skipped, which is a decision rather than a fault, so it
-                  # counts as clean here. Real faults are failed_check's
-                  # territory, and a lane whose every check skips has still
-                  # concluded. Omitting skipped strands a lane forever: its
-                  # stage can only ever wait out the poll budget.
-                  settled() {
-                      runs=$(latest_runs "$1")
-                      total=$(jq 'length' <<<"$runs")
-                      clean_count=$(jq '[.[] | select(.status == "completed") | select(.conclusion as $conclusion | ["success", "neutral", "skipped"] | index($conclusion))] | length' <<<"$runs")
-                      [ "$total" != "0" ] && [ "$clean_count" = "$total" ]
-                  }
-
-                  failed_check() {
-                      runs=$(latest_runs "$1")
-                      jq -r '[.[]
-                          | select(.status == "completed")
-                          | select(.conclusion as $conclusion | ["failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"] | index($conclusion))
-                          | .html_url] | first // empty' <<<"$runs"
-                  }
-
-                  latest_comment_id() {
-                      GH_TOKEN=$CALLER_TOKEN gh api --paginate \
-                          "repos/$REPO/issues/$PR/comments?per_page=100" \
-                          --jq '[.[].id]' | jq -s 'add // [] | max // 0'
-                  }
-
-                  terminal_comment_after() {
-                      comments=$(GH_TOKEN=$CALLER_TOKEN gh api --paginate \
-                          "repos/$REPO/issues/$PR/comments?per_page=100" \
-                          --jq "[.[] | select(.id > $1) | select(.user.login == \"$2\") | select(.body | test(\"couldn.t run|unable to run|failed to run|usage limit|spend limit|is paused|usage-based billing\"; \"i\")) | .html_url]" \
-                          | jq -s 'add // []')
-                      jq -r 'first // empty' <<<"$comments"
-                  }
-
-                  blocked() {
-                      GH_TOKEN=$CALLER_TOKEN gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
-                          --jq "[.[].name]" | jq -s "add // [] | index(\"$1\") != null" | grep -qx true
-                  }
-
-                  mark_blocked() {
-                      encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
-                      gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1 \
-                          || gh api -X POST "repos/$REPO/labels" \
-                              -f name="$1" -f color="$LABEL_COLOR" \
-                              -f description="Review lane requires intervention" >/dev/null
-                      # An issue: label event fails every lane guard, so this
-                      # blocker cannot re-enter or relaunch a cascade.
-                      gh api -X POST \
-                          "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
-                  }
-
-                  clear_label() {
-                      encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
-                      gh api -X DELETE \
-                          "repos/$REPO/issues/$PR/labels/$encoded" >/dev/null 2>&1 || true
-                  }
-
-                  # An ignored lane reports in full; only its power to stop the
-                  # funnel is withdrawn. A terminal review failure still
-                  # fails: that is a broken lane, not a judged one, and skip:
-                  # is the override for a lane that should not run at all.
-                  # Callers read stage_unsettled rather than a return code:
-                  # wrapping this call in `if` would disable errexit for its
-                  # whole body, so a failed API read inside would stop aborting
-                  # and could report a stage settled that never was.
-                  stage_unsettled=false
-                  wait_clean() {
-                      app=$1; bot=$2; stage=$3; comment_after=${4:-0}; rest_bot=${5:-}; blocker=${6:-}; summon_label=${7:-}; poll_rounds=$8; ignore_label=${9:-}
-                      stage_unsettled=false
-                      ignored=false
-                      if [ -n "$ignore_label" ] && blocked "$ignore_label"; then
-                          ignored=true
+                  require_live_request() {
+                      refresh_labels
+                      if ! has_label "$LABEL_ENTRY"; then
+                          echo "The review request was withdrawn. No new review will be dispatched."
+                          exit 0
                       fi
-                      round=0
-                      for _ in $(seq 1 "$poll_rounds"); do
-                          round=$((round + 1))
-                          if settled "$app"; then
-                              [ -z "$blocker" ] || clear_label "$blocker"
-                              head_still
-                              open=$(unresolved_by "$bot")
-                              [ "$open" = "0" ] && { echo "$stage settled clean"; return 0; }
-                              [ "$ignored" = "true" ] && {
-                                  echo "$ignore_label present; $stage holds $open unresolved findings that no longer hold the funnel."
-                                  return 0
-                              }
-                              fail_cascade "$stage holds $open unresolved findings; the funnel stops here."
-                          fi
-                          # A freshly applied review label needs a few rounds to register its new
-                          # check run; until then a leftover failed run from the
-                          # previous attempt must not trip the breaker.
-                          failure_url=""
-                          [ "$round" -gt 3 ] && failure_url=$(failed_check "$app")
-                          if [ -n "$failure_url" ]; then
-                              head_still
-                              open=$(unresolved_by "$bot")
-                              if [ "$open" != "0" ] && [ "$ignored" != "true" ]; then
-                                  fail_cascade "$stage holds $open unresolved findings; the funnel stops here."
-                              fi
-                              [ -z "$summon_label" ] || clear_label "$summon_label"
-                              [ -z "$blocker" ] || mark_blocked "$blocker"
-                              fail_cascade "$stage reported a terminal review failure: $failure_url"
-                          fi
-                          if [ -n "$rest_bot" ]; then
-                              failure_url=$(terminal_comment_after "$comment_after" "$rest_bot")
-                              if [ -n "$failure_url" ]; then
-                                  [ -z "$summon_label" ] || clear_label "$summon_label"
-                                  [ -z "$blocker" ] || mark_blocked "$blocker"
-                                  fail_cascade "$stage reported a terminal review failure: $failure_url"
-                              fi
-                          fi
-                          sleep "$POLL_SECONDS"
-                      done
-                      # A lane that never reported has settled nothing, so the
-                      # caller must not record a stage label for it. This
-                      # releases the funnel without claiming settled work.
-                      [ "$ignored" = "true" ] && {
-                          echo "$ignore_label present; $stage did not settle within the poll budget and no longer holds the funnel."
-                          stage_unsettled=true
-                          return 0
-                      }
-                      fail_cascade "$stage did not settle within the poll budget; the funnel stops here."
                   }
 
                   ensure_label() {
-                      encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
-                      gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1 \
-                          || gh api -X POST "repos/$REPO/labels" \
-                              -f name="$1" -f color="$LABEL_COLOR" \
-                              -f description="$LABEL_DESCRIPTION" >/dev/null
-                      gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
+                      local response
+                      response=$(gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" 2>&1) \
+                          || api_failure "dispatch of $1" "$response"
                   }
 
-                  # Stage labels record settled stages across pushes: fix
-                  # rounds return straight to the adjudicator instead of
-                  # respending the whole funnel. A stage: label event fails
-                  # every lane guard, so marking one re-enters nothing.
-                  # Runeseer clears them when a delta warrants a fresh pass,
-                  # and the owner clears them to force one.
-                  mark_stage() {
-                      encoded=$(printf '%s' "$1" | sed 's/:/%3A/')
-                      gh api "repos/$REPO/labels/$encoded" >/dev/null 2>&1 \
-                          || gh api -X POST "repos/$REPO/labels" \
-                              -f name="$1" -f color="0e8a16" \
-                              -f description="Stage settled clean; remove to re-run it" >/dev/null
-                      gh api -X POST \
-                          "repos/$REPO/issues/$PR/labels" -f "labels[]=$1" >/dev/null
-                  }
-
-                  # A settled stage still holds its findings resolved: an
-                  # unresolved thread from that lane reopens the gate without
-                  # respending the provider.
-                  verify_stage_threads() {
-                      open=$(unresolved_by "$1")
-                      [ "$open" = "0" ] && return 0
-                      if [ -n "${3:-}" ] && blocked "$3"; then
-                          echo "$3 present; $2 holds $open unresolved findings that no longer hold the funnel."
+                  consume_label() {
+                      local response encoded action
+                      encoded=${1//:/%3A}
+                      action=${2:-"consumption of $1"}
+                      # Workflow-token consumption emits no new workflow event.
+                      # Never replace this token with an App-token fallback.
+                      if response=$(GH_TOKEN=$CALLER_TOKEN gh api -X DELETE \
+                          "repos/$REPO/issues/$PR/labels/$encoded" 2>&1); then
                           return 0
                       fi
-                      fail_cascade "$2 holds $open unresolved findings; resolve them before the funnel continues."
+                      case "$response" in *"HTTP 404"*) return 0 ;; esac
+                      api_failure "$action" "$response"
                   }
 
-                  # GraphQL bot logins are bare (cursor, macroscopeapp); REST
-                  # issue-comment logins carry the [bot] suffix.
-                  echo "stage 1: cursor"
-                  if blocked "$LABEL_SKIP_CURSOR"; then
-                      echo "$LABEL_SKIP_CURSOR present; the cursor stage never runs."
-                  elif blocked "$LABEL_STAGE_CURSOR"; then
-                      verify_stage_threads "$BOT_CURSOR" "cursor" "$LABEL_IGNORE_CURSOR"
-                      echo "cursor stage already settled; not re-summoned."
-                  else
-                      cursor_comment_id=0
-                      if settled "$APP_CURSOR"; then
-                          echo "cursor already settled on this head; not asking it again."
-                      elif blocked "$LABEL_CURSOR_BLOCKED"; then
-                          fail_cascade "$LABEL_CURSOR_BLOCKED is present; clear the review failure before re-summoning."
-                      else
-                          # Cursor ignores bot-authored comments, so only the
-                          # owner-minted token can actually summon it. Falling
-                          # back to runewright posts a comment Cursor will never
-                          # answer, and the stage then dies of the poll budget
-                          # with a message blaming the lane for a token fault.
-                          # Naming the fault here costs seconds instead.
-                          # Posting as a bot succeeds and still gets ignored, so
-                          # an absent token has to be caught before the request,
-                          # not by its result.
-                          if [ -z "$SUMMON_TOKEN" ]; then
-                              fail_cascade "no summon token is configured, and Cursor ignores bot-authored comments, so this stage could only wait out its poll budget. Configure RUNEWRIGHT_GITHUB_TOKEN, or apply $LABEL_SKIP_CURSOR to stand the stage down."
-                          fi
-                          if ! cursor_comment_id=$(GH_TOKEN=$SUMMON_TOKEN gh api -X POST \
-                              "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id' 2>&1); then
-                              fail_cascade "the summon token cannot comment on $REPO, so Cursor can never be asked: $cursor_comment_id. Grant RUNEWRIGHT_GITHUB_TOKEN access to this repository, or apply $LABEL_SKIP_CURSOR to stand the stage down."
-                          fi
-                      fi
-                      wait_clean "$APP_CURSOR" "$BOT_CURSOR" "cursor" \
-                          "$cursor_comment_id" "$REST_BOT_CURSOR" "$LABEL_CURSOR_BLOCKED" "" "$POLL_ROUNDS_CURSOR" \
-                          "$LABEL_IGNORE_CURSOR"
-                      [ "$stage_unsettled" = "true" ] || mark_stage "$LABEL_STAGE_CURSOR"
-                  fi
+                  consume_entry_label() {
+                      consume_label "$LABEL_ENTRY" "request consumption"
+                  }
 
-                  echo "stage 2: macroscope"
+                  latest_run() {
+                      # Filter raw results here so another product or head cannot qualify.
+                      GH_TOKEN=$CALLER_TOKEN gh api --paginate \
+                          "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" --jq '.check_runs' \
+                          | jq -s --arg app "$APP_MACROSCOPE" --arg name "$CHECK_MACROSCOPE" --arg head "$HEAD_SHA" \
+                        'add // [] | map(select(.app.slug == $app and .name == $name and .head_sha == $head))
+                        | map(select((.output.text // "" | test("(^|\\n)[[:space:]>]*Your check run agent prompt is:"; "i")) | not))
+                        | sort_by(.id) | last // null'
+                  }
+
+                  # Zero permits reuse of an existing current-head round.
+                  # A fresh dispatch advances the baseline before the provider receives it.
+                  review_after_id=0
+                  review_completed() {
+                      jq -e --argjson after "$review_after_id" \
+                          '(.id // 0) > $after and .status == "completed" and (.conclusion == "success" or .conclusion == "neutral")' \
+                          <<<"$run" >/dev/null
+                  }
+
+                  review_active() {
+                      jq -e '.status == "queued" or .status == "in_progress" or .status == "pending" or .status == "waiting" or .status == "requested"' \
+                          <<<"$run" >/dev/null
+                  }
+
+                  request_macroscope() {
+                      head_still
+                      require_live_request
+                      run=$(latest_run) || fail_cascade "Cannot read Macroscope correctness checks."
+                      # Recheck live recovery before changing any provider label.
+                      if review_completed || review_active; then
+                          return 0
+                      fi
+                      if has_label "$LABEL_MACROSCOPE_BLOCKED"; then
+                          fail_cascade "$LABEL_MACROSCOPE_BLOCKED is present. Repair the provider failure and clear the blocker before another request."
+                      fi
+                      # Re-adding an existing label emits no fresh request event.
+                      # Only an eligible explicit retry rearms that provider label.
+                      if has_label "$LABEL_MACROSCOPE"; then
+                          consume_label "$LABEL_MACROSCOPE"
+                      fi
+                      head_still
+                      run=$(latest_run) || fail_cascade "Cannot read Macroscope correctness checks."
+                      if review_completed || review_active; then
+                          return 0
+                      fi
+                      require_live_request
+                      # Capture the latest visible generation before dispatch, never after it.
+                      run=$(latest_run) || fail_cascade "Cannot read Macroscope correctness checks."
+                      if review_completed || review_active; then
+                          return 0
+                      fi
+                      review_after_id=$(jq -r '.id // 0' <<<"$run")
+                      ensure_label "$LABEL_MACROSCOPE"
+                  }
+
                   head_still
-                  # Skipping this stage leaves the adjudicating lane judging the
-                  # head, so the required verdict mirror can still clear.
-                  if blocked "$LABEL_SKIP_MACROSCOPE"; then
-                      echo "$LABEL_SKIP_MACROSCOPE present; the macroscope stage never runs."
-                  elif blocked "$LABEL_STAGE_MACROSCOPE"; then
-                      verify_stage_threads "$BOT_MACROSCOPE" "macroscope" "$LABEL_IGNORE_MACROSCOPE"
-                      echo "macroscope stage already settled; not re-summoned."
+                  require_live_request
+                  echo "stage 1: macroscope"
+                  if has_label "$LABEL_SKIP_MACROSCOPE"; then
+                      echo "$LABEL_SKIP_MACROSCOPE is present. No Macroscope review is recorded."
                   else
-                      macroscope_comment_id=$(latest_comment_id)
-                      if ! settled "$APP_MACROSCOPE"; then
-                          if blocked "$LABEL_MACROSCOPE_BLOCKED"; then
-                              fail_cascade "$LABEL_MACROSCOPE_BLOCKED is present; clear the review failure before re-summoning."
+                      [ -n "$CHECK_MACROSCOPE" ] || fail_cascade "MACROSCOPE_CORRECTNESS_CHECK is unset. Enable core correctness for review:macroscope and bind its observed exact check name."
+                      check_lower=$(printf '%s' "$CHECK_MACROSCOPE" | tr '[:upper:]' '[:lower:]')
+                      case "$check_lower" in
+                          *approvability*|*eligibility*|*conventions*|*custom*|*security\ agent*)
+                              fail_cascade "MACROSCOPE_CORRECTNESS_CHECK names an excluded check. Configure the observed core correctness check, not approvability or a custom agent." ;;
+                      esac
+                      run=$(latest_run) || fail_cascade "Cannot read Macroscope correctness checks."
+                      if ! review_completed; then
+                          # An existing current-head run needs no duplicate request.
+                          if ! review_active; then
+                              request_macroscope
                           fi
-                          ensure_label "$LABEL_MACROSCOPE"
+                          for _ in $(seq 1 "$POLL_ROUNDS_MACROSCOPE"); do
+                              head_still
+                              run=$(latest_run) || fail_cascade "Cannot read Macroscope correctness checks."
+                              review_completed && break
+                              # An old check cannot report the outcome of a fresh request.
+                              if jq -e --argjson after "$review_after_id" \
+                                  '(.id // 0) > $after and .status == "completed"' <<<"$run" >/dev/null; then
+                                  conclusion=$(jq -r '.conclusion // "unknown"' <<<"$run")
+                                  # Blocker metadata must not emit another workflow event.
+                                  GH_TOKEN=$CALLER_TOKEN ensure_label "$LABEL_MACROSCOPE_BLOCKED"
+                                  fail_cascade "Macroscope correctness ended as $conclusion. No completed review is recorded."
+                              fi
+                              sleep "$POLL_SECONDS"
+                          done
                       fi
-                      wait_clean "$APP_MACROSCOPE" "$BOT_MACROSCOPE" "macroscope" \
-                          "$macroscope_comment_id" "$REST_BOT_MACROSCOPE" "$LABEL_MACROSCOPE_BLOCKED" "$LABEL_MACROSCOPE" "$POLL_ROUNDS_MACROSCOPE" \
-                          "$LABEL_IGNORE_MACROSCOPE"
-                      [ "$stage_unsettled" = "true" ] || mark_stage "$LABEL_STAGE_MACROSCOPE"
+                      review_completed || fail_cascade "Macroscope correctness did not complete. Verify provider label settings and the configured check identity."
+                      head_still
+                      refresh_labels
+                      if has_label "$LABEL_MACROSCOPE_BLOCKED"; then
+                          consume_label "$LABEL_MACROSCOPE_BLOCKED"
+                      fi
+                      conclusion=$(jq -r '.conclusion' <<<"$run")
+                      echo "Macroscope correctness completed as $conclusion. Runeseer will adjudicate its findings."
+                      # Stage labels are informational. A later round still checks its head.
+                      ensure_label "$LABEL_STAGE_MACROSCOPE"
                   fi
 
-                  # The paid lane cannot run on fork pull requests (its
-                  # secrets are stripped there), so their funnel ends clean at
-                  # the free lanes and the owner reviews next.
                   if [ "$IS_FORK" = "true" ]; then
                       consume_entry_label
-                      echo "fork funnel complete: both free lanes settled clean; the owner's review is the remaining gate."
+                      echo "Fork cascade complete. The owner must review this pull request."
                       exit 0
                   fi
 
-                  echo "stage 3: runeseer"
                   head_still
-                  # The lane's own guard stands it down on skip:runeseer, so
-                  # summoning it would only spend a round to reach the same
-                  # place. ignore:runeseer still summons: its judgment is
-                  # wanted on the record, just not as a gate.
-                  if blocked "$LABEL_SKIP_RUNESEER"; then
-                      # The cascade ends here, so the entry label is consumed
-                      # exactly as on every other ending: re-applying it is
-                      # what starts the next round.
+                  # Finish an active provider round, but authorize each new dispatch again.
+                  require_live_request
+                  echo "stage 2: runeseer"
+                  if has_label "$LABEL_SKIP_RUNESEER"; then
                       consume_entry_label
-                      echo "$LABEL_SKIP_RUNESEER present; the correctness lane is not summoned."
+                      echo "$LABEL_SKIP_RUNESEER is present. Runeseer is not summoned."
                       exit 0
                   fi
-                  if blocked "$LABEL_RUNE_BLOCKED"; then
-                      fail_cascade "$LABEL_RUNE_BLOCKED is present; clear the review failure before re-summoning."
+                  if has_label "$LABEL_RUNE_BLOCKED"; then
+                      fail_cascade "$LABEL_RUNE_BLOCKED is present. Repair the correctness failure before another request."
                   fi
+                  # A bare review request cancels an active correctness run.
+                  # Remove its existing label before dispatch so GitHub emits a new event.
+                  if has_label "$LABEL_RUNESEER"; then
+                      consume_label "$LABEL_RUNESEER"
+                  fi
+                  head_still
+                  require_live_request
                   ensure_label "$LABEL_RUNESEER"
-                  echo "runeseer summoned; its clean verdict earns the approval, and only then does the pull request reach the owner."
+                  head_still
+                  consume_entry_label
+                  echo "Runeseer was summoned. Only its clean current-head verdict can earn approval."

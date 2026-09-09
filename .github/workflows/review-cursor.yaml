@@ -1,20 +1,16 @@
 name: Review Cursor
 
-# Reusable single-lane summon: consume the review:cursor label and post the
-# owner-voiced `@cursor review` trigger comment on the pull request. Cursor
-# drops bot-authored trigger comments, so the summon rides the owner-minted
-# token and fails loudly when it is missing; a runewright-posted mention
-# would die silently with the one-shot label already consumed. The lane
-# summons and stands down: Cursor's review lands on its own schedule and no
-# verdict gates on it, unlike the cascade, which polls the round to
-# completion as its first stage.
+# This optional lane dispatches Bugbot through an owner-authored comment.
+# A successful dispatch consumes review:cursor with the workflow token.
+# A failed dispatch preserves the label. This job records no review verdict.
+# Cursor Security Agent runs separately. The default cascade uses neither product.
 on:
     workflow_call:
         secrets:
             RUNEWRIGHT_APP_ID:
-                required: true
+                required: false
             RUNEWRIGHT_APP_KEY:
-                required: true
+                required: false
             RUNEWRIGHT_GITHUB_TOKEN:
                 required: true
 
@@ -36,42 +32,64 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  labels=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
-                  if printf '%s\n' "$labels" | grep -qx 'review:cursor'; then
+                  set -o pipefail
+                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s 'add // []')
+                  if jq -e 'index("review:cursor") != null' <<<"$labels" >/dev/null; then
                       echo "live=true" >> "$GITHUB_OUTPUT"
                   else
                       echo "live=false" >> "$GITHUB_OUTPUT"
                       echo "no live review:cursor label on this pull request; the summon stands down."
                   fi
 
-            - id: runewright
-              if: steps.live.outputs.live == 'true'
-              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
-              with:
-                  app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
-                  private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
-
-            - name: Consume the label and post the summon
+            - name: Dispatch Bugbot and consume the request
               if: steps.live.outputs.live == 'true'
               env:
-                  GH_TOKEN: ${{ steps.runewright.outputs.token }}
+                  GH_TOKEN: ${{ github.token }}
                   # Cursor drops bot-authored trigger comments; only the
                   # owner-minted token can voice a summon Cursor acts on.
                   SUMMON_TOKEN: ${{ secrets.RUNEWRIGHT_GITHUB_TOKEN }}
                   REPO: ${{ github.repository }}
                   PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
               run: |
                   set -o pipefail
-                  # An empty owner token means the summon would be a dead bot
-                  # mention: fail before touching the label so it stays live
-                  # for a retry once the secret is configured.
-                  if [ -z "$SUMMON_TOKEN" ]; then
-                      echo "RUNEWRIGHT_GITHUB_TOKEN is empty; Cursor ignores bot-authored mentions, so the summon stands down with the label intact."
+                  fail_request() {
+                      echo "::error::$1 The review:cursor request remains available for retry."
                       exit 1
+                  }
+                  head_still() {
+                      live=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha') \
+                          || fail_request "Cannot read the current pull request head."
+                      [ "$live" = "$HEAD_SHA" ] \
+                          || fail_request "The head changed from $HEAD_SHA to $live. Request Bugbot on the final head."
+                  }
+                  if [ -z "$SUMMON_TOKEN" ]; then
+                      fail_request "RUNEWRIGHT_GITHUB_TOKEN is empty. Configure the optional owner-authored Bugbot summon."
                   fi
-                  # The label is a one-round token: consume it before posting,
-                  # so a failed post reads as a missing summon comment rather
-                  # than a stale label that re-fires later.
-                  gh api -X DELETE "repos/$REPO/issues/$PR/labels/review%3Acursor" >/dev/null
-                  GH_TOKEN=$SUMMON_TOKEN gh api -X POST \
-                      "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id'
+                  head_still
+                  labels=$(gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s 'add // []') \
+                      || fail_request "Cannot verify the live Bugbot request."
+                  if ! jq -e 'index("review:cursor") != null' <<<"$labels" >/dev/null; then
+                      echo "The review:cursor request was withdrawn. Bugbot will not be dispatched."
+                      exit 0
+                  fi
+                  if ! dispatch=$(GH_TOKEN=$SUMMON_TOKEN gh api -X POST \
+                      "repos/$REPO/issues/$PR/comments" -f body="$SUMMON_COMMENT" --jq '.id' 2>&1); then
+                      case "$dispatch" in
+                          *"HTTP 401"*) fail_request "GitHub rejected RUNEWRIGHT_GITHUB_TOKEN authentication (HTTP 401). The owner must replace invalid or expired credentials." ;;
+                          *"HTTP 403"*) fail_request "GitHub denied the Bugbot summon (HTTP 403). The owner must inspect token access, installation policy, and response details." ;;
+                          *) fail_request "GitHub did not confirm the Bugbot summon. Inspect the existing comments before retrying an uncertain dispatch." ;;
+                      esac
+                  fi
+                  echo "Bugbot summon comment: $dispatch. Dispatch does not prove a completed review."
+                  head_still
+                  # Workflow-token writes emit no new workflow event.
+                  # An App-token fallback could cancel this run through an unlabeled event.
+                  if ! consumed=$(gh api -X DELETE "repos/$REPO/issues/$PR/labels/review%3Acursor" 2>&1); then
+                      case "$consumed" in
+                          *"HTTP 404"*) exit 0 ;;
+                      esac
+                      fail_request "The summon succeeded, but GitHub denied request consumption. Inspect caller token permissions before retrying."
+                  fi
