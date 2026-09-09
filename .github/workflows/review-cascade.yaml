@@ -257,6 +257,13 @@ jobs:
                   if has_label "$LABEL_RUNE_BLOCKED"; then
                       fail_cascade "$LABEL_RUNE_BLOCKED is present. Repair the correctness failure before another request."
                   fi
+                  # A bare review request cancels an active correctness run.
+                  # Remove its existing label before dispatch so GitHub emits a new event.
+                  if has_label "$LABEL_RUNESEER"; then
+                      consume_label "$LABEL_RUNESEER"
+                  fi
+                  head_still
+                  require_live_request
                   ensure_label "$LABEL_RUNESEER"
                   head_still
                   consume_entry_label

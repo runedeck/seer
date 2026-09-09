@@ -314,6 +314,40 @@ class EvidenceAdjudicationTests(unittest.TestCase):
             self.canonicalize(data, self.sources(include_review=True))["count"], 3
         )
 
+    def test_one_review_body_can_report_two_defects_at_the_same_anchor(self):
+        data = verdict(
+            [
+                judgment(),
+                judgment(source_kind="review", path="other.py"),
+                judgment(
+                    source_kind="review",
+                    path="other.py",
+                    summary="Missing cleanup leaks the lock",
+                    severity="high",
+                ),
+            ]
+        )
+        result = self.canonicalize(data, self.sources(include_review=True))
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(
+            [(item["summary"], item["severity"]) for item in result["findings"][1:]],
+            [("Guard accepts stale state", "medium"),
+             ("Missing cleanup leaks the lock", "high")],
+        )
+
+    def test_confirmed_review_defect_cannot_hide_a_contradiction_at_the_same_anchor(self):
+        confirmed = judgment(source_kind="review", path="other.py")
+        removed = judgment(
+            source_kind="review", path="other.py",
+            summary="Missing cleanup leaks the lock", judgment="disputed",
+        )
+        data = verdict(
+            [judgment(), confirmed, removed],
+            findings=[{**removed, "judgment": "confirmed"}],
+        )
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "contradiction"):
+            self.canonicalize(data, self.sources(include_review=True))
+
     def test_review_body_without_additional_findings_needs_an_explicit_judgment(self):
         data = verdict(
             [

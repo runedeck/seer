@@ -563,6 +563,37 @@ class CascadeTests(unittest.TestCase):
         self.assertIn("labels[]=review:runeseer", requests)
         self.assertNotIn("-X DELETE", requests)
 
+    def test_existing_runeseer_request_emits_a_fresh_event_before_consumption(self):
+        result, requests = self.run_cascade(labels=("review", "review:runeseer"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.fixture_events.count("labeled:review:runeseer"), 1)
+        self.assertLess(result.fixture_events.index("unlabeled:review:runeseer"),
+                        result.fixture_events.index("labeled:review:runeseer"))
+        self.assertLess(result.fixture_events.index("labeled:review:runeseer"),
+                        result.fixture_events.index("unlabeled:review"))
+        self.assertIn("workflow-fixture api -X DELETE repos/runedeck/example/issues/7/labels/review%3Aruneseer", requests)
+        self.assertNotIn("app-fixture api -X DELETE", requests)
+
+    def test_runeseer_rearm_delete_failure_preserves_entry(self):
+        result, requests = self.run_cascade(
+            labels=("review", "review:runeseer"),
+            consume_error="gh: forbidden (HTTP 403)",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("labels[]=review:runeseer", requests)
+        self.assertIn({"name": "review"}, result.fixture_labels)
+        self.assertNotIn("app-fixture api -X DELETE", requests)
+
+    def test_runeseer_rearm_add_failure_preserves_entry(self):
+        result, requests = self.run_cascade(
+            labels=("review", "review:runeseer", "skip:macroscope"),
+            dispatch_error="gh: forbidden (HTTP 403)",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn({"name": "review"}, result.fixture_labels)
+        self.assertEqual(result.fixture_events, ["unlabeled:review:runeseer"])
+        self.assertNotIn("labels/review ", requests)
+
     def test_runeseer_blocker_remains_required(self):
         result, requests = self.run_cascade(labels=("issue:rune",))
         self.assert_stopped(result, requests)

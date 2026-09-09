@@ -470,6 +470,19 @@ def lane_source_key(item: dict[str, Any], *, source: bool = False) -> tuple[str,
     return item.get("source_kind", "comment"), item["id" if source else "comment_id"]
 
 
+def finding_identity(item: dict[str, Any]) -> tuple[Any, ...]:
+    """Distinguish defects in one review body and retain strict inline identity."""
+    source_kind = item.get("source_kind", "comment")
+    return (
+        item.get("lane"),
+        item.get("path"),
+        item.get("line"),
+        item.get("comment_id"),
+        source_kind,
+        item.get("summary") if source_kind == "review" else None,
+    )
+
+
 def matching_lane_thread(
     judgment: dict[str, Any], threads: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -664,12 +677,7 @@ def validate_lane_bindings(
         if judgment["lane"] != source_lane:
             raise SummaryError("Each lane judgment must preserve its source lane.")
         if key[0] == "review":
-            anchor = (
-                comment_id,
-                judgment["path"],
-                judgment["line"],
-                judgment["summary"],
-            )
+            anchor = finding_identity(judgment)
             if anchor in review_anchors:
                 raise SummaryError("Each review-body finding needs a unique anchor.")
             review_anchors.add(anchor)
@@ -1026,17 +1034,14 @@ def canonicalize_external_findings(
     # external findings, so an invalid entry carries no authority. A complete
     # entry names one trusted root inline comment. When the judgments removed
     # that finding, the declaration and the judgments contradict each other.
-    rebuilt_ids = {
-        (lane_source_key(finding), finding["path"], finding["line"])
-        for finding in external_findings
-    }
+    rebuilt_ids = {finding_identity(finding) for finding in external_findings}
     complete_declarations = [
         declared
         for declared in declared_external
         if complete_external_declaration(declared)
     ]
     for declared in complete_declarations:
-        declared_key = (lane_source_key(declared), declared["path"], declared["line"])
+        declared_key = finding_identity(declared)
         if declared_key not in rebuilt_ids:
             raise SummaryError(
                 "The lane judgments removed a declared external finding. "
@@ -1150,16 +1155,7 @@ def validate_verdict(
             previous_findings or [],
             allow_unposted=runeseer_records is not None,
         )
-    finding_keys = [
-        (
-            item.get("lane"),
-            item.get("path"),
-            item.get("line"),
-            item.get("comment_id"),
-            item.get("source_kind", "comment"),
-        )
-        for item in findings
-    ]
+    finding_keys = [finding_identity(item) for item in findings]
     if len(finding_keys) != len(set(finding_keys)):
         raise SummaryError("Each open finding needs a unique identity.")
     lane_findings = {
@@ -1168,13 +1164,7 @@ def validate_verdict(
         if key[0] != "runeseer"
     }
     confirmed = {
-        (
-            item.get("lane"),
-            item.get("path"),
-            item.get("line"),
-            item.get("comment_id"),
-            item.get("source_kind", "comment"),
-        ): item
+        finding_identity(item): item
         for item in judgments
         if item.get("judgment") == "confirmed"
         and item.get("severity") != "low"
