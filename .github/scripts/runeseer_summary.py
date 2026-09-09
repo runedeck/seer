@@ -474,7 +474,7 @@ def collect_rebuttal_context(
     lane_comments: list[dict[str, Any]],
     previous_findings: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Collect bounded discussion data without granting finding authority."""
+    """Collect typed provider facts and reply references, never reply prose."""
     roots = {
         item["id"] for item in lane_comments
         if item.get("in_reply_to_id") is None
@@ -485,7 +485,12 @@ def collect_rebuttal_context(
         and item["comment_id"] > 0
     }
     entries = []
-    for record in [*inline, *issues]:
+    notice_ids = {}
+    notice_url = re.compile(
+        r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/"
+        r"[1-9][0-9]*#issuecomment-([1-9][0-9]*)"
+    )
+    for record in issues:
         user = record.get("user")
         body = record.get("body")
         if (
@@ -503,20 +508,11 @@ def collect_rebuttal_context(
             "url": str(record.get("html_url", ""))[:1024],
             "updated_at": str(record.get("updated_at", ""))[:40],
         }
-        if (
-            user.get("type") == "User"
-            and type(record.get("in_reply_to_id")) is int
-            and record["in_reply_to_id"] in roots
-        ):
-            encoded = body.encode("utf-8")
-            entry.update(
-                kind="finding_reply",
-                root_comment_id=record["in_reply_to_id"],
-                body=encoded[:MODEL_TEXT_BYTE_LIMIT].decode("utf-8", errors="ignore"),
-                truncated=len(encoded) > MODEL_TEXT_BYTE_LIMIT,
-            )
-        elif user.get("login") == "coderabbitai[bot]" and user.get("type") == "Bot":
+        if user.get("login") == "coderabbitai[bot]" and user.get("type") == "Bot":
             # Keep configuration metadata, not the walkthrough or echoed PR text.
+            url_match = notice_url.fullmatch(entry["url"])
+            if url_match is None or int(url_match[1]) != record["id"]:
+                continue
             if "<!-- This is an auto-generated comment: skip review by coderabbit.ai -->" not in body:
                 continue
             source = re.search(
@@ -531,7 +527,10 @@ def collect_rebuttal_context(
             if source is None or labels is None:
                 continue
             required = re.findall(r"(?m)^>\s*\* ([^\r\n]{1,100})$", labels[1])
-            if not required or len(required) > 20:
+            if (
+                not required or len(required) > 20
+                or any(re.fullmatch(r"[A-Za-z0-9_:.-]{1,100}", label) is None for label in required)
+            ):
                 continue
             entry.update(
                 kind="coderabbit_configuration_notice",
@@ -541,6 +540,7 @@ def collect_rebuttal_context(
         else:
             continue
         entries.append(entry)
+        notice_ids[entry["url"]] = entry["id"]
     entries.sort(key=lambda item: (item["updated_at"], item["id"]), reverse=True)
     result: dict[str, Any] = {
         "schema_version": 1, "head": head, "trust": "untrusted",
@@ -548,6 +548,37 @@ def collect_rebuttal_context(
     }
     for entry in entries:
         result["entries"].append(entry)
+        if (
+            len(result["entries"]) > MAX_CONTEXT_RECORDS
+            or utf8_size(json.dumps(result, ensure_ascii=False)) > MAX_CONTEXT_BYTES - 128
+        ):
+            result["entries"].pop()
+            result["omitted_records"] += 1
+    # Only link to typed notices that remain in this bounded evidence snapshot.
+    # A reply cannot introduce a URL to fetch, a new fact, or model instructions.
+    retained_ids = {entry["id"] for entry in result["entries"]}
+    for record in reversed(inline):
+        user = record.get("user")
+        body = record.get("body")
+        if (
+            not isinstance(user, dict) or user.get("type") != "User"
+            or type(record.get("id")) is not int or record["id"] <= 0
+            or type(record.get("in_reply_to_id")) is not int
+            or record["in_reply_to_id"] not in roots
+            or not isinstance(body, str) or utf8_size(body) > MAX_GITHUB_COMMENT_BYTES
+        ):
+            continue
+        references = sorted({
+            notice_ids[match[0]] for match in notice_url.finditer(body)
+            if match[0] in notice_ids and notice_ids[match[0]] in retained_ids
+        })
+        if not references:
+            continue
+        result["entries"].append({
+            "id": record["id"], "kind": "finding_reply",
+            "root_comment_id": record["in_reply_to_id"],
+            "configuration_notice_ids": references,
+        })
         if (
             len(result["entries"]) > MAX_CONTEXT_RECORDS
             or utf8_size(json.dumps(result, ensure_ascii=False)) > MAX_CONTEXT_BYTES - 128
