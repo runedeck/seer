@@ -56,6 +56,8 @@ MAX_OPEN_FINDINGS = 50
 MAX_LANE_JUDGMENTS = 200
 MAX_RDJSONL_RECORD_BYTES = 16384
 MAX_GITHUB_COMMENT_BYTES = 60000
+MAX_CONTEXT_RECORDS = 40
+MAX_CONTEXT_BYTES = 65536
 VERDICT_PREFIXES = {
     "clean": "**Looks good.**",
     "findings": "**Request changes.**",
@@ -462,6 +464,127 @@ def collect_lane_evidence(
         raise SummaryError(
             "A carried review-body finding has no submitted source review."
         )
+    return result
+
+
+def collect_rebuttal_context(
+    inline: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+    head: str,
+    lane_comments: list[dict[str, Any]],
+    previous_findings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Collect typed provider facts and reply references, never reply prose."""
+    roots = {
+        item["id"] for item in lane_comments
+        if item.get("in_reply_to_id") is None
+    } | {
+        item["comment_id"] for item in previous_findings
+        if item.get("source_kind", "comment") == "comment"
+        and type(item.get("comment_id")) is int
+        and item["comment_id"] > 0
+    }
+    entries = []
+    notice_ids = {}
+    notice_url = re.compile(
+        r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/"
+        r"[1-9][0-9]*#issuecomment-([1-9][0-9]*)"
+    )
+    for record in issues:
+        user = record.get("user")
+        body = record.get("body")
+        if (
+            not isinstance(user, dict)
+            or not isinstance(user.get("login"), str)
+            or type(record.get("id")) is not int
+            or record["id"] <= 0
+            or not isinstance(body, str)
+            or utf8_size(body) > MAX_GITHUB_COMMENT_BYTES
+        ):
+            continue
+        entry = {
+            "id": record["id"],
+            "author": user["login"][:100],
+            "url": str(record.get("html_url", ""))[:1024],
+            "updated_at": str(record.get("updated_at", ""))[:40],
+        }
+        if user.get("login") == "coderabbitai[bot]" and user.get("type") == "Bot":
+            # Keep configuration metadata, not the walkthrough or echoed PR text.
+            url_match = notice_url.fullmatch(entry["url"])
+            if url_match is None or int(url_match[1]) != record["id"]:
+                continue
+            if "<!-- This is an auto-generated comment: skip review by coderabbit.ai -->" not in body:
+                continue
+            source = re.search(
+                r"(?m)^>\s*\*\*Configuration used\*\*:\s*"
+                r"(Organization UI|Repository UI|Central YAML|Repository YAML)\s*$",
+                body,
+            )
+            labels = re.search(
+                r"<summary>[^\n]*Required labels[^\n]*</summary>(.*?)</details>",
+                body, re.DOTALL,
+            )
+            if source is None or labels is None:
+                continue
+            required = re.findall(r"(?m)^>\s*\* ([^\r\n]{1,100})$", labels[1])
+            if (
+                not required or len(required) > 20
+                or any(re.fullmatch(r"[A-Za-z0-9_:.-]{1,100}", label) is None for label in required)
+            ):
+                continue
+            entry.update(
+                kind="coderabbit_configuration_notice",
+                configuration_source=source[1],
+                required_labels=required,
+            )
+        else:
+            continue
+        entries.append(entry)
+        notice_ids[entry["url"]] = entry["id"]
+    entries.sort(key=lambda item: (item["updated_at"], item["id"]), reverse=True)
+    result: dict[str, Any] = {
+        "schema_version": 1, "head": head, "trust": "untrusted",
+        "entries": [], "omitted_records": 0,
+    }
+    for entry in entries:
+        result["entries"].append(entry)
+        if (
+            len(result["entries"]) > MAX_CONTEXT_RECORDS
+            or utf8_size(json.dumps(result, ensure_ascii=False)) > MAX_CONTEXT_BYTES - 128
+        ):
+            result["entries"].pop()
+            result["omitted_records"] += 1
+    # Only link to typed notices that remain in this bounded evidence snapshot.
+    # A reply cannot introduce a URL to fetch, a new fact, or model instructions.
+    retained_ids = {entry["id"] for entry in result["entries"]}
+    for record in reversed(inline):
+        user = record.get("user")
+        body = record.get("body")
+        if (
+            not isinstance(user, dict) or user.get("type") != "User"
+            or type(record.get("id")) is not int or record["id"] <= 0
+            or type(record.get("in_reply_to_id")) is not int
+            or record["in_reply_to_id"] not in roots
+            or not isinstance(body, str) or utf8_size(body) > MAX_GITHUB_COMMENT_BYTES
+        ):
+            continue
+        references = sorted({
+            notice_ids[match[0]] for match in notice_url.finditer(body)
+            if match[0] in notice_ids and notice_ids[match[0]] in retained_ids
+        })
+        if not references:
+            continue
+        result["entries"].append({
+            "id": record["id"], "kind": "finding_reply",
+            "root_comment_id": record["in_reply_to_id"],
+            "configuration_notice_ids": references,
+        })
+        if (
+            len(result["entries"]) > MAX_CONTEXT_RECORDS
+            or utf8_size(json.dumps(result, ensure_ascii=False)) > MAX_CONTEXT_BYTES - 128
+        ):
+            result["entries"].pop()
+            result["omitted_records"] += 1
     return result
 
 
@@ -2302,18 +2425,27 @@ def main() -> int:
     arguments = build_parser().parse_args()
     try:
         if arguments.command == "collect-lanes":
+            inline = load_json(arguments.inline)
+            issues = load_json(arguments.issues)
+            previous = load_previous_findings(arguments.previous_verdict)
             evidence = collect_lane_evidence(
-                load_json(arguments.inline),
-                load_json(arguments.issues),
+                inline,
+                issues,
                 load_json(arguments.reviews),
                 arguments.head,
-                load_previous_findings(arguments.previous_verdict),
+                previous,
             )
             arguments.output_dir.mkdir(parents=True, exist_ok=True)
             for name, records in evidence.items():
                 (arguments.output_dir / f"{name}.json").write_text(
                     json.dumps(records, indent=2) + "\n", encoding="utf-8"
                 )
+            context = collect_rebuttal_context(
+                inline, issues, arguments.head, evidence["inline-comments"], previous
+            )
+            (arguments.output_dir / "rebuttal-context.json").write_text(
+                json.dumps(context, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
             return 0
         if arguments.command == "match-lane-thread":
             thread = matching_lane_thread(
