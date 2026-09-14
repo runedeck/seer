@@ -128,7 +128,22 @@ jobs:
                       echo "skip:runeseer present; the correctness lane never runs."
                       exit 0
                   fi
-                  files=$(gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --name-only)
+                  # The files API pages past the 300-file cap that makes the
+                  # diff endpoint answer 406 on a large pull request.
+                  files=$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files?per_page=100" \
+                      --jq '.[].filename') \
+                      || { echo "could not list the pull request files; rerun the check"; exit 1; }
+                  # The files API stops at 3000 entries and reports no
+                  # truncation, so the listing must match the count the pull
+                  # request itself carries before it can decide the scope.
+                  expected=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" \
+                      --jq '.changed_files') \
+                      || { echo "could not read the changed-file count; rerun the check"; exit 1; }
+                  listed=$(printf '%s\n' "$files" | grep -c . || true)
+                  if [ "$listed" -ne "$expected" ]; then
+                      echo "the files API listed $listed of $expected changed files; the scope cannot be judged from a partial list"
+                      exit 1
+                  fi
                   substantive=$(printf '%s\n' "$files" | grep -Ev '\.md$' || true)
                   in_scope_md=$(printf '%s\n' "$files" | grep -E '^(docs/specs/|\.github/|runes/[^/]+/(skills|rules)/).*\.md$' || true)
                   if [ -z "$substantive" ] && [ -z "$in_scope_md" ]; then
