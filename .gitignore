@@ -1,2 +1,5 @@
 __pycache__/
 .ruff_cache/
+
+# Quarantine: rune repair and reseal move evidence here, never delete it
+.trash/
