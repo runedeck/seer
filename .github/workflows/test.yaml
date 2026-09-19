@@ -1,0 +1,46 @@
+name: Test
+
+# The review machinery is this repository's own product: its scripts, their
+# tests, and the reusable workflow bodies. The template's Quality workflow
+# covers the shared checks. This one covers what only seer has.
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+concurrency:
+    group: test-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  persist-credentials: false
+
+            - name: Shellcheck scripts
+              run: |
+                  sudo apt-get install -y shellcheck
+                  shellcheck -S warning .github/scripts/*.sh
+
+            - name: Test review machinery
+              run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
+            - name: Actionlint workflows
+              run: |
+                  curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+                  printf '%s  %s\n' \
+                      023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757 \
+                      actionlint_1.7.7_linux_amd64.tar.gz | sha256sum --check
+                  tar -xzf actionlint_1.7.7_linux_amd64.tar.gz actionlint
+                  ./actionlint \
+                      -ignore 'property "workflow_sha" is not defined in object type' \
+                      -ignore 'SC2016'

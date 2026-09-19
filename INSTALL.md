@@ -2,7 +2,7 @@
 
 > Wire the org so seer's reusable lanes can run from any repository's thin callers.
 
-Seer needs no build and no deploy of its own; installing it means giving the org the secrets, labels, and dashboard state the lanes assume, then letting callers reference `runedeck/seer@main`.
+Seer needs no build and no deploy of its own. Installing it means giving the org the secrets, labels, and dashboard state the lanes assume, then letting callers reference `runedeck/seer@main`.
 
 OBJECTIVE: every repository with lane callers can summon a full funnel round.
 
@@ -30,7 +30,7 @@ gh secret set RUNEWRIGHT_APP_KEY --org runedeck --visibility all < runewright.pe
 gh secret set CLAUDE_CODE_OAUTH_TOKEN --org runedeck --visibility all --body "<token from: claude setup-token>"
 ```
 
-Dashboard state cannot be scripted; follow the guide named above and verify with its procedure: a draft pull request pushed twice summons nothing, and one `review` label runs the funnel in order.
+Dashboard state cannot be scripted. Follow the guide named above and verify with its procedure: a draft pull request pushed twice summons nothing, and one `review` label runs the funnel in order.
 
 ## Verify provider evidence
 

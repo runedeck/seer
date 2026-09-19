@@ -1,0 +1,7 @@
+# actionlint has no schema for `job.workflow_sha`, and the jq and GraphQL
+# programs in the review bodies keep `$name` inside single quotes on purpose.
+paths:
+    .github/workflows/**/*.yaml:
+        ignore:
+            - 'property "workflow_sha" is not defined in object type'
+            - 'SC2016'
