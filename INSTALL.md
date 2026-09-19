@@ -64,6 +64,7 @@ The default cascade needs no Bugbot token.
 - HTTP 401 means authentication was rejected. HTTP 403 means access was denied and requires permission or policy inspection.
 - The observed label-consumption HTTP 403 remains unverified after these changes. Existing `issues: write` did not explain that failure.
 - Required approvals count only write-access reviewers: an app holding `contents: read` submits APPROVED reviews that satisfy no ruleset. runeseer therefore carries `contents: read and write`, and the write/approve separation is enforced by its workflow's tool allowlist rather than by the permission bit.
+- runeseer carries `checks: write`. The controller publishes the `ledger` check run on `reviewed_sha` with it and rerequests `owner-seal` after a generation bump. Without it the ledger step fails and no seal can bind.
 - App permission changes take two acceptances: editing the registration (`organizations/<org>/settings/apps/<app>/permissions`) does nothing until the installation accepts the new scope (`organizations/<org>/settings/installations/<id>`). The installations API shows what is actually live.
 - Nothing is retroactive: reviews and tokens carry the scope in force when they were minted. After a permission change, mint a fresh approval with a new round.
 

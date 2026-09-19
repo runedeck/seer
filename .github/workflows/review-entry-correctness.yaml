@@ -2,13 +2,16 @@ name: Review Correctness Entry
 
 # Thin caller: the lane's body lives in this repository. The caller owns
 # the triggers, the concurrency, and the permissions. The controller
-# invites the paid lane on the ready event and on each push to a ready
-# pull request; the body's triage stands it down before any spend. Review
+# invites the paid lane on the ready event, on each push to a ready pull
+# request, and on a reopen. The body's triage stands it down before any
+# spend. A body edit rebuilds the ledger and starts no round. Review
 # labels force a round, while stage labels record settled work. Applying
-# or removing a review label may cancel an active run; other label changes
-# do not. The lane consumes labels with the workflow token when a round
-# ends, and those removals emit no events, so a clean round never
-# re-enters here.
+# or removing a review label, or pushing, cancels an active run: a round
+# on a moved head is void before its model call. Other label changes do
+# not cancel. The lane consumes labels with the workflow token when a
+# round ends, and those removals emit no events, so a clean round never
+# re-enters here. A new review comment runs only the mirror, which stales
+# the approval on a thread the ledger never saw.
 # pull_request_target, deliberately: the caller executes from the base branch,
 # so a pull request cannot rewrite the reviewer, the mirror, or the secret
 # wiring that judges its own head. The body checks out the judged head
@@ -24,6 +27,9 @@ on:
             - unlabeled
             - ready_for_review
             - edited
+    pull_request_review_comment:
+        types:
+            - created
 
 permissions:
     contents: read
@@ -35,7 +41,7 @@ permissions:
 
 concurrency:
     group: review-correctness-${{ github.event.pull_request.number }}
-    cancel-in-progress: ${{ contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) && contains(fromJSON('["review", "review:macroscope", "review:runeseer"]'), github.event.label.name) }}
+    cancel-in-progress: ${{ github.event.action == 'synchronize' || (contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) && contains(fromJSON('["review", "review:macroscope", "review:runeseer"]'), github.event.label.name)) }}
 
 jobs:
     # The ready event is the automatic review request. A queued ready event
@@ -70,13 +76,14 @@ jobs:
                   fi
 
     # The controller runs on the ready event, on every push to a ready
-    # pull request, and on the owner's review:runeseer label. Its triage
-    # stands the paid lane down before any spend. skip:runeseer is checked
-    # here as well, so the lane is never invoked and no runner is spent
-    # standing it down; the mirror then records the skipped lane.
+    # pull request, on a reopen, on a body edit (ledger rebuild only), and
+    # on the owner's review:runeseer label. Its triage stands the paid lane
+    # down before any spend. skip:runeseer is checked here as well, so the
+    # lane is never invoked and no runner is spent standing it down. The
+    # mirror then records the skipped lane.
     review:
         needs: release
-        if: '!cancelled() && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, ''skip:runeseer'') && ((github.event.action == ''labeled'' && github.event.label.name == ''review:runeseer'') || github.event.action == ''synchronize'' || (github.event.action == ''ready_for_review'' && needs.release.outputs.summoned == ''true''))'
+        if: '!cancelled() && github.event_name == ''pull_request_target'' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, ''skip:runeseer'') && ((github.event.action == ''labeled'' && github.event.label.name == ''review:runeseer'') || github.event.action == ''synchronize'' || github.event.action == ''reopened'' || github.event.action == ''edited'' || (github.event.action == ''ready_for_review'' && needs.release.outputs.summoned == ''true''))'
         # A pull request must not modify the reviewer that judges the same head.
         uses: runedeck/seer/.github/workflows/review-correctness.yaml@main
         secrets:
@@ -88,11 +95,12 @@ jobs:
     # rulesets require. Fail-closed: a head the lane did not judge reports
     # failure rather than skipping, because a skipped check satisfies a
     # required status check, and it runs for drafts too so a label applied
-    # in draft can never leave a skipped-green check behind. When the lane
-    # does not run, green requires that Runeseer's latest review on this
-    # exact head is an approval: an approval a later review superseded
-    # stays red, and no event class can redden or green a head past that
-    # judgment.
+    # in draft can never leave a skipped-green check behind. The ledger is
+    # the record: green means a verdict bound to this head and generation
+    # with Runeseer's approval standing, or a recorded stand-down whose
+    # coverage state is printed. A thread the ledger never saw, a moved
+    # generation, or an edited body stales the approval, and the mirror
+    # dismisses it.
     review-context:
         name: review/correctness
         needs: review
@@ -102,15 +110,20 @@ jobs:
         steps:
             - env:
                   GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  RUN_ID: ${{ github.run_id }}
+                  REVIEW_RESULT: ${{ needs.review.result }}
+                  LEDGER_PREFIX: runeseer-ledger-pr
               run: |
                   set -o pipefail
                   # A red mirror names what it saw: the lane job, and the verdict
                   # when one exists for this head. A missing verdict marks a lane
                   # fault rather than a judgment, and each case states its retry.
                   verdict_comments() {
-                      gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100" \
+                      gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
                           --jq '[.[] | select(.user.login == "runeseer[bot]") | select(.body | contains("<!-- runeseer-verdict sha=" + env.HEAD_SHA + " base=" + env.BASE_SHA + " round="))]' \
                           | jq -s 'add // []'
                   }
@@ -125,18 +138,32 @@ jobs:
                           | last // {}
                           | "\(.verdict // ""):\(.restart // "")"'
                   }
-                  # The ledger binds the verdict to (reviewed_sha, generation).
-                  # A thread the ledger never saw, or a generation past the
-                  # verdict's, stales the approval until a re-adjudication.
-                  # A head without a ledger falls through to the review check.
+                  # The newest ledger for this head, trusted by the run that
+                  # uploaded it: this workflow, from the base branch, for this
+                  # pull request. Writes the ledger to $ledger and prints one
+                  # of: none, other-head, stale:late-thread, stale:body,
+                  # stale:generation, unjudged:<generation>, free:<coverage>,
+                  # bound:<generation>. Returns 1 on an API failure.
+                  ledger="$RUNNER_TEMP/runeseer-ledger.json"
                   ledger_state() {
-                      ledger_id=$(gh api --paginate "repos/${{ github.repository }}/actions/artifacts?name=runeseer-ledger-pr${{ github.event.pull_request.number }}&per_page=100" \
+                      candidates=$(gh api --paginate "repos/$REPO/actions/artifacts?name=${LEDGER_PREFIX}${PR}&per_page=100" \
                           --jq '[.artifacts[] | select(.expired == false)]' \
-                          | jq -s -r 'add // [] | sort_by(.created_at) | reverse | .[0].id // empty') || return 1
-                      [ -n "$ledger_id" ] || { echo "none"; return 0; }
-                      gh api "repos/${{ github.repository }}/actions/artifacts/$ledger_id/zip" > "$RUNNER_TEMP/ledger.zip" || return 1
-                      unzip -o "$RUNNER_TEMP/ledger.zip" runeseer-ledger.json -d "$RUNNER_TEMP/ledger" >/dev/null || return 1
-                      ledger="$RUNNER_TEMP/ledger/runeseer-ledger.json"
+                          | jq -s -r 'add // [] | sort_by(.created_at) | reverse | .[] | "\(.id)|\(.workflow_run.id)"') || return 1
+                      found=false
+                      for candidate in $candidates; do
+                          artifact_id=${candidate%%|*}
+                          run_id=${candidate#*|}
+                          run=$(gh api "repos/$REPO/actions/runs/$run_id") || return 1
+                          jq -e --argjson pr "$PR" '
+                              .event == "pull_request_target"
+                              and ([.pull_requests[]?.number] | index($pr) != null)' <<<"$run" >/dev/null || continue
+                          gh api "repos/$REPO/actions/artifacts/$artifact_id/zip" > "$RUNNER_TEMP/ledger.zip" || return 1
+                          unzip -p "$RUNNER_TEMP/ledger.zip" runeseer-ledger.json > "$ledger" 2>/dev/null || continue
+                          jq -e --argjson pr "$PR" '.schema == 1 and .pull_request == $pr' "$ledger" >/dev/null || continue
+                          found=true
+                          break
+                      done
+                      [ "$found" = "true" ] || { echo "none"; return 0; }
                       [ "$(jq -r '.reviewed_sha' "$ledger")" = "$HEAD_SHA" ] || { echo "other-head"; return 0; }
                       thread_query='query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
                           repository(owner: $owner, name: $repo) {
@@ -149,27 +176,44 @@ jobs:
                           }
                       }'
                       gh api graphql --paginate -f query="$thread_query" \
-                          -f owner="${GITHUB_REPOSITORY%/*}" -f repo="${GITHUB_REPOSITORY#*/}" \
-                          -F number="${{ github.event.pull_request.number }}" \
+                          -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" \
                           --jq '[.data.repository.pullRequest.reviewThreads.nodes[].id]' \
                           | jq -s 'add // []' > "$RUNNER_TEMP/thread-ids.json" || return 1
                       late=$(jq --slurpfile live "$RUNNER_TEMP/thread-ids.json" \
                           '[.threads[].id] as $known | [$live[0][] | select(. as $id | $known | index($id) | not)] | length' "$ledger")
+                      body_digest=$(gh api "repos/$REPO/pulls/$PR" --jq '.body // ""' | sha256sum | cut -d' ' -f1) || return 1
                       generation=$(jq -r '.generation' "$ledger")
                       verdict_generation=$(jq -r '.verdict.generation // ""' "$ledger")
+                      coverage=$(jq -r '.coverage // ""' "$ledger")
                       if [ "$late" != "0" ]; then
                           echo "stale:late-thread"
-                      elif [ -z "$verdict_generation" ]; then
-                          echo "unjudged:$generation"
-                      elif [ "$verdict_generation" != "$generation" ]; then
+                      elif [ "$body_digest" != "$(jq -r '.body_digest // ""' "$ledger")" ]; then
+                          echo "stale:body"
+                      elif [ -n "$verdict_generation" ] && [ "$verdict_generation" != "$generation" ]; then
                           echo "stale:generation"
-                      else
+                      elif [ -n "$verdict_generation" ]; then
                           echo "bound:$generation"
+                      elif [ "${coverage#free lanes only}" != "$coverage" ]; then
+                          echo "free:$coverage"
+                      else
+                          echo "unjudged:$generation"
                       fi
+                  }
+                  # A stale approval is withdrawn: the earned approval binds to
+                  # (reviewed_sha, generation), and the generation moved.
+                  dismiss_stale_approval() {
+                      review_id=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+                          --jq '[.[] | select(.user.login == "runeseer[bot]" and .commit_id == env.HEAD_SHA and .state == "APPROVED")]' \
+                          | jq -s -r 'add // [] | sort_by(.submitted_at) | last | .id // empty') || return 0
+                      [ -n "$review_id" ] || return 0
+                      gh api -X PUT "repos/$REPO/pulls/$PR/reviews/$review_id/dismissals" \
+                          -f message="$1" -f event=DISMISS >/dev/null \
+                          && echo "dismissed the stale approval (review $review_id)" \
+                          || echo "could not dismiss the stale approval; the check holds the merge"
                   }
                   explain_lane_failure() {
                       conclusion="$1"
-                      job_url=$(gh api --paginate "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
+                      job_url=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
                           --jq '[.jobs[] | select(.name == "review / correctness")]' \
                           | jq -s -r 'add // [] | first // empty | .html_url // ""') || job_url=""
                       verdict_line=$(verdict_comments \
@@ -185,7 +229,7 @@ jobs:
                   }
                   # Read live overrides before the mirror decides. A failed
                   # label read must not read as an applied override.
-                  labels=$(gh api --paginate "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+                  labels=$(gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
                       --jq '[.[].name]' | jq -s -r 'add // [] | .[]') \
                       || { echo "could not read the live labels; rerun the check"; exit 1; }
                   # skip: means the lane is out of scope for this pull request,
@@ -196,8 +240,8 @@ jobs:
                   fi
                   # ignore:runeseer cannot hide a failed current round. It can
                   # release only a prior judgment when no new round ran.
-                  if [ "${{ needs.review.result }}" != "success" ] && [ "${{ needs.review.result }}" != "skipped" ]; then
-                      explain_lane_failure "${{ needs.review.result }}"
+                  if [ "$REVIEW_RESULT" != "success" ] && [ "$REVIEW_RESULT" != "skipped" ]; then
+                      explain_lane_failure "$REVIEW_RESULT"
                       exit 1
                   fi
                   # ignore: releases a judged lane, never a broken one. Every
@@ -221,53 +265,72 @@ jobs:
                   # A reusable workflow whose inner job skips its guard still
                   # concludes success, so a successful caller result defers to
                   # the inner job's own conclusion. A failed jobs read fails
-                  # this check rather than falling through to the approval
-                  # path, and an unknown conclusion stays red.
-                  if [ "${{ needs.review.result }}" = "success" ]; then
-                      inner=$(gh api --paginate "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" \
+                  # this check, and an unknown conclusion stays red. A green
+                  # inner job proves nothing by itself: the ledger decides.
+                  if [ "$REVIEW_RESULT" = "success" ]; then
+                      inner=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
                           --jq '[.jobs[] | select(.name == "review / correctness")]' \
                           | jq -s -r 'add // [] | first | .conclusion // "missing"') \
                           || { echo "could not read this run's jobs; rerun the check"; exit 1; }
-                      if [ "$inner" = "success" ]; then
-                          echo "the lane judged this head or stood down in scope."
-                          exit 0
-                      fi
-                      if [ "$inner" != "skipped" ]; then
+                      if [ "$inner" != "success" ] && [ "$inner" != "skipped" ]; then
                           explain_lane_failure "$inner"
                           exit 1
                       fi
                   fi
-                  # Per-page jq output merges through jq -s: the runner's gh
-                  # predates --slurp. pipefail keeps a failed reviews read from
-                  # reading as an absent approval.
-                  latest_state=$(gh api --paginate "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews?per_page=100" \
-                      --jq '[.[] | select(.user.login == "runeseer[bot]" and .commit_id == env.HEAD_SHA)]' \
-                      | jq -s -r 'add // [] | sort_by(.submitted_at) | last | .state // ""') \
-                      || { echo "could not read the pull request reviews; rerun the check"; exit 1; }
-                  machine_verdict=$(latest_machine_verdict) \
-                      || { echo "could not read the current Runeseer verdict; rerun the check"; exit 1; }
-                  live=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '[.head.sha, .base.sha] | @tsv') \
+                  live=$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | @tsv') \
                       || { echo "could not read the live pull request; rerun the check"; exit 1; }
                   if [ "$live" != "$HEAD_SHA"$'\t'"$BASE_SHA" ]; then
                       echo "the pull request head or base changed; start a new review round"
                       exit 1
                   fi
+                  state=$(ledger_state) \
+                      || { echo "could not read the ledger for this head; rerun the check"; exit 1; }
+                  case "$state" in
+                      stale:late-thread)
+                          echo "a review thread arrived after the ledger was built; the approval is stale."
+                          echo "push a fix or apply review:runeseer for one more adjudication on this head"
+                          dismiss_stale_approval "A review thread arrived after the verdict; the ledger generation moves and the approval is stale."
+                          exit 1
+                          ;;
+                      stale:body)
+                          echo "the pull request body changed after the ledger was built; the approval is stale until the ledger rebuilds."
+                          dismiss_stale_approval "The pull request body changed after the verdict; the approval is stale."
+                          exit 1
+                          ;;
+                      stale:generation)
+                          echo "the ledger generation moved past the verdict's; the approval is stale until a re-adjudication."
+                          dismiss_stale_approval "The ledger generation moved past the verdict's; the approval is stale."
+                          exit 1
+                          ;;
+                      free:*)
+                          echo "the paid lane stood down; coverage: ${state#free:}"
+                          echo "This green check records the coverage state, not a clean verdict."
+                          exit 0
+                          ;;
+                      unjudged:*)
+                          echo "the ledger records no verdict at generation ${state#unjudged:}; coverage: $(jq -r '.coverage // "not triaged"' "$ledger")"
+                          echo "a round is pending or the lane faulted; rerun this workflow or apply review:runeseer"
+                          exit 1
+                          ;;
+                  esac
+                  # Per-page jq output merges through jq -s: the runner's gh
+                  # predates --slurp. pipefail keeps a failed reviews read from
+                  # reading as an absent approval.
+                  latest_state=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews?per_page=100" \
+                      --jq '[.[] | select(.user.login == "runeseer[bot]" and .commit_id == env.HEAD_SHA)]' \
+                      | jq -s -r 'add // [] | sort_by(.submitted_at) | last | .state // ""') \
+                      || { echo "could not read the pull request reviews; rerun the check"; exit 1; }
+                  machine_verdict=$(latest_machine_verdict) \
+                      || { echo "could not read the current Runeseer verdict; rerun the check"; exit 1; }
                   if [ "$latest_state" = "APPROVED" ] && [ "$machine_verdict" = "clean:none" ]; then
-                      state=$(ledger_state) \
-                          || { echo "could not read the ledger for this head; rerun the check"; exit 1; }
                       case "$state" in
-                          stale:late-thread)
-                              echo "a review thread arrived after the verdict; the ledger generation moved and the approval is stale."
-                              echo "push a fix or apply review:runeseer for one more adjudication on this head"
-                              exit 1
-                              ;;
-                          stale:generation)
-                              echo "the ledger generation moved past the verdict's; the approval is stale until a re-adjudication."
-                              exit 1
+                          bound:*)
+                              echo "Runeseer's latest review approves this head at ledger generation ${state#bound:}; coverage: paid."
+                              exit 0
                               ;;
                       esac
-                      echo "Runeseer's latest review approves this head and current base (ledger: $state)."
-                      exit 0
+                      echo "Runeseer's latest review approves this head, but no trusted ledger binds it (ledger: $state)."
+                      exit 1
                   fi
-                  echo "no standing clean Runeseer verdict for this head and base; apply the review label to start a round"
+                  echo "no standing clean Runeseer verdict for this head and base (ledger: $state); apply the review label to start a round"
                   exit 1

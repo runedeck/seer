@@ -12,14 +12,15 @@ Seer is the review machinery behind two GitHub Apps: **runeseer**, the reviewing
 |                      |                                 | Missing reviews, provider failures, and moved heads preserve the request. |
 | `review-cursor`      | `review:cursor` label           | Dispatches optional Bugbot. A failed dispatch preserves the request. |
 | `review-correctness` | ready, push to a ready pull     | The controller. Builds the ledger from the API by lane login, triages    |
-|                      | request, `review:runeseer` label | the head, adjudicates the free lanes' findings, records a verdict bound  |
-|                      |                                 | to the head and ledger generation, earns the approval on a clean verdict |
-|                      |                                 | with every thread disposed, and consumes the review labels.              |
+|                      | request, reopen, body edit      | the head, adjudicates the free lanes' findings, records a verdict bound  |
+|                      | (ledger only), `review:runeseer` | to the head and ledger generation, resolves the threads the verdict      |
+|                      | label                           | disposed as `fixed`, earns the approval on a clean verdict with every    |
+|                      |                                 | thread disposed, and consumes the review labels.                         |
 | `autofix-suggest`    | `review:autofix` label          | Untrusted half: runs the fixers with no secrets, uploads a patch.          |
 | `autofix-comment`    | completed `autofix-suggest`     | Trusted half: binds the artifact to its run, posts the suggestion.         |
 | `congrats`           | push to `main`                  | Greets a contributor's first merged pull request.                          |
 | `issue-dedup`        | issue opened                    | Flags probable duplicates, referencing only gathered candidates.           |
-| `thread-resolver`    | push to a pull request          | Resolves exactly the threads the ledger's verdict disposed as `fixed`.   |
+| `thread-resolver`    | push to a pull request          | Retired: resolution lives in the correctness round. Callers can drop it. |
 | `dashboard`          | schedule, runs here             | Sweeps the org for pull requests waiting only on the owner and keeps       |
 |                      |                                 | the "Awaiting owner review" issue current.                                 |
 
@@ -45,6 +46,14 @@ An empty value blocks the cascade with a configuration error. [INSTALL.md](INSTA
 The cascade caller grants `contents: read`, `checks: read`, `issues: write`, and `pull-requests: write`.
 Workflow-token consumption emits no workflow event. App tokens dispatch downstream labels but never consume the entry request.
 Only a new `review` label event cancels an active cascade. An `unlabeled` event does not cancel it.
+
+## Known gaps
+
+- The open-seal is verified by `owner-seal`, which lives in the skeleton track and does not exist yet. Until it does, the controller starts the funnel on any ready event of a same-repository pull request, and a contributor with push access can ready a draft by hand and spend a paid round. The nonce line `Open-Seal-Nonce:` is not checked here.
+- A late review thread runs the mirror, which reports the approval stale and dismisses it. The ledger generation itself moves on the next controller run. A late lane check run (a free lane that completes after the controller ran) moves the generation only on the next pull request event. The `check_run` event carries no pull request payload, so the entry workflow cannot route it to the controller.
+- The lane table accepts an optional `check_slug` per lane for the app slug that reports its check runs. The Codex and Cursor slugs are not verified against a live head and default to the login slug.
+- The ledger has two carriers. The artifact holds the full record and is trusted by the run that uploaded it. The check run named `ledger` on `reviewed_sha`, written under the runeseer app, carries one line `ledger: {artifact_id, digest, generation, pull_request, reviewed_sha}`. `owner-seal` and `rune sign` read that line, and a reader who needs the threads fetches the artifact and proves it by the digest. The runeseer app needs `checks: write` for this, an installation change the owner accepts once.
+- A round-start marker is a Runeseer comment. A user with write access can delete it, and the budget then undercounts by that round.
 
 ## Canon
 

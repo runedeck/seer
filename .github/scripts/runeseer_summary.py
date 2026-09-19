@@ -33,6 +33,10 @@ REVIEW_FOOTER_RE = re.compile(
 )
 VERDICTS = {"clean", "findings"}
 RESTARTS = {"none", "macroscope"}
+# The lane table on the protected default branch is the one source of
+# lanes. These maps hold the built-in table until configure_lanes replaces
+# them from the fetched table, so a lane added as one table row reaches
+# the formatter without a code change.
 LANE_LOGINS = {
     "cursor[bot]": "cursor",
     "macroscopeapp[bot]": "macroscope",
@@ -46,6 +50,7 @@ LANE_NAMES = {
     "coderabbit": "CodeRabbit",
     "codex": "Codex",
 }
+REVIEWER_LANE = "runeseer"
 # The controller's ledger. The lane table on the protected default branch
 # names the expected lanes; every one of them records one of these states
 # on every head. Dispositions come from the verdict, never from the
@@ -66,7 +71,16 @@ LANE_KINDS = frozenset({"free", "paid"})
 DISPOSITIONS = frozenset({"fixed", "rejected", "owner"})
 PAID_ROUND_LIMIT = 3
 LANE_VOLUME_LIMIT = 40
-PROSE_SCOPE_RE = re.compile(r"^(docs/specs/|runes/|\.github/workflows/)")
+# The judged scope: the specifications, the delta specs of a change, the
+# runes, and everything under .github. A file removed or renamed is never
+# prose, whatever its name.
+PROSE_SCOPE_RE = re.compile(r"^(docs/specs/|docs/changes/[^/]+/specs/|runes/|\.github/)")
+NEVER_PROSE_STATUSES = frozenset({"D", "removed", "renamed", "renamed-from", "copied"})
+ROUND_START_MARKER = "<!-- runeseer-round-start sha={sha} base={base} round={round} -->"
+ROUND_START_RE = re.compile(
+    r"<!-- runeseer-round-start sha=(?P<sha>[0-9a-f]{40}) base=(?P<base>[0-9a-f]{40})"
+    r" round=(?P<round>[1-9][0-9]*) -->"
+)
 INSTRUCTION_PATTERN = (
     r"(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)"
     r"|(^|/)copilot-instructions\.md$|^\.mcp\.json$|^\.rune$"
@@ -1246,11 +1260,36 @@ def load_lane_table(value: Any) -> list[dict[str, Any]]:
         validate_plain_text(lane.get("name"), f"The lane {lane_id} name")
         if lane.get("kind") not in LANE_KINDS:
             raise SummaryError(f"The lane {lane_id} kind must be free or paid.")
+        check_slug = lane.get("check_slug")
+        if check_slug is not None and (
+            not isinstance(check_slug, str) or not re.fullmatch(r"[a-z0-9-]+", check_slug)
+        ):
+            raise SummaryError(f"The lane {lane_id} check_slug must be a lowercase slug.")
         if lane_id in seen_ids or login_slug(login) in seen_logins:
             raise SummaryError(f"The lane {lane_id} repeats an id or login.")
         seen_ids.add(lane_id)
         seen_logins.add(login_slug(login))
     return lanes
+
+
+def configure_lanes(lanes: list[dict[str, Any]]) -> None:
+    """Replace the built-in lane maps with the fetched lane table.
+
+    The reviewer lane never enters LANE_LOGINS: its comments are the
+    verdict's own, not lane evidence for the model.
+    """
+    LANE_LOGINS.clear()
+    LANE_NAMES.clear()
+    for lane in lanes:
+        LANE_NAMES[lane["id"]] = lane["name"]
+        if lane["id"] != REVIEWER_LANE:
+            LANE_LOGINS[lane["login"]] = lane["id"]
+
+
+def lane_check_slug(lane: dict[str, Any]) -> str:
+    """The app slug whose check runs report this lane, the login slug by default."""
+    slug = lane.get("check_slug")
+    return slug if isinstance(slug, str) and slug else login_slug(lane["login"])
 
 
 def lane_for_login(lanes: list[dict[str, Any]], login: Any) -> str | None:
@@ -1344,7 +1383,7 @@ def lane_statuses(
             statuses[lane_id] = "skipped"
             continue
         has_threads = any(thread["lane"] == lane_id for thread in threads)
-        slug = login_slug(lane["login"])
+        slug = lane_check_slug(lane)
         runs = [
             run
             for run in check_runs
@@ -1414,19 +1453,43 @@ def build_ledger(
 
     A new thread, a lane status change, or a body edit on the same head
     increments the generation. A new head starts at generation one and
-    carries no disposition forward.
+    carries no disposition forward. The reviewer lane's status is the
+    controller's own record, so the same head keeps it unless an override
+    names it. A work item recorded on an earlier head is bound: a body
+    that names another change is a fault, not a rekey of the budget.
     """
     if not re.fullmatch(r"[0-9a-f]{40}", head):
         raise SummaryError("The ledger head must be a full commit SHA.")
     if type(paid_rounds) is not int or paid_rounds < 0:
         raise SummaryError("The paid round count must be a nonnegative integer.")
     threads = collect_threads(thread_nodes, lanes)
+    overrides = dict(overrides or {})
+    if (
+        previous is not None
+        and REVIEWER_LANE not in overrides
+        and previous.get("reviewed_sha") == head
+        and isinstance(previous.get("lanes"), dict)
+        and REVIEWER_LANE in previous["lanes"]
+    ):
+        overrides[REVIEWER_LANE] = previous["lanes"][REVIEWER_LANE]
     statuses = lane_statuses(lanes, threads, check_runs, labels, overrides)
     digest = body_digest(body)
+    work_item = work_item_from_body(body, pull_number)
     generation = 1
     verdict: dict[str, Any] | None = None
+    coverage: str | None = None
     if previous is not None:
         previous = validate_ledger(previous)
+        earlier_item = previous.get("work_item")
+        if (
+            isinstance(earlier_item, str)
+            and earlier_item.startswith("docs/changes/")
+            and earlier_item != work_item
+        ):
+            raise SummaryError(
+                f"The work item changed from {earlier_item} to {work_item}: "
+                "the body must not rename the change after ready."
+            )
         if previous["reviewed_sha"] == head:
             carried = {
                 thread["id"]: thread
@@ -1445,21 +1508,23 @@ def build_ledger(
             same_body = digest == previous.get("body_digest")
             generation = previous["generation"]
             verdict = previous.get("verdict")
+            coverage = previous.get("coverage")
             if not (same_threads and same_lanes and same_body):
                 generation += 1
                 verdict = None
+                coverage = None
     return {
         "schema": LEDGER_SCHEMA,
         "pull_request": pull_number,
         "reviewed_sha": head,
         "base": base,
         "generation": generation,
-        "work_item": work_item_from_body(body, pull_number),
+        "work_item": work_item,
         "paid_rounds": paid_rounds,
         "body_digest": digest,
         "lanes": statuses,
         "threads": threads,
-        "coverage": None,
+        "coverage": coverage,
         "verdict": verdict,
     }
 
@@ -1471,11 +1536,21 @@ def open_threads(ledger: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def is_prose_only(files: list[str], instruction_pattern: str = INSTRUCTION_PATTERN) -> bool:
-    """A diff is prose-only when every file is markdown outside the judged scope."""
+    """A diff is prose-only when every file is markdown outside the judged scope.
+
+    Each entry is a path, or a status and a path separated by a tab as
+    `git diff --name-status --no-renames` prints them. A removal or a
+    rename is never prose: the old path leaves the tree under the new name.
+    """
     if not files:
         return False
     instruction_re = re.compile(instruction_pattern)
-    for path in files:
+    for entry in files:
+        status, separator, path = entry.partition("\t")
+        if not separator:
+            status, path = "", entry
+        if status.startswith(("R", "C")) or status in NEVER_PROSE_STATUSES:
+            return False
         if not path.endswith(".md"):
             return False
         if PROSE_SCOPE_RE.search(path) or instruction_re.search(path):
@@ -1522,6 +1597,35 @@ def coverage_state(reason: str | None) -> str:
 STANDDOWN_MARKER = "<!-- runeseer-standdown head={head} generation={generation} -->"
 
 
+LEDGER_LINE_PREFIX = "ledger: "
+
+
+def ledger_digest(ledger_bytes: bytes) -> str:
+    """The sha256 of the ledger artifact, byte for byte as uploaded."""
+    return hashlib.sha256(ledger_bytes).hexdigest()
+
+
+def ledger_line(ledger_bytes: bytes, artifact_id: int, ledger: dict[str, Any] | None = None) -> str:
+    """The first line of the `ledger` check run's output text.
+
+    The seal verifiers read this line and nothing else from the check run:
+    the merge-seal binds reviewed_sha, generation, and the digest. The
+    artifact id lets a reader fetch the full ledger and prove it by the
+    digest. Keys are sorted and the JSON is compact so the line is stable.
+    """
+    parsed = validate_ledger(ledger if ledger is not None else json.loads(ledger_bytes))
+    if not isinstance(artifact_id, int) or artifact_id <= 0:
+        raise SummaryError("A ledger line needs the positive artifact id of the uploaded ledger.")
+    record = {
+        "artifact_id": artifact_id,
+        "digest": ledger_digest(ledger_bytes),
+        "generation": parsed["generation"],
+        "pull_request": parsed["pull_request"],
+        "reviewed_sha": parsed["reviewed_sha"],
+    }
+    return LEDGER_LINE_PREFIX + json.dumps(record, sort_keys=True, separators=(",", ":"))
+
+
 def standdown_notice(ledger: dict[str, Any]) -> str:
     """One owner-facing line for a stand-down, never a clean claim."""
     ledger = validate_ledger(ledger)
@@ -1543,30 +1647,50 @@ def standdown_notice(ledger: dict[str, Any]) -> str:
 
 
 def validate_explicit_dispositions(
-    value: Any, threads: dict[int, dict[str, Any]]
-) -> dict[int, tuple[str, str | None]]:
+    value: Any, threads: list[dict[str, Any]]
+) -> dict[str, tuple[str, str | None]]:
+    """Explicit dispositions keyed by thread node id.
+
+    An entry names its thread by `thread_id`, or by `comment_id` when the
+    thread's first comment carries one. A thread without a comment id can
+    still be disposed by its node id.
+    """
     if value is None:
         return {}
     if not isinstance(value, list):
         raise SummaryError("The dispositions field must be an array.")
-    explicit: dict[int, tuple[str, str | None]] = {}
+    by_comment = {
+        thread["comment_id"]: thread["id"]
+        for thread in threads
+        if thread.get("comment_id") is not None
+    }
+    by_thread = {thread["id"] for thread in threads}
+    explicit: dict[str, tuple[str, str | None]] = {}
     for item in value:
         if not isinstance(item, dict):
             raise SummaryError("Each disposition must be an object.")
         comment_id = item.get("comment_id")
-        if type(comment_id) is not int or comment_id < 1:
-            raise SummaryError("Each disposition needs a positive comment ID.")
-        if comment_id not in threads:
+        thread_id = item.get("thread_id")
+        if thread_id is not None:
+            if not isinstance(thread_id, str) or thread_id not in by_thread:
+                raise SummaryError(
+                    f"The disposition for thread {thread_id} names no open ledger thread."
+                )
+        elif type(comment_id) is not int or comment_id < 1:
+            raise SummaryError("Each disposition needs a positive comment ID or a thread ID.")
+        elif comment_id not in by_comment:
             raise SummaryError(
                 f"The disposition for comment {comment_id} names no open ledger thread."
             )
+        else:
+            thread_id = by_comment[comment_id]
         disposition = item.get("disposition")
         if disposition not in DISPOSITIONS:
             raise SummaryError("Each disposition must be fixed, rejected, or owner.")
         reason = item.get("reason")
         if disposition == "rejected" or reason is not None:
             validate_plain_text(reason, "Each rejected disposition reason")
-        explicit[comment_id] = (disposition, reason)
+        explicit[thread_id] = (disposition, reason)
     return explicit
 
 
@@ -1580,12 +1704,9 @@ def derive_dispositions(
     confirmed note is rejected as a note. A confirmed defect stays open.
     Runeseer's own thread is fixed when no open finding still names it.
     """
-    by_comment = {
-        thread["comment_id"]: thread
-        for thread in open_threads(ledger)
-        if thread.get("comment_id") is not None
-    }
-    explicit = validate_explicit_dispositions(verdict.get("dispositions"), by_comment)
+    explicit = validate_explicit_dispositions(
+        verdict.get("dispositions"), open_threads(ledger)
+    )
     judgments: dict[int, dict[str, Any]] = {}
     for judgment in verdict.get("lane_judgments", []):
         judgments.setdefault(judgment["comment_id"], judgment)
@@ -1599,8 +1720,8 @@ def derive_dispositions(
         disposition: str | None = None
         reason: str | None = None
         comment_id = thread.get("comment_id")
-        if comment_id in explicit:
-            disposition, reason = explicit[comment_id]
+        if thread["id"] in explicit:
+            disposition, reason = explicit[thread["id"]]
         elif comment_id in open_finding_ids:
             disposition = None
         elif comment_id in judgments:
@@ -1644,6 +1765,17 @@ def apply_verdict_to_ledger(
             thread["disposition"] = disposed["disposition"]
             thread["reason"] = disposed.get("reason")
     ledger["coverage"] = "paid"
+    # The paid lane's terminal status is the controller's own record: the
+    # reviewer posts reviews, not check runs, so no check run reports it.
+    if REVIEWER_LANE in ledger["lanes"]:
+        own_threads = any(
+            thread.get("lane") == REVIEWER_LANE for thread in ledger["threads"]
+        )
+        ledger["lanes"][REVIEWER_LANE] = (
+            "completed"
+            if verdict.get("findings") or own_threads
+            else "completed-no-findings"
+        )
     ledger["verdict"] = {
         "sha": verdict["sha"],
         "generation": verdict["generation"],
@@ -2110,13 +2242,40 @@ def parse_canonical_summary_marker(body: str) -> dict[str, Any] | None:
     }
 
 
-def marker_round(body: str, base: str | None = None) -> int:
+def marker_round(body: str, base: str | None = None, dispatches: bool = False) -> int:
+    """The highest round the reviewer recorded in this comment history.
+
+    With `dispatches`, the round-start markers count too: a round voided
+    after the model call still spent the budget, and the count is not
+    keyed to a base, so a moved base never restarts it.
+    """
     rounds = [
         int(match.group("round"))
         for match in VERDICT_MARKER_RE.finditer(body)
         if base is None or match.group("base") == base
     ]
+    if dispatches:
+        rounds.extend(
+            int(match.group("round")) for match in ROUND_START_RE.finditer(body)
+        )
     return max(rounds, default=0)
+
+
+def round_start_marker(sha: str, base: str, round_number: int, generation: int) -> str:
+    """The dispatch record the lane posts before the model call."""
+    for value in (sha, base):
+        if not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise SummaryError("The round-start marker needs full commit SHAs.")
+    if type(round_number) is not int or round_number < 1:
+        raise SummaryError("The round-start marker needs a positive round.")
+    if type(generation) is not int or generation < 1:
+        raise SummaryError("The round-start marker needs a positive generation.")
+    marker = ROUND_START_MARKER.format(sha=sha, base=base, round=round_number)
+    return (
+        f"{marker}\n"
+        f"review/correctness round {round_number} started on `{sha[:8]}` "
+        f"at ledger generation {generation}."
+    )
 
 
 def find_summary_comment(
@@ -2784,6 +2943,8 @@ def write_output(body: str, output: Path | None) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    # The lane table replaces the built-in lane maps for every command.
+    parser.add_argument("--lane-table", type=Path, dest="lane_table_global")
     commands = parser.add_subparsers(dest="command", required=True)
 
     collect_parser = commands.add_parser("collect-lanes")
@@ -2806,6 +2967,13 @@ def build_parser() -> argparse.ArgumentParser:
     marker_parser = commands.add_parser("marker-round")
     marker_parser.add_argument("--history", type=Path, required=True)
     marker_parser.add_argument("--base")
+    marker_parser.add_argument("--dispatches", action="store_true")
+
+    start_parser = commands.add_parser("round-start")
+    start_parser.add_argument("--sha", required=True)
+    start_parser.add_argument("--base", required=True)
+    start_parser.add_argument("--round", type=int, required=True)
+    start_parser.add_argument("--generation", type=int, required=True)
 
     owner_parser = commands.add_parser("owner-from-codeowners")
     owner_parser.add_argument("--codeowners", type=Path, required=True)
@@ -2956,6 +3124,10 @@ def build_parser() -> argparse.ArgumentParser:
     standdown_parser = commands.add_parser("standdown-notice")
     standdown_parser.add_argument("--ledger", type=Path, required=True)
 
+    ledger_line_parser = commands.add_parser("ledger-line")
+    ledger_line_parser.add_argument("--ledger", type=Path, required=True)
+    ledger_line_parser.add_argument("--artifact-id", type=int, required=True)
+
     ledger_parser = commands.add_parser("read-ledger")
     ledger_parser.add_argument("--verdict", type=Path, required=True)
     ledger_parser.add_argument("--sha", required=True)
@@ -2987,6 +3159,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     arguments = build_parser().parse_args()
     try:
+        if arguments.lane_table_global is not None:
+            configure_lanes(load_lane_table(load_json(arguments.lane_table_global)))
+        if arguments.command == "round-start":
+            print(
+                round_start_marker(
+                    arguments.sha, arguments.base, arguments.round, arguments.generation
+                )
+            )
+            return 0
         if arguments.command == "collect-lanes":
             inline = load_json(arguments.inline)
             issues = load_json(arguments.issues)
@@ -3027,7 +3208,11 @@ def main() -> int:
             )
             return 0
         if arguments.command == "marker-round":
-            print(marker_round(read_utf8(arguments.history), arguments.base))
+            print(
+                marker_round(
+                    read_utf8(arguments.history), arguments.base, arguments.dispatches
+                )
+            )
             return 0
         if arguments.command == "owner-from-codeowners":
             print(repository_owner(read_utf8(arguments.codeowners)))
@@ -3220,6 +3405,9 @@ def main() -> int:
             return 0
         if arguments.command == "standdown-notice":
             print(standdown_notice(load_json(arguments.ledger)))
+            return 0
+        if arguments.command == "ledger-line":
+            print(ledger_line(arguments.ledger.read_bytes(), arguments.artifact_id))
             return 0
         if arguments.command == "format":
             body = format_review(

@@ -1,13 +1,13 @@
 name: Thread Resolver
 
-# Reusable body of ledger-driven thread resolution. The resolver acts on
-# the controller's ledger: it resolves exactly the threads the verdict
-# disposed as fixed, and nothing else. Rejected and owner threads stay
-# open. Callers trigger on pull_request_target synchronize. This body
-# never checks out or executes pull request code, and fork pull requests
-# need the base-context token's pull-requests write. A Resolves-Thread:
+# Retired body, kept so existing callers stay green. Thread resolution
+# has one path now: the correctness lane's resolve step, which acts on
+# the ledger the round just recorded, with the reviewer identity, on the
+# head the verdict judged. A separate resolver read the newest ledger
+# artifact on the next push and raced the controller run for that push,
+# so it acted on the previous head's verdict or on none. A Resolves-Thread:
 # trailer on a fix commit stays bookkeeping for the verdict; it resolves
-# nothing by itself.
+# nothing by itself. Callers can drop their stub at any time.
 on:
     workflow_call:
         secrets:
@@ -20,101 +20,7 @@ jobs:
     resolve:
         name: resolve
         runs-on: ubuntu-latest
-        timeout-minutes: 5
-        env:
-            HAS_RUNESEER_CREDENTIALS: ${{ secrets.RUNESEER_APP_ID != '' && secrets.RUNESEER_APP_KEY != '' }}
+        timeout-minutes: 1
         steps:
-            # The workflow token cannot resolve threads that Runeseer created.
-            # Callers must pass both secrets to resolve those threads.
-            # The fallback keeps older callers operational during rollout.
-            - id: runeseer
-              name: Mint the Runeseer token
-              if: env.HAS_RUNESEER_CREDENTIALS == 'true'
-              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
-              with:
-                  app-id: ${{ secrets.RUNESEER_APP_ID }}
-                  private-key: ${{ secrets.RUNESEER_APP_KEY }}
-
-            # The newest ledger for this pull request names every thread and
-            # its disposition. Only a thread the verdict listed as fixed
-            # resolves, matched by its node id against the pull request's
-            # own thread map, never passed to the API raw.
-            - name: Resolve threads the verdict disposed as fixed
-              uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-              env:
-                  RUNESEER_TOKEN_ACTIVE: ${{ steps.runeseer.outputs.token != '' }}
-              with:
-                  github-token: ${{ steps.runeseer.outputs.token || github.token }}
-                  script: |
-                      const pull_number = context.payload.pull_request.number;
-                      const name = `runeseer-ledger-pr${pull_number}`;
-                      const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
-                          ...context.repo, name, per_page: 100,
-                      });
-                      const live = artifacts
-                          .filter(artifact => !artifact.expired)
-                          .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
-                      if (live.length === 0) {
-                          core.info('no ledger for this pull request; nothing to resolve');
-                          return;
-                      }
-                      const download = await github.rest.actions.downloadArtifact({
-                          ...context.repo, artifact_id: live[0].id, archive_format: 'zip',
-                      });
-                      // The artifact is a zip with one file; the runner's
-                      // unzip reads it, so no zip parser lives in this script.
-                      const fs = require('fs');
-                      const path = require('path');
-                      const zipPath = path.join(process.env.RUNNER_TEMP, 'runeseer-ledger.zip');
-                      fs.writeFileSync(zipPath, Buffer.from(download.data));
-                      const unzipped = await exec.getExecOutput('unzip', ['-p', zipPath, 'runeseer-ledger.json']);
-                      const ledger = JSON.parse(unzipped.stdout);
-                      if (ledger.schema !== 1 || !Array.isArray(ledger.threads)) {
-                          throw new Error('the ledger is not a schema 1 ledger');
-                      }
-                      if (!ledger.verdict) {
-                          core.info('the ledger carries no verdict; nothing to resolve');
-                          return;
-                      }
-                      const fixed = new Set(
-                          ledger.threads
-                              .filter(thread => thread.disposition === 'fixed' && typeof thread.id === 'string')
-                              .map(thread => thread.id));
-                      if (fixed.size === 0) {
-                          core.info('the verdict lists no fixed thread');
-                          return;
-                      }
-                      const threads = [];
-                      let cursor = null;
-                      do {
-                          const page = await github.graphql(
-                              `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
-                                  repository(owner: $owner, name: $repo) {
-                                      pullRequest(number: $number) {
-                                          reviewThreads(first: 100, after: $cursor) {
-                                              pageInfo { hasNextPage endCursor }
-                                              nodes { id isResolved }
-                                          }
-                                      }
-                                  }
-                              }`,
-                              { owner: context.repo.owner, repo: context.repo.repo, number: pull_number, cursor });
-                          const connection = page.repository.pullRequest.reviewThreads;
-                          threads.push(...connection.nodes);
-                          cursor = connection.pageInfo.hasNextPage ? connection.pageInfo.endCursor : null;
-                      } while (cursor);
-                      for (const thread of threads) {
-                          if (!fixed.has(thread.id)) continue;
-                          if (thread.isResolved) continue;
-                          try {
-                              await github.graphql(
-                                  `mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }`,
-                                  { id: thread.id });
-                              core.info(`resolved ${thread.id} (fixed at ${ledger.reviewed_sha} generation ${ledger.verdict.generation})`);
-                          } catch (e) {
-                              const guidance = process.env.RUNESEER_TOKEN_ACTIVE === 'true'
-                                  ? ''
-                                  : ' Pass the Runeseer App secrets from the caller.';
-                              core.warning(`could not resolve ${thread.id}: ${e.message}.${guidance}`);
-                          }
-                      }
+            - run: |
+                  echo "thread resolution moved into the review/correctness round; this caller can drop its thread-resolver stub."

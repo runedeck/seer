@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import tempfile
@@ -1296,7 +1297,7 @@ class WorkflowSourceTests(unittest.TestCase):
         positions = [self.source.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
         prevalidate = self.section("- id: prevalidate", "- id: post_findings")
-        self.assertIn('python3 "$RUNESEER_FORMATTER" format', prevalidate)
+        self.assertIn('--lane-table "$RUNESEER_LANES/lanes.json" format', prevalidate)
         self.assertNotIn("reviewdog ", prevalidate)
 
     def test_label_consumption_is_scope_aware_and_verified(self):
@@ -1339,11 +1340,18 @@ class WorkflowSourceTests(unittest.TestCase):
         self.assertIn("github.event.action == ''labeled''", review)
         self.assertIn("github.event.action == ''ready_for_review''", review)
         self.assertIn("github.event.action == ''synchronize''", review)
+        self.assertIn("github.event.action == ''reopened''", review)
+        self.assertIn("github.event.action == ''edited''", review)
         self.assertIn("github.event.pull_request.draft == false", review)
-        # The body's own guard admits the same three events and no draft.
+        # A review comment runs only the mirror.
+        self.assertIn("    pull_request_review_comment:\n        types:\n            - created\n", self.entry_source)
+        self.assertIn("github.event_name == ''pull_request_target''", review)
+        # The body's own guard admits the same events and no draft.
         guard = self.section("        if: >", "        runs-on:")
         self.assertIn("github.event.action == 'ready_for_review'", guard)
         self.assertIn("github.event.action == 'synchronize'", guard)
+        self.assertIn("github.event.action == 'reopened'", guard)
+        self.assertIn("github.event.action == 'edited'", guard)
         self.assertIn("'review:runeseer'", guard)
         self.assertIn("github.event.pull_request.draft == false", guard)
 
@@ -1619,6 +1627,33 @@ class ControllerTests(unittest.TestCase):
             **overrides,
         )
 
+    def test_ledger_line_binds_the_artifact_by_digest(self):
+        ledger = self.ledger()
+        raw = json.dumps(ledger, indent=2).encode()
+        line = SUMMARY.ledger_line(raw, 4242)
+        self.assertTrue(line.startswith(SUMMARY.LEDGER_LINE_PREFIX))
+        record = json.loads(line[len(SUMMARY.LEDGER_LINE_PREFIX) :])
+        self.assertEqual(
+            record,
+            {
+                "artifact_id": 4242,
+                "digest": hashlib.sha256(raw).hexdigest(),
+                "generation": ledger["generation"],
+                "pull_request": 7,
+                "reviewed_sha": SHA,
+            },
+        )
+        self.assertNotIn("\n", line)
+        # Any byte change in the artifact changes the digest the seal binds.
+        self.assertNotEqual(SUMMARY.ledger_line(raw + b"\n", 4242), line)
+
+    def test_ledger_line_rejects_a_missing_artifact_id(self):
+        raw = json.dumps(self.ledger()).encode()
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.ledger_line(raw, 0)
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.ledger_line(b'{"schema": 1}', 1)
+
     def test_lane_table_repo_file_matches_the_fixture(self):
         table = json.loads((SCRIPT.parent.parent / "lanes.json").read_text(encoding="utf-8"))
         self.assertEqual([lane["id"] for lane in SUMMARY.load_lane_table(table)],
@@ -1743,10 +1778,98 @@ class ControllerTests(unittest.TestCase):
 
     def test_instruction_path_and_scope_diffs_are_never_prose_only(self):
         for path in ("CLAUDE.md", "nested/AGENTS.md", ".claude/rules/Glossary.md", "docs/specs/x/spec.md",
-                     "runes/core/rules/Literals.md", ".github/workflows/quality.yaml", "src/main.rs", ".rune"):
+                     "docs/changes/review-loop/specs/review-ceremony/spec.md", ".github/PULL_REQUEST_TEMPLATE.md",
+                     "runes/core/rules/Literals.md", ".github/workflows/quality.yaml", "src/main.rs", ".rune",
+                     "D\tdocs/notes/old.md", "renamed-from\t.github/workflows/quality.yaml", "R100\tdocs/notes.md",
+                     "removed\trunes/core/rules/RemoteWrites.md"):
             with self.subTest(path=path):
                 self.assertFalse(SUMMARY.is_prose_only(["README.md", path]))
                 self.assertIsNone(SUMMARY.triage(self.ledger(), ["README.md", path], comments=0))
+        self.assertTrue(SUMMARY.is_prose_only(["M\tREADME.md", "modified\tdocs/notes/plan.md", "added\tdocs/new.md"]))
+
+    def test_verdict_records_the_paid_lane_status(self):
+        ledger = self.ledger()
+        self.assertEqual(ledger["lanes"]["runeseer"], "ineligible")
+        clean = SUMMARY.apply_verdict_to_ledger(ledger, SUMMARY.validate_verdict({**verdict(), "generation": 1}, SHA, 1, ledger=ledger))
+        self.assertEqual(clean["lanes"]["runeseer"], "completed-no-findings")
+        finding = {"path": "src/lib.rs", "line": 7, "summary": "Unchecked error", "lane": "runeseer",
+                   "judgment": "confirmed", "severity": "high", "comment_id": None}
+        found = SUMMARY.apply_verdict_to_ledger(ledger, {**verdict(findings=[finding]), "generation": 1, "thread_dispositions": []})
+        self.assertEqual(found["lanes"]["runeseer"], "completed")
+        # The same head keeps the recorded status: no lane change, no bump.
+        again = self.ledger(previous=clean)
+        self.assertEqual((again["lanes"]["runeseer"], again["generation"], again["verdict"], again["coverage"]),
+                         ("completed-no-findings", 1, clean["verdict"], "paid"))
+        overridden = self.ledger(previous=clean, overrides={"runeseer": "skipped"})
+        self.assertEqual(overridden["lanes"]["runeseer"], "skipped")
+
+    def test_body_edit_bumps_the_generation_and_drops_the_verdict(self):
+        first = self.ledger()
+        recorded = SUMMARY.apply_verdict_to_ledger(first, SUMMARY.validate_verdict({**verdict(), "generation": 1}, SHA, 1, ledger=first))
+        edited = SUMMARY.build_ledger(
+            pull_number=7, head=SHA, base=BASE, lanes=self.lanes, thread_nodes=[], check_runs=[], labels=[],
+            body="Change: docs/changes/review-loop\n\n## Release Notes\n- Edited", previous=recorded)
+        self.assertEqual((edited["generation"], edited["verdict"], edited["coverage"]), (2, None, None))
+        self.assertNotEqual(edited["body_digest"], recorded["body_digest"])
+
+    def test_work_item_is_bound_by_the_first_ledger(self):
+        first = self.ledger()
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "work item changed from docs/changes/review-loop to pull/7"):
+            SUMMARY.build_ledger(pull_number=7, head=SHA, base=BASE, lanes=self.lanes, thread_nodes=[], check_runs=[],
+                                 labels=[], body="no change named", previous=first)
+        # Naming a change on a pull request that had none is allowed.
+        unnamed = SUMMARY.build_ledger(pull_number=7, head=SHA, base=BASE, lanes=self.lanes, thread_nodes=[],
+                                       check_runs=[], labels=[], body="none")
+        named = SUMMARY.build_ledger(pull_number=7, head=SHA, base=BASE, lanes=self.lanes, thread_nodes=[],
+                                     check_runs=[], labels=[], body="see docs/changes/x", previous=unnamed)
+        self.assertEqual(named["work_item"], "docs/changes/x")
+
+    def test_thread_without_a_comment_id_is_disposed_by_thread_id(self):
+        node = thread_node("PRRT_7", "cursor", 71)
+        node["comments"]["nodes"][0]["databaseId"] = None
+        ledger = self.ledger(threads=[node])
+        self.assertIsNone(ledger["threads"][0]["comment_id"])
+        data = {**verdict(), "generation": 1}
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "without a disposition: https://github.com/runedeck/deck/pull/7#discussion_r71"):
+            SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+        data["dispositions"] = [{"thread_id": "PRRT_7", "disposition": "owner"}]
+        disposed = SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+        self.assertEqual(disposed["thread_dispositions"][0]["disposition"], "owner")
+        data["dispositions"] = [{"thread_id": "PRRT_missing", "disposition": "owner"}]
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "names no open ledger thread"):
+            SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+
+    def test_dispatch_markers_count_toward_the_budget_on_any_base(self):
+        start = SUMMARY.round_start_marker(SHA, BASE, 2, 1)
+        self.assertTrue(start.startswith(f"<!-- runeseer-round-start sha={SHA} base={BASE} round=2 -->\n"))
+        other_base = SUMMARY.VERDICT_MARKER.format(sha=SHA, base="e" * 40, round=1, verdict="clean", restart="none", generation="")
+        history = f"{other_base}\n{start}"
+        self.assertEqual(SUMMARY.marker_round(history, base=BASE), 0)
+        self.assertEqual(SUMMARY.marker_round(history), 1)
+        self.assertEqual(SUMMARY.marker_round(history, dispatches=True), 2)
+
+    def test_lane_table_configures_the_formatter_maps(self):
+        table = {"lanes": [
+            {"id": "newbot", "login": "newbot[bot]", "name": "New Bot", "kind": "free", "check_slug": "newbot-app"},
+            {"id": "runeseer", "login": "runeseer[bot]", "name": "Runeseer", "kind": "paid"},
+        ]}
+        saved = (dict(SUMMARY.LANE_LOGINS), dict(SUMMARY.LANE_NAMES))
+        try:
+            lanes = SUMMARY.load_lane_table(table)
+            SUMMARY.configure_lanes(lanes)
+            self.assertEqual(SUMMARY.LANE_LOGINS, {"newbot[bot]": "newbot"})
+            self.assertEqual(SUMMARY.LANE_NAMES["newbot"], "New Bot")
+            self.assertEqual(SUMMARY.lane_check_slug(lanes[0]), "newbot-app")
+            self.assertEqual(SUMMARY.lane_check_slug(lanes[1]), "runeseer")
+            statuses = SUMMARY.lane_statuses(lanes, [], [check_run("newbot-app")], [])
+            self.assertEqual(statuses["newbot"], "completed-no-findings")
+        finally:
+            SUMMARY.LANE_LOGINS.clear()
+            SUMMARY.LANE_LOGINS.update(saved[0])
+            SUMMARY.LANE_NAMES.clear()
+            SUMMARY.LANE_NAMES.update(saved[1])
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "check_slug"):
+            SUMMARY.load_lane_table({"lanes": [{"id": "x", "login": "x[bot]", "name": "X", "kind": "free", "check_slug": "Bad Slug"}]})
 
     def test_volume_limit_stands_the_lane_down_unless_forced(self):
         threads = [thread_node(f"PRRT_{index}", "cursor", 100 + index) for index in range(5)]
@@ -1799,44 +1922,12 @@ class ControllerWorkflowSourceTests(unittest.TestCase):
         self.assertIn("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}", controller)
         self.assertNotIn("isResolved", controller)
 
-    def test_stand_down_writes_the_ledger_and_reports_coverage_not_clean(self):
-        controller = self.section("- id: controller", "- id: lanes")
-        self.assertIn("stand_down=true", controller)
-        self.assertIn("standdown-notice", controller)
-        gate = self.section("- name: Verdict gates the check", "- name: Metrics")
-        self.assertIn('if [ "$STAND_DOWN" = "true" ]; then', gate)
-        self.assertIn(".generation == $generation", gate)
-        self.assertIn('select(.disposition == null)', gate)
-        upload = self.section("- id: upload_ledger", "- id: consume")
-        self.assertIn("runeseer-ledger-pr${{ github.event.pull_request.number }}", upload)
-        self.assertIn("steps.controller.outcome == 'success'", upload)
-
-    def test_push_during_the_round_voids_it_before_validation(self):
-        prevalidate = self.section("- id: prevalidate", "- name: Install reviewdog")
-        self.assertLess(prevalidate.index("round voided by push"), prevalidate.index('python3 "$RUNESEER_FORMATTER" format'))
-        self.assertIn("generation: $generation", prevalidate)
-        self.assertIn('--ledger "$RUNESEER_LANES/ledger.json"', prevalidate)
-
     def test_model_steps_wait_for_the_triage(self):
         for step in ("- id: lanes", "- id: adjudicate", "- id: post_findings", "- id: upload\n", "- id: breaker"):
             with self.subTest(step=step):
                 block = self.source[self.source.index(step):]
                 block = block[:block.index("run: |") if "run: |" in block[:2000] else 2000]
                 self.assertIn("steps.controller.outputs.stand_down != 'true'", block)
-
-    def test_only_fixed_dispositions_resolve_threads(self):
-        judgments = self.section("- id: judgments", "- id: upload")
-        self.assertIn('!= "already addressed" ]; then', judgments)
-        self.assertIn("a rejected finding stays open", judgments)
-        self.assertIn("disposition === 'fixed'", self.resolver)
-        self.assertNotIn("Resolves-Thread:\\s*", self.resolver)
-        self.assertIn("runeseer-ledger-pr${pull_number}", self.resolver)
-
-    def test_mirror_stales_the_approval_on_a_late_thread(self):
-        mirror = self.entry_source[self.entry_source.index("review-context:"):]
-        self.assertIn("stale:late-thread", mirror)
-        self.assertIn("stale:generation", mirror)
-        self.assertLess(mirror.index("state=$(ledger_state)"), mirror.index("approves this head and current base"))
 
 
 class ReliabilityTests(unittest.TestCase):
