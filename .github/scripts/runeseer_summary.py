@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import re
 import subprocess
@@ -15,13 +16,14 @@ from typing import Any
 SUMMARY_MARKER = "<!-- runeseer-review -->"
 VERDICT_MARKER = (
     "<!-- runeseer-verdict sha={sha} base={base} round={round} "
-    "verdict={verdict} restart={restart} -->"
+    "verdict={verdict} restart={restart}{generation} -->"
 )
 VERDICT_MARKER_RE = re.compile(
     r"<!-- runeseer-verdict sha=(?P<sha>[0-9a-f]{40}) "
     r"base=(?P<base>[0-9a-f]{40}) round=(?P<round>[0-9]+) "
     r"verdict=(?P<verdict>clean|findings)"
-    r"(?: restart=(?P<restart>none|cursor|macroscope))? -->"
+    r"(?: restart=(?P<restart>none|cursor|macroscope))?"
+    r"(?: generation=(?P<generation>[1-9][0-9]*))? -->"
 )
 REVIEW_FOOTER_RE = re.compile(
     r"^(?:No open findings|1 open|[1-9][0-9]* open) · "
@@ -35,13 +37,45 @@ LANE_LOGINS = {
     "cursor[bot]": "cursor",
     "macroscopeapp[bot]": "macroscope",
     "coderabbitai[bot]": "coderabbit",
+    "chatgpt-codex-connector[bot]": "codex",
 }
 LANE_NAMES = {
     "runeseer": "Runeseer",
     "cursor": "Cursor Bugbot",
     "macroscope": "Macroscope",
     "coderabbit": "CodeRabbit",
+    "codex": "Codex",
 }
+# The controller's ledger. The lane table on the protected default branch
+# names the expected lanes; every one of them records one of these states
+# on every head. Dispositions come from the verdict, never from the
+# platform's resolved flag.
+LEDGER_SCHEMA = 1
+LANE_STATUSES = frozenset(
+    {
+        "completed",
+        "completed-no-findings",
+        "skipped",
+        "ineligible",
+        "failed",
+        "rate-limited",
+        "pending",
+    }
+)
+LANE_KINDS = frozenset({"free", "paid"})
+DISPOSITIONS = frozenset({"fixed", "rejected", "owner"})
+PAID_ROUND_LIMIT = 3
+LANE_VOLUME_LIMIT = 40
+PROSE_SCOPE_RE = re.compile(r"^(docs/specs/|runes/|\.github/workflows/)")
+INSTRUCTION_PATTERN = (
+    r"(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)"
+    r"|(^|/)copilot-instructions\.md$|^\.mcp\.json$|^\.rune$"
+)
+WORK_ITEM_RE = re.compile(r"docs/changes/([A-Za-z0-9][A-Za-z0-9._-]*)")
+RATE_LIMIT_RE = re.compile(r"rate.?limit|usage exhausted|quota", re.IGNORECASE)
+FAILED_CONCLUSIONS = frozenset(
+    {"failure", "timed_out", "action_required", "stale", "cancelled", "startup_failure"}
+)
 PROHIBITED_LINES = (
     "lane judgments",
     "digest",
@@ -650,6 +684,12 @@ def load_previous_findings(path: Path | None) -> list[dict[str, Any]]:
     return findings
 
 
+def load_ledger(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    return validate_ledger(load_json(path))
+
+
 def read_stored_ledger(
     verdict: Any, expected_sha: str, expected_round: int
 ) -> dict[str, Any]:
@@ -1181,6 +1221,453 @@ def canonicalize_external_findings(
     return repaired
 
 
+def login_slug(login: Any) -> str:
+    if not isinstance(login, str):
+        return ""
+    return re.sub(r"\[bot\]$", "", login)
+
+
+def load_lane_table(value: Any) -> list[dict[str, Any]]:
+    """Validate the lane table read from the protected default branch."""
+    lanes = value.get("lanes") if isinstance(value, dict) else None
+    if not isinstance(lanes, list) or not lanes:
+        raise SummaryError("The lane table must contain a nonempty lanes array.")
+    seen_ids: set[str] = set()
+    seen_logins: set[str] = set()
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            raise SummaryError("Each lane table entry must be an object.")
+        lane_id = lane.get("id")
+        if not isinstance(lane_id, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", lane_id):
+            raise SummaryError("Each lane needs a lowercase id.")
+        login = lane.get("login")
+        if not isinstance(login, str) or not login:
+            raise SummaryError(f"The lane {lane_id} needs a login.")
+        validate_plain_text(lane.get("name"), f"The lane {lane_id} name")
+        if lane.get("kind") not in LANE_KINDS:
+            raise SummaryError(f"The lane {lane_id} kind must be free or paid.")
+        if lane_id in seen_ids or login_slug(login) in seen_logins:
+            raise SummaryError(f"The lane {lane_id} repeats an id or login.")
+        seen_ids.add(lane_id)
+        seen_logins.add(login_slug(login))
+    return lanes
+
+
+def lane_for_login(lanes: list[dict[str, Any]], login: Any) -> str | None:
+    slug = login_slug(login)
+    if not slug:
+        return None
+    for lane in lanes:
+        if login_slug(lane["login"]) == slug:
+            return lane["id"]
+    return None
+
+
+def collect_threads(
+    nodes: Any, lanes: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Read every review thread from the API by login, never by resolved flag."""
+    if not isinstance(nodes, list):
+        raise SummaryError("The review threads must be an array.")
+    threads: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+            raise SummaryError("Each review thread needs a node id.")
+        comments = node.get("comments")
+        first_nodes = comments.get("nodes") if isinstance(comments, dict) else None
+        first = first_nodes[0] if isinstance(first_nodes, list) and first_nodes else {}
+        first = first if isinstance(first, dict) else {}
+        author = first.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        comment_id = first.get("databaseId")
+        threads.append(
+            {
+                "id": node["id"],
+                "url": first.get("url") if isinstance(first.get("url"), str) else None,
+                "login": login if isinstance(login, str) else None,
+                "lane": lane_for_login(lanes, login),
+                "path": node.get("path"),
+                "line": node.get("line") if node.get("line") is not None else node.get("originalLine"),
+                "comment_id": comment_id if type(comment_id) is int and comment_id > 0 else None,
+                "disposition": None,
+                "reason": None,
+            }
+        )
+    threads.sort(key=lambda thread: thread["id"])
+    return threads
+
+
+def check_run_status(runs: list[dict[str, Any]], has_threads: bool) -> str | None:
+    """Map one lane's check runs on the head to a ledger status."""
+    if not runs:
+        return None
+    if any(run.get("status") != "completed" for run in runs):
+        return "pending"
+    latest = max(runs, key=lambda run: str(run.get("completed_at") or ""))
+    conclusion = latest.get("conclusion")
+    output = latest.get("output") if isinstance(latest.get("output"), dict) else {}
+    text = " ".join(
+        str(output.get(field) or "") for field in ("title", "summary")
+    )
+    if RATE_LIMIT_RE.search(text):
+        return "rate-limited"
+    if conclusion == "skipped":
+        return "skipped"
+    if conclusion in FAILED_CONCLUSIONS:
+        return "failed"
+    if conclusion in {"success", "neutral"}:
+        return "completed" if has_threads else "completed-no-findings"
+    return "failed"
+
+
+def lane_statuses(
+    lanes: list[dict[str, Any]],
+    threads: list[dict[str, Any]],
+    check_runs: Any,
+    labels: list[str],
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Record one status per expected lane, the controller's own view."""
+    if not isinstance(check_runs, list):
+        raise SummaryError("The check runs must be an array.")
+    overrides = overrides or {}
+    for lane_id, status in overrides.items():
+        if status not in LANE_STATUSES:
+            raise SummaryError(f"The lane status override for {lane_id} is invalid.")
+    statuses: dict[str, str] = {}
+    for lane in lanes:
+        lane_id = lane["id"]
+        if lane_id in overrides:
+            statuses[lane_id] = overrides[lane_id]
+            continue
+        if f"skip:{lane_id}" in labels:
+            statuses[lane_id] = "skipped"
+            continue
+        has_threads = any(thread["lane"] == lane_id for thread in threads)
+        slug = login_slug(lane["login"])
+        runs = [
+            run
+            for run in check_runs
+            if isinstance(run, dict)
+            and isinstance(run.get("app"), dict)
+            and run["app"].get("slug") == slug
+        ]
+        status = check_run_status(runs, has_threads)
+        if status is None:
+            status = "completed" if has_threads else "ineligible"
+        statuses[lane_id] = status
+    return statuses
+
+
+def work_item_from_body(body: Any, pull_number: int) -> str:
+    match = WORK_ITEM_RE.search(body) if isinstance(body, str) else None
+    if match is None:
+        return f"pull/{pull_number}"
+    return f"docs/changes/{match.group(1)}"
+
+
+def body_digest(body: Any) -> str:
+    text = body if isinstance(body, str) else ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def validate_ledger(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema") != LEDGER_SCHEMA:
+        raise SummaryError("The ledger must be a schema 1 object.")
+    if not re.fullmatch(r"[0-9a-f]{40}", str(value.get("reviewed_sha", ""))):
+        raise SummaryError("The ledger reviewed_sha must be a full commit SHA.")
+    generation = value.get("generation")
+    if type(generation) is not int or generation < 1:
+        raise SummaryError("The ledger generation must be a positive integer.")
+    lanes = value.get("lanes")
+    if not isinstance(lanes, dict) or any(
+        status not in LANE_STATUSES for status in lanes.values()
+    ):
+        raise SummaryError("Each ledger lane needs a known status.")
+    threads = value.get("threads")
+    if not isinstance(threads, list) or not all(
+        isinstance(thread, dict) and isinstance(thread.get("id"), str)
+        for thread in threads
+    ):
+        raise SummaryError("The ledger threads must be an array of thread objects.")
+    for thread in threads:
+        if thread.get("disposition") not in DISPOSITIONS | {None}:
+            raise SummaryError(f"The ledger thread {thread['id']} has an invalid disposition.")
+    return value
+
+
+def build_ledger(
+    *,
+    pull_number: int,
+    head: str,
+    base: str,
+    lanes: list[dict[str, Any]],
+    thread_nodes: Any,
+    check_runs: Any,
+    labels: list[str],
+    body: Any,
+    previous: dict[str, Any] | None = None,
+    overrides: dict[str, str] | None = None,
+    paid_rounds: int = 0,
+) -> dict[str, Any]:
+    """Build the per-pull-request ledger for one head.
+
+    A new thread, a lane status change, or a body edit on the same head
+    increments the generation. A new head starts at generation one and
+    carries no disposition forward.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise SummaryError("The ledger head must be a full commit SHA.")
+    if type(paid_rounds) is not int or paid_rounds < 0:
+        raise SummaryError("The paid round count must be a nonnegative integer.")
+    threads = collect_threads(thread_nodes, lanes)
+    statuses = lane_statuses(lanes, threads, check_runs, labels, overrides)
+    digest = body_digest(body)
+    generation = 1
+    verdict: dict[str, Any] | None = None
+    if previous is not None:
+        previous = validate_ledger(previous)
+        if previous["reviewed_sha"] == head:
+            carried = {
+                thread["id"]: thread
+                for thread in previous["threads"]
+                if thread.get("disposition") is not None
+            }
+            for thread in threads:
+                earlier = carried.get(thread["id"])
+                if earlier is not None:
+                    thread["disposition"] = earlier["disposition"]
+                    thread["reason"] = earlier.get("reason")
+            same_threads = {thread["id"] for thread in threads} == {
+                thread["id"] for thread in previous["threads"]
+            }
+            same_lanes = statuses == previous["lanes"]
+            same_body = digest == previous.get("body_digest")
+            generation = previous["generation"]
+            verdict = previous.get("verdict")
+            if not (same_threads and same_lanes and same_body):
+                generation += 1
+                verdict = None
+    return {
+        "schema": LEDGER_SCHEMA,
+        "pull_request": pull_number,
+        "reviewed_sha": head,
+        "base": base,
+        "generation": generation,
+        "work_item": work_item_from_body(body, pull_number),
+        "paid_rounds": paid_rounds,
+        "body_digest": digest,
+        "lanes": statuses,
+        "threads": threads,
+        "coverage": None,
+        "verdict": verdict,
+    }
+
+
+def open_threads(ledger: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        thread for thread in ledger["threads"] if thread.get("disposition") is None
+    ]
+
+
+def is_prose_only(files: list[str], instruction_pattern: str = INSTRUCTION_PATTERN) -> bool:
+    """A diff is prose-only when every file is markdown outside the judged scope."""
+    if not files:
+        return False
+    instruction_re = re.compile(instruction_pattern)
+    for path in files:
+        if not path.endswith(".md"):
+            return False
+        if PROSE_SCOPE_RE.search(path) or instruction_re.search(path):
+            return False
+    return True
+
+
+def triage(
+    ledger: dict[str, Any],
+    files: list[str],
+    *,
+    comments: int,
+    forced: bool = False,
+    volume_limit: int = LANE_VOLUME_LIMIT,
+    instruction_pattern: str = INSTRUCTION_PATTERN,
+) -> str | None:
+    """Return the stand-down reason, or None when the paid lane may run.
+
+    The order is binding: prose-only diff, then budget, then volume. An
+    owner-forced round skips the prose and volume rules but never the
+    budget.
+    """
+    if type(comments) is not int or comments < 0:
+        raise SummaryError("The comment count must be a nonnegative integer.")
+    if type(volume_limit) is not int or volume_limit < 1:
+        raise SummaryError("The lane volume limit must be a positive integer.")
+    if not forced and is_prose_only(files, instruction_pattern):
+        return "the diff since the last verdict changes only prose outside the judged scope"
+    if ledger["paid_rounds"] >= PAID_ROUND_LIMIT:
+        return (
+            f"the work item {ledger['work_item']} has spent "
+            f"{ledger['paid_rounds']} paid rounds"
+        )
+    volume = len(open_threads(ledger)) + comments
+    if not forced and volume > volume_limit:
+        return f"{volume} open threads and comments exceed the lane volume limit of {volume_limit}"
+    return None
+
+
+def coverage_state(reason: str | None) -> str:
+    return "paid" if reason is None else f"free lanes only: {reason}"
+
+
+STANDDOWN_MARKER = "<!-- runeseer-standdown head={head} generation={generation} -->"
+
+
+def standdown_notice(ledger: dict[str, Any]) -> str:
+    """One owner-facing line for a stand-down, never a clean claim."""
+    ledger = validate_ledger(ledger)
+    coverage = ledger.get("coverage")
+    if not isinstance(coverage, str) or not coverage.startswith("free lanes only"):
+        raise SummaryError("A stand-down notice needs a free-lanes-only coverage state.")
+    head = ledger["reviewed_sha"]
+    marker = STANDDOWN_MARKER.format(head=head, generation=ledger["generation"])
+    budget = ledger["paid_rounds"] >= PAID_ROUND_LIMIT
+    action = (
+        "The pull request waits for the owner."
+        if budget
+        else "Apply `review:runeseer` to force a paid round."
+    )
+    return (
+        f"{marker}\n"
+        f"review/correctness stood down on `{head[:8]}`: {coverage}. {action}"
+    )
+
+
+def validate_explicit_dispositions(
+    value: Any, threads: dict[int, dict[str, Any]]
+) -> dict[int, tuple[str, str | None]]:
+    if value is None:
+        return {}
+    if not isinstance(value, list):
+        raise SummaryError("The dispositions field must be an array.")
+    explicit: dict[int, tuple[str, str | None]] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            raise SummaryError("Each disposition must be an object.")
+        comment_id = item.get("comment_id")
+        if type(comment_id) is not int or comment_id < 1:
+            raise SummaryError("Each disposition needs a positive comment ID.")
+        if comment_id not in threads:
+            raise SummaryError(
+                f"The disposition for comment {comment_id} names no open ledger thread."
+            )
+        disposition = item.get("disposition")
+        if disposition not in DISPOSITIONS:
+            raise SummaryError("Each disposition must be fixed, rejected, or owner.")
+        reason = item.get("reason")
+        if disposition == "rejected" or reason is not None:
+            validate_plain_text(reason, "Each rejected disposition reason")
+        explicit[comment_id] = (disposition, reason)
+    return explicit
+
+
+def derive_dispositions(
+    verdict: dict[str, Any], ledger: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Dispose every open ledger thread from the verdict.
+
+    Explicit `dispositions` entries win. A lane judgment then maps: already
+    addressed is fixed, disputed is rejected with its reason, and a Low
+    confirmed note is rejected as a note. A confirmed defect stays open.
+    Runeseer's own thread is fixed when no open finding still names it.
+    """
+    by_comment = {
+        thread["comment_id"]: thread
+        for thread in open_threads(ledger)
+        if thread.get("comment_id") is not None
+    }
+    explicit = validate_explicit_dispositions(verdict.get("dispositions"), by_comment)
+    judgments: dict[int, dict[str, Any]] = {}
+    for judgment in verdict.get("lane_judgments", []):
+        judgments.setdefault(judgment["comment_id"], judgment)
+    open_finding_ids = {
+        finding.get("comment_id")
+        for finding in verdict.get("findings", [])
+        if finding.get("comment_id") is not None
+    }
+    result: list[dict[str, Any]] = []
+    for thread in open_threads(ledger):
+        disposition: str | None = None
+        reason: str | None = None
+        comment_id = thread.get("comment_id")
+        if comment_id in explicit:
+            disposition, reason = explicit[comment_id]
+        elif comment_id in open_finding_ids:
+            disposition = None
+        elif comment_id in judgments:
+            judgment = judgments[comment_id]
+            if judgment["judgment"] == "already addressed":
+                disposition = "fixed"
+            elif judgment["judgment"] == "disputed":
+                disposition, reason = "rejected", judgment["reason"]
+            elif judgment.get("severity") == "low":
+                disposition, reason = "rejected", f"Low severity note: {judgment['reason']}"
+        elif thread.get("lane") == "runeseer" and comment_id is not None:
+            disposition = "fixed"
+        result.append(
+            {
+                "id": thread["id"],
+                "url": thread.get("url"),
+                "comment_id": comment_id,
+                "lane": thread.get("lane"),
+                "disposition": disposition,
+                "reason": reason,
+            }
+        )
+    return result
+
+
+def apply_verdict_to_ledger(
+    ledger: dict[str, Any], verdict: dict[str, Any]
+) -> dict[str, Any]:
+    """Record the verdict's dispositions and its (sha, generation) binding."""
+    ledger = validate_ledger(copy.deepcopy(ledger))
+    if verdict.get("sha") != ledger["reviewed_sha"]:
+        raise SummaryError("The verdict SHA does not match the ledger head.")
+    if verdict.get("generation") != ledger["generation"]:
+        raise SummaryError("The verdict generation does not match the ledger.")
+    dispositions = {
+        item["id"]: item for item in verdict.get("thread_dispositions", [])
+    }
+    for thread in ledger["threads"]:
+        disposed = dispositions.get(thread["id"])
+        if disposed is not None and disposed["disposition"] is not None:
+            thread["disposition"] = disposed["disposition"]
+            thread["reason"] = disposed.get("reason")
+    ledger["coverage"] = "paid"
+    ledger["verdict"] = {
+        "sha": verdict["sha"],
+        "generation": verdict["generation"],
+        "round": verdict.get("round"),
+        "verdict": verdict["verdict"],
+        "count": verdict.get("count"),
+    }
+    return ledger
+
+
+def ledger_is_stale(ledger: dict[str, Any], thread_nodes: Any) -> bool:
+    """A thread the ledger never saw stales its verdict and approval."""
+    ledger = validate_ledger(ledger)
+    known = {thread["id"] for thread in ledger["threads"]}
+    if not isinstance(thread_nodes, list):
+        raise SummaryError("The review threads must be an array.")
+    for node in thread_nodes:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+            raise SummaryError("Each review thread needs a node id.")
+        if node["id"] not in known:
+            return True
+    return False
+
+
 def validate_verdict(
     verdict: Any,
     expected_sha: str,
@@ -1189,6 +1676,7 @@ def validate_verdict(
     runeseer_comments: list[dict[str, Any]] | None = None,
     previous_findings: list[dict[str, Any]] | None = None,
     runeseer_records: list[dict[str, Any]] | None = None,
+    ledger: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(verdict, dict):
         raise SummaryError("The verdict must be a JSON object.")
@@ -1330,6 +1818,28 @@ def validate_verdict(
     expected_verdict = "clean" if not findings else "findings"
     if verdict["verdict"] != expected_verdict:
         raise SummaryError("The verdict value does not match the findings array.")
+    generation = verdict.get("generation")
+    if generation is not None and (type(generation) is not int or generation < 1):
+        raise SummaryError("The verdict generation must be a positive integer.")
+    if ledger is not None:
+        ledger = validate_ledger(ledger)
+        if ledger["reviewed_sha"] != expected_sha:
+            raise SummaryError("The ledger head does not match the reviewed head.")
+        if generation != ledger["generation"]:
+            raise SummaryError(
+                "The verdict generation does not match the ledger generation."
+            )
+        dispositions = derive_dispositions(verdict, ledger)
+        undisposed = [
+            item for item in dispositions if item["disposition"] is None
+        ]
+        if verdict["verdict"] == "clean" and undisposed:
+            first = undisposed[0]
+            name = first.get("url") or first["id"]
+            raise SummaryError(
+                f"The clean verdict leaves a thread without a disposition: {name}"
+            )
+        verdict["thread_dispositions"] = dispositions
     return verdict
 
 
@@ -1456,6 +1966,7 @@ def format_review(
     previous_verdict_path: Path | None = None,
     session_stats: str = "",
     runeseer_findings_path: Path | None = None,
+    ledger_path: Path | None = None,
 ) -> str:
     lane_comments = load_lane_comments(lane_comment_paths)
     verdict_value = load_json(verdict_path)
@@ -1469,6 +1980,7 @@ def format_review(
         load_lane_comments(runeseer_comment_paths),
         load_previous_findings(previous_verdict_path),
         load_runeseer_records(runeseer_findings_path),
+        load_ledger(ledger_path),
     )
     try:
         summary_text = read_utf8(summary_path)
@@ -1491,12 +2003,14 @@ def format_review(
     if session_stats:
         footer_parts.append(validate_plain_text(session_stats, "session stats"))
     footer = " · ".join(footer_parts)
+    generation = verdict.get("generation")
     verdict_marker = VERDICT_MARKER.format(
         sha=expected_sha,
         base=verdict["base"],
         round=verdict["round"],
         verdict=verdict["verdict"],
         restart=verdict["restart"],
+        generation="" if generation is None else f" generation={generation}",
     )
     lines = [
         SUMMARY_MARKER,
@@ -1566,6 +2080,9 @@ def parse_verdict_marker(body: str) -> dict[str, Any] | None:
         "round": int(match.group("round")),
         "verdict": match.group("verdict"),
         "restart": match.group("restart") or "none",
+        "generation": (
+            int(match.group("generation")) if match.group("generation") else None
+        ),
     }
 
 
@@ -1587,6 +2104,9 @@ def parse_canonical_summary_marker(body: str) -> dict[str, Any] | None:
         "round": int(match.group("round")),
         "verdict": match.group("verdict"),
         "restart": match.group("restart") or "none",
+        "generation": (
+            int(match.group("generation")) if match.group("generation") else None
+        ),
     }
 
 
@@ -2393,6 +2913,48 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--runeseer-comments", type=Path, action="append")
     validate_parser.add_argument("--previous-verdict", type=Path)
     validate_parser.add_argument("--runeseer-findings", type=Path)
+    validate_parser.add_argument("--ledger", type=Path)
+
+    build_parser_ = commands.add_parser("build-ledger")
+    build_parser_.add_argument("--pr", type=int, required=True)
+    build_parser_.add_argument("--head", required=True)
+    build_parser_.add_argument("--base", required=True)
+    build_parser_.add_argument("--lane-table", type=Path, required=True)
+    build_parser_.add_argument("--threads", type=Path, required=True)
+    build_parser_.add_argument("--check-runs", type=Path, required=True)
+    build_parser_.add_argument("--labels", type=Path, required=True)
+    build_parser_.add_argument("--body", type=Path, required=True)
+    build_parser_.add_argument("--previous-ledger", type=Path)
+    build_parser_.add_argument("--paid-rounds", type=int, default=0)
+    build_parser_.add_argument(
+        "--lane-status", action="append", default=[], metavar="LANE=STATUS"
+    )
+    build_parser_.add_argument("--output", type=Path)
+
+    triage_parser = commands.add_parser("triage")
+    triage_parser.add_argument("--ledger", type=Path, required=True)
+    triage_parser.add_argument("--files", type=Path, required=True)
+    triage_parser.add_argument("--comments", type=int, required=True)
+    triage_parser.add_argument("--forced", action="store_true")
+    triage_parser.add_argument("--volume-limit", type=int, default=LANE_VOLUME_LIMIT)
+    triage_parser.add_argument("--instruction-pattern", default=INSTRUCTION_PATTERN)
+    triage_parser.add_argument("--output", type=Path)
+
+    apply_parser = commands.add_parser("apply-verdict")
+    apply_parser.add_argument("--ledger", type=Path, required=True)
+    apply_parser.add_argument("--verdict", type=Path, required=True)
+    apply_parser.add_argument("--output", type=Path)
+
+    stale_parser = commands.add_parser("ledger-stale")
+    stale_parser.add_argument("--ledger", type=Path, required=True)
+    stale_parser.add_argument("--threads", type=Path, required=True)
+
+    work_item_parser = commands.add_parser("work-item")
+    work_item_parser.add_argument("--body", type=Path, required=True)
+    work_item_parser.add_argument("--pr", type=int, required=True)
+
+    standdown_parser = commands.add_parser("standdown-notice")
+    standdown_parser.add_argument("--ledger", type=Path, required=True)
 
     ledger_parser = commands.add_parser("read-ledger")
     ledger_parser.add_argument("--verdict", type=Path, required=True)
@@ -2411,6 +2973,7 @@ def build_parser() -> argparse.ArgumentParser:
     format_parser.add_argument("--previous-verdict", type=Path)
     format_parser.add_argument("--runeseer-findings", type=Path)
     format_parser.add_argument("--session-stats", default="")
+    format_parser.add_argument("--ledger", type=Path)
     format_parser.add_argument("--output", type=Path)
 
     publish_parser = commands.add_parser("publish")
@@ -2590,7 +3153,73 @@ def main() -> int:
                 load_lane_comments(arguments.runeseer_comments),
                 load_previous_findings(arguments.previous_verdict),
                 load_runeseer_records(arguments.runeseer_findings),
+                load_ledger(arguments.ledger),
             )
+            return 0
+        if arguments.command == "build-ledger":
+            overrides: dict[str, str] = {}
+            for entry in arguments.lane_status:
+                lane_id, separator, status = entry.partition("=")
+                if not separator:
+                    raise SummaryError(f"The lane status must read LANE=STATUS: {entry}")
+                overrides[lane_id] = status
+            labels = load_json(arguments.labels)
+            if not isinstance(labels, list) or not all(
+                isinstance(label, str) for label in labels
+            ):
+                raise SummaryError("The labels file must contain an array of names.")
+            ledger = build_ledger(
+                pull_number=arguments.pr,
+                head=arguments.head,
+                base=arguments.base,
+                lanes=load_lane_table(load_json(arguments.lane_table)),
+                thread_nodes=load_json(arguments.threads),
+                check_runs=load_json(arguments.check_runs),
+                labels=labels,
+                body=read_utf8(arguments.body),
+                previous=load_ledger(arguments.previous_ledger),
+                overrides=overrides,
+                paid_rounds=arguments.paid_rounds,
+            )
+            write_output(json.dumps(ledger, indent=2), arguments.output)
+            return 0
+        if arguments.command == "triage":
+            ledger = validate_ledger(load_json(arguments.ledger))
+            files = [
+                line for line in read_utf8(arguments.files).splitlines() if line
+            ]
+            reason = triage(
+                ledger,
+                files,
+                comments=arguments.comments,
+                forced=arguments.forced,
+                volume_limit=arguments.volume_limit,
+                instruction_pattern=arguments.instruction_pattern,
+            )
+            ledger["coverage"] = coverage_state(reason)
+            if reason is not None and "runeseer" in ledger["lanes"]:
+                ledger["lanes"]["runeseer"] = "skipped"
+            if arguments.output is not None:
+                write_output(json.dumps(ledger, indent=2), arguments.output)
+            print(ledger["coverage"])
+            return 0
+        if arguments.command == "apply-verdict":
+            ledger = apply_verdict_to_ledger(
+                load_json(arguments.ledger), load_json(arguments.verdict)
+            )
+            write_output(json.dumps(ledger, indent=2), arguments.output)
+            return 0
+        if arguments.command == "ledger-stale":
+            stale = ledger_is_stale(
+                load_json(arguments.ledger), load_json(arguments.threads)
+            )
+            print("true" if stale else "false")
+            return 0
+        if arguments.command == "work-item":
+            print(work_item_from_body(read_utf8(arguments.body), arguments.pr))
+            return 0
+        if arguments.command == "standdown-notice":
+            print(standdown_notice(load_json(arguments.ledger)))
             return 0
         if arguments.command == "format":
             body = format_review(
@@ -2604,6 +3233,7 @@ def main() -> int:
                 arguments.previous_verdict,
                 arguments.session_stats,
                 arguments.runeseer_findings,
+                arguments.ledger,
             )
             write_output(body, arguments.output)
             return 0

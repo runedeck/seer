@@ -1323,12 +1323,13 @@ class WorkflowSourceTests(unittest.TestCase):
         self.assertEqual(consume.count("for label in $LABELS_CONSUMED; do"), 1)
         self.assertEqual(consume.count('for label in "${labels_to_consume[@]}"; do'), 2)
 
-    def test_entry_refreshes_the_mirror_without_starting_paid_review(self):
+    def test_entry_invites_the_lane_on_ready_push_and_label(self):
         for event in (
             "opened",
             "reopened",
             "synchronize",
             "converted_to_draft",
+            "ready_for_review",
         ):
             with self.subTest(event=event):
                 self.assertIn(f"            - {event}\n", self.entry_source)
@@ -1337,7 +1338,14 @@ class WorkflowSourceTests(unittest.TestCase):
         review = self.entry_source[review_start:context_start]
         self.assertIn("github.event.action == ''labeled''", review)
         self.assertIn("github.event.action == ''ready_for_review''", review)
-        self.assertNotIn("github.event.action == ''synchronize''", review)
+        self.assertIn("github.event.action == ''synchronize''", review)
+        self.assertIn("github.event.pull_request.draft == false", review)
+        # The body's own guard admits the same three events and no draft.
+        guard = self.section("        if: >", "        runs-on:")
+        self.assertIn("github.event.action == 'ready_for_review'", guard)
+        self.assertIn("github.event.action == 'synchronize'", guard)
+        self.assertIn("'review:runeseer'", guard)
+        self.assertIn("github.event.pull_request.draft == false", guard)
 
     def test_macroscope_label_changes_cancel_an_older_consumer(self):
         self.assertIn(
@@ -1393,7 +1401,13 @@ class WorkflowSourceTests(unittest.TestCase):
         self.assertIn(
             "This green check records a skipped review, not a clean verdict.", scope
         )
-        self.assertEqual(scope.count('record_skip "$reason"'), 2)
+        self.assertEqual(scope.count('record_skip "$reason"'), 1)
+        # The prose-only decision belongs to the triage: it judges the range
+        # since the last verdict, not the whole pull request.
+        self.assertNotIn("Prose-only change", scope)
+        controller = self.section("- id: controller", "- id: lanes")
+        self.assertIn('python3 "$RUNESEER_FORMATTER" triage', controller)
+        self.assertIn("### review/correctness stood down", controller)
 
     def test_consume_still_clears_labels_after_a_pre_ledger_failure(self):
         consume = self.section("- id: consume", "- id: restart")
@@ -1545,6 +1559,284 @@ class WorkflowSourceTests(unittest.TestCase):
         ):
             with self.subTest(boundary=boundary):
                 self.assertIn(boundary, adjudicate)
+
+
+LANES = {
+    "lanes": [
+        {"id": "codex", "login": "chatgpt-codex-connector[bot]", "name": "Codex", "kind": "free"},
+        {"id": "cursor", "login": "cursor[bot]", "name": "Cursor Bugbot", "kind": "free"},
+        {"id": "coderabbit", "login": "coderabbitai[bot]", "name": "CodeRabbit", "kind": "paid"},
+        {"id": "macroscope", "login": "macroscopeapp[bot]", "name": "Macroscope", "kind": "paid"},
+        {"id": "runeseer", "login": "runeseer[bot]", "name": "Runeseer", "kind": "paid"},
+    ]
+}
+
+
+def thread_node(identifier, login, comment_id, *, path="src/lib.rs", line=7):
+    return {
+        "id": identifier,
+        "path": path,
+        "line": line,
+        "originalLine": line,
+        "comments": {
+            "nodes": [
+                {
+                    "databaseId": comment_id,
+                    "url": f"https://github.com/runedeck/deck/pull/7#discussion_r{comment_id}",
+                    "author": {"login": login},
+                }
+            ]
+        },
+    }
+
+
+def check_run(slug, conclusion="success", *, status="completed", title=""):
+    return {
+        "app": {"slug": slug},
+        "status": status,
+        "conclusion": conclusion,
+        "completed_at": "2026-09-19T00:00:00Z",
+        "output": {"title": title, "summary": ""},
+    }
+
+
+class ControllerTests(unittest.TestCase):
+    """The ledger, the triage, and the verdict's dispositions."""
+
+    lanes = SUMMARY.load_lane_table(LANES)
+
+    def ledger(self, threads=(), check_runs=(), labels=(), previous=None, **overrides):
+        return SUMMARY.build_ledger(
+            pull_number=7,
+            head=SHA,
+            base=BASE,
+            lanes=self.lanes,
+            thread_nodes=list(threads),
+            check_runs=list(check_runs),
+            labels=list(labels),
+            body="Change: docs/changes/review-loop\n\n## Release Notes\n- N/A",
+            previous=previous,
+            **overrides,
+        )
+
+    def test_lane_table_repo_file_matches_the_fixture(self):
+        table = json.loads((SCRIPT.parent.parent / "lanes.json").read_text(encoding="utf-8"))
+        self.assertEqual([lane["id"] for lane in SUMMARY.load_lane_table(table)],
+                         ["codex", "cursor", "coderabbit", "macroscope", "runeseer"])
+        with self.assertRaises(SUMMARY.SummaryError):
+            SUMMARY.load_lane_table({"lanes": [{"id": "x", "login": "x[bot]", "name": "X", "kind": "metered"}]})
+
+    def test_each_of_the_seven_lane_statuses_is_recorded(self):
+        ledger = self.ledger(
+            threads=[thread_node("PRRT_1", "cursor", 11)],
+            check_runs=[
+                check_run("cursor"),
+                check_run("chatgpt-codex-connector"),
+                check_run("macroscopeapp", "failure"),
+                check_run("coderabbitai", None, status="in_progress"),
+            ],
+            overrides={"runeseer": "rate-limited"},
+        )
+        self.assertEqual(ledger["lanes"], {
+            "cursor": "completed",
+            "codex": "completed-no-findings",
+            "macroscope": "failed",
+            "coderabbit": "pending",
+            "runeseer": "rate-limited",
+        })
+        skipped = self.ledger(labels=["skip:cursor"])
+        self.assertEqual(skipped["lanes"]["cursor"], "skipped")
+        self.assertEqual(skipped["lanes"]["codex"], "ineligible")
+        limited = self.ledger(check_runs=[check_run("cursor", "failure", title="Rate limit exceeded")])
+        self.assertEqual(limited["lanes"]["cursor"], "rate-limited")
+        self.assertEqual(set(ledger["lanes"].values()) | {"skipped", "ineligible"}, set(SUMMARY.LANE_STATUSES))
+
+    def test_unknown_login_is_kept_with_no_lane_and_no_authority(self):
+        ledger = self.ledger(threads=[thread_node("PRRT_9", "some-stranger", 99)])
+        stranger = ledger["threads"][0]
+        self.assertIsNone(stranger["lane"])
+        self.assertEqual(stranger["login"], "some-stranger")
+        self.assertIsNone(stranger["disposition"])
+        self.assertNotIn("some-stranger", ledger["lanes"])
+        # The thread still needs a disposition: a clean verdict cannot skip it.
+        data = verdict()
+        data["generation"] = 1
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "discussion_r99"):
+            SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+        data["dispositions"] = [{"comment_id": 99, "disposition": "owner"}]
+        disposed = SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+        self.assertEqual(disposed["thread_dispositions"][0]["disposition"], "owner")
+
+    def test_undisposed_thread_fails_a_clean_verdict_naming_the_url(self):
+        ledger = self.ledger(threads=[thread_node("PRRT_2", "cursor", 21)])
+        data = verdict()
+        data["generation"] = 1
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "without a disposition: https://github.com/runedeck/deck/pull/7#discussion_r21"):
+            SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+        # A findings verdict leaves the thread open without failing.
+        data["lane_judgments"] = [{
+            "path": "src/lib.rs", "line": 7, "summary": "Unchecked error", "lane": "cursor",
+            "judgment": "disputed", "severity": "medium", "reason": "The error is checked on line 9.",
+            "comment_id": 21,
+        }]
+        disposed = SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+        self.assertEqual(disposed["thread_dispositions"][0]["disposition"], "rejected")
+        self.assertEqual(disposed["thread_dispositions"][0]["reason"], "The error is checked on line 9.")
+
+    def test_rejected_disposition_needs_a_reason_and_generation_must_bind(self):
+        ledger = self.ledger(threads=[thread_node("PRRT_3", "cursor", 31)])
+        data = verdict()
+        data["generation"] = 1
+        data["dispositions"] = [{"comment_id": 31, "disposition": "rejected"}]
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "rejected disposition reason"):
+            SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+        data["dispositions"] = [{"comment_id": 31, "disposition": "fixed"}]
+        data["generation"] = 2
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "generation does not match"):
+            SUMMARY.validate_verdict(data, SHA, 1, ledger=ledger)
+
+    def test_late_thread_bumps_the_generation_and_stales_the_approval(self):
+        first = self.ledger(threads=[thread_node("PRRT_4", "cursor", 41)])
+        data = verdict()
+        data["generation"] = 1
+        data["dispositions"] = [{"comment_id": 41, "disposition": "fixed"}]
+        judged = SUMMARY.validate_verdict(data, SHA, 1, ledger=first)
+        recorded = SUMMARY.apply_verdict_to_ledger(first, judged)
+        self.assertEqual(recorded["verdict"], {"sha": SHA, "generation": 1, "round": 1, "verdict": "clean", "count": 0})
+        self.assertEqual(recorded["threads"][0]["disposition"], "fixed")
+        late = [thread_node("PRRT_4", "cursor", 41), thread_node("PRRT_5", "chatgpt-codex-connector", 51)]
+        self.assertTrue(SUMMARY.ledger_is_stale(recorded, late))
+        self.assertFalse(SUMMARY.ledger_is_stale(recorded, late[:1]))
+        second = self.ledger(threads=late, previous=recorded)
+        self.assertEqual(second["generation"], 2)
+        self.assertIsNone(second["verdict"])
+        # The earlier disposition carries; the late thread is open.
+        self.assertEqual([thread["disposition"] for thread in second["threads"]], ["fixed", None])
+        # The same head with nothing new keeps its generation and verdict.
+        same = self.ledger(threads=late[:1], previous=recorded)
+        self.assertEqual((same["generation"], same["verdict"]), (1, recorded["verdict"]))
+        # A lane status change also bumps the generation.
+        changed = self.ledger(threads=late[:1], check_runs=[check_run("chatgpt-codex-connector")], previous=recorded)
+        self.assertEqual((changed["lanes"]["codex"], changed["generation"]), ("completed-no-findings", 2))
+
+    def test_marker_carries_the_generation(self):
+        body = SUMMARY.VERDICT_MARKER.format(sha=SHA, base=BASE, round=2, verdict="clean", restart="none", generation=" generation=3")
+        parsed = SUMMARY.parse_verdict_marker(body)
+        self.assertEqual((parsed["round"], parsed["generation"]), (2, 3))
+        self.assertIsNone(SUMMARY.parse_verdict_marker(BODY)["generation"])
+
+    def test_budget_refuses_the_fourth_round_even_when_forced(self):
+        ledger = self.ledger(paid_rounds=3)
+        reason = SUMMARY.triage(ledger, ["src/lib.rs"], comments=0, forced=True)
+        self.assertEqual(reason, "the work item docs/changes/review-loop has spent 3 paid rounds")
+        self.assertIsNone(SUMMARY.triage(self.ledger(paid_rounds=2), ["src/lib.rs"], comments=0))
+        self.assertEqual(SUMMARY.coverage_state(reason), f"free lanes only: {reason}")
+        self.assertIn("waits for the owner", SUMMARY.standdown_notice({**ledger, "coverage": SUMMARY.coverage_state(reason)}))
+
+    def test_prose_only_diff_stands_the_lane_down_in_order(self):
+        ledger = self.ledger(paid_rounds=3)
+        # Prose first: the budget reason never shows on a prose-only range.
+        reason = SUMMARY.triage(ledger, ["README.md", "docs/notes/plan.md"], comments=0)
+        self.assertEqual(reason, "the diff since the last verdict changes only prose outside the judged scope")
+        self.assertIsNone(SUMMARY.triage(self.ledger(), ["README.md"], comments=0, forced=True))
+        self.assertFalse(SUMMARY.is_prose_only([]))
+
+    def test_instruction_path_and_scope_diffs_are_never_prose_only(self):
+        for path in ("CLAUDE.md", "nested/AGENTS.md", ".claude/rules/Glossary.md", "docs/specs/x/spec.md",
+                     "runes/core/rules/Literals.md", ".github/workflows/quality.yaml", "src/main.rs", ".rune"):
+            with self.subTest(path=path):
+                self.assertFalse(SUMMARY.is_prose_only(["README.md", path]))
+                self.assertIsNone(SUMMARY.triage(self.ledger(), ["README.md", path], comments=0))
+
+    def test_volume_limit_stands_the_lane_down_unless_forced(self):
+        threads = [thread_node(f"PRRT_{index}", "cursor", 100 + index) for index in range(5)]
+        ledger = self.ledger(threads=threads)
+        reason = SUMMARY.triage(ledger, ["src/lib.rs"], comments=36, volume_limit=40)
+        self.assertEqual(reason, "41 open threads and comments exceed the lane volume limit of 40")
+        self.assertIsNone(SUMMARY.triage(ledger, ["src/lib.rs"], comments=35, volume_limit=40))
+        self.assertIsNone(SUMMARY.triage(ledger, ["src/lib.rs"], comments=36, volume_limit=40, forced=True))
+
+    def test_voided_round_never_records_on_another_head(self):
+        ledger = self.ledger()
+        data = verdict()
+        data["generation"] = 1
+        data["sha"] = "f" * 40
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "does not match the ledger head"):
+            SUMMARY.apply_verdict_to_ledger(ledger, data)
+        with self.assertRaisesRegex(SUMMARY.SummaryError, "ledger head does not match"):
+            SUMMARY.validate_verdict({**verdict(), "generation": 1}, SHA, 1, ledger={**ledger, "reviewed_sha": "f" * 40})
+
+    def test_runeseer_own_thread_is_fixed_only_when_no_open_finding_names_it(self):
+        ledger = self.ledger(threads=[thread_node("PRRT_6", "runeseer", 61)])
+        clean = {**verdict(), "generation": 1}
+        self.assertEqual(SUMMARY.validate_verdict(clean, SHA, 1, ledger=ledger)["thread_dispositions"][0]["disposition"], "fixed")
+        finding = {
+            "path": "src/lib.rs", "line": 7, "summary": "Unchecked error", "lane": "runeseer",
+            "judgment": "confirmed", "severity": "high", "comment_id": 61,
+        }
+        open_verdict = {**verdict(findings=[finding]), "generation": 1}
+        self.assertIsNone(SUMMARY.validate_verdict(open_verdict, SHA, 1, ledger=ledger)["thread_dispositions"][0]["disposition"])
+
+    def test_work_item_falls_back_to_the_pull_request(self):
+        self.assertEqual(SUMMARY.work_item_from_body("no change named", 7), "pull/7")
+        self.assertEqual(SUMMARY.work_item_from_body("see docs/changes/pi-harness/tasks.md", 7), "docs/changes/pi-harness")
+
+
+class ControllerWorkflowSourceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = WORKFLOW.read_text(encoding="utf-8")
+        cls.entry_source = ENTRY_WORKFLOW.read_text(encoding="utf-8")
+        cls.resolver = (WORKFLOW.parent / "thread-resolver.yaml").read_text(encoding="utf-8")
+
+    def section(self, start, end):
+        start_index = self.source.index(start)
+        return self.source[start_index:self.source.index(end, start_index)]
+
+    def test_lane_table_is_read_from_the_default_branch(self):
+        controller = self.section("- id: controller", "- id: lanes")
+        self.assertIn('contents/$LANE_TABLE_PATH?ref=$DEFAULT_BRANCH', controller)
+        self.assertIn("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}", controller)
+        self.assertNotIn("isResolved", controller)
+
+    def test_stand_down_writes_the_ledger_and_reports_coverage_not_clean(self):
+        controller = self.section("- id: controller", "- id: lanes")
+        self.assertIn("stand_down=true", controller)
+        self.assertIn("standdown-notice", controller)
+        gate = self.section("- name: Verdict gates the check", "- name: Metrics")
+        self.assertIn('if [ "$STAND_DOWN" = "true" ]; then', gate)
+        self.assertIn(".generation == $generation", gate)
+        self.assertIn('select(.disposition == null)', gate)
+        upload = self.section("- id: upload_ledger", "- id: consume")
+        self.assertIn("runeseer-ledger-pr${{ github.event.pull_request.number }}", upload)
+        self.assertIn("steps.controller.outcome == 'success'", upload)
+
+    def test_push_during_the_round_voids_it_before_validation(self):
+        prevalidate = self.section("- id: prevalidate", "- name: Install reviewdog")
+        self.assertLess(prevalidate.index("round voided by push"), prevalidate.index('python3 "$RUNESEER_FORMATTER" format'))
+        self.assertIn("generation: $generation", prevalidate)
+        self.assertIn('--ledger "$RUNESEER_LANES/ledger.json"', prevalidate)
+
+    def test_model_steps_wait_for_the_triage(self):
+        for step in ("- id: lanes", "- id: adjudicate", "- id: post_findings", "- id: upload\n", "- id: breaker"):
+            with self.subTest(step=step):
+                block = self.source[self.source.index(step):]
+                block = block[:block.index("run: |") if "run: |" in block[:2000] else 2000]
+                self.assertIn("steps.controller.outputs.stand_down != 'true'", block)
+
+    def test_only_fixed_dispositions_resolve_threads(self):
+        judgments = self.section("- id: judgments", "- id: upload")
+        self.assertIn('!= "already addressed" ]; then', judgments)
+        self.assertIn("a rejected finding stays open", judgments)
+        self.assertIn("disposition === 'fixed'", self.resolver)
+        self.assertNotIn("Resolves-Thread:\\s*", self.resolver)
+        self.assertIn("runeseer-ledger-pr${pull_number}", self.resolver)
+
+    def test_mirror_stales_the_approval_on_a_late_thread(self):
+        mirror = self.entry_source[self.entry_source.index("review-context:"):]
+        self.assertIn("stale:late-thread", mirror)
+        self.assertIn("stale:generation", mirror)
+        self.assertLess(mirror.index("state=$(ledger_state)"), mirror.index("approves this head and current base"))
 
 
 class ReliabilityTests(unittest.TestCase):

@@ -33,13 +33,19 @@ concurrency:
 # keeps its literals; the reviewer prompt stays inline until the shared
 # definitions file on the roadmap carries it.
 env:
-    LANE_BOTS: '["macroscopeapp[bot]", "cursor[bot]", "coderabbitai[bot]"]'
+    LANE_BOTS: '["macroscopeapp[bot]", "cursor[bot]", "coderabbitai[bot]", "chatgpt-codex-connector[bot]"]'
     REVIEWER_LOGIN: ${{ inputs.reviewer_login }}
     LABELS_CONSUMED: "review review%3Amacroscope review%3Aruneseer"
     LABEL_RUNE_BLOCKED: "issue:rune"
     LABEL_STAGE_CURSOR: "stage%3Acursor"
     LABEL_STAGE_MACROSCOPE: "stage%3Amacroscope"
     ARTIFACT_PREFIX: runeseer-verdict-pr
+    # The controller's ledger: one artifact per pull request, rebuilt on
+    # every head from the API by lane login. The lane table is read from
+    # the protected default branch, never from the candidate tree.
+    LEDGER_PREFIX: runeseer-ledger-pr
+    LANE_TABLE_PATH: .github/lanes.json
+    LANE_VOLUME_LIMIT: ${{ vars.LANE_VOLUME_LIMIT || 40 }}
     RUNESEER_FORMATTER: /usr/local/lib/runeseer_summary.py
     RUNESEER_LANES: /usr/local/share/runeseer-lanes
     INSTRUCTION_PATTERN: '(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)|(^|/)copilot-instructions\.md$|^\.mcp\.json$|^\.rune$'
@@ -49,18 +55,26 @@ env:
 jobs:
     correctness:
         name: correctness
-        # Summoned, never ambient: the lane runs only while the owner's
-        # review:runeseer label is on the pull request, on any non-draft
-        # same-repository pull request — the owner controls spend by
-        # applying the label, so contributor branches pass through the
-        # same funnel. Fork pull requests cannot run this lane: GitHub
-        # strips the secrets it needs from fork-triggered runs, and their
-        # funnel ends at the free lanes plus the owner's review.
+        # The controller invites the paid lane: on the ready event, on each
+        # later push to a ready pull request, and on the owner's
+        # review:runeseer label, which forces a round the triage would
+        # stand down. Drafts never reach here. The triage step below stands
+        # the lane down before any model call, so a push spends nothing
+        # unless the diff, the budget, and the volume admit it. Fork pull
+        # requests cannot run this lane: GitHub strips the secrets it needs
+        # from fork-triggered runs, and their funnel ends at the free lanes
+        # plus the owner's review.
         if: >
             github.event.pull_request.draft == false &&
             github.event.pull_request.head.repo.full_name == github.repository &&
-            contains(github.event.pull_request.labels.*.name, 'review:runeseer') &&
-            (github.event.action != 'labeled' || startsWith(github.event.label.name, 'review'))
+            (
+                github.event.action == 'ready_for_review' ||
+                github.event.action == 'synchronize' ||
+                (
+                    contains(github.event.pull_request.labels.*.name, 'review:runeseer') &&
+                    (github.event.action != 'labeled' || startsWith(github.event.label.name, 'review'))
+                )
+            )
         runs-on: ubuntu-latest
         timeout-minutes: 40
         steps:
@@ -93,18 +107,18 @@ jobs:
                   done
                   echo "instruction surface pinned to the base branch."
 
-            # Prose-only diffs use the conventions lane. The subscription
-            # reviews executable surfaces. Markdown in docs/specs, .github,
-            # rune skills, or rune rules stays in scope.
+            # skip:runeseer stands the lane down before it spends anything.
+            # The controller still writes the ledger with the lane skipped,
+            # and the job concludes success so the required mirror clears.
+            # The prose-only decision moved to the triage step: it judges the
+            # range since the last verdict, not the whole pull request.
             - id: scope
               name: Scope to reviewable changes
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   set -o pipefail
-                  # skip: stands the lane down before it spends anything, and
-                  # the job still concludes success so the required mirror
-                  # clears. A failed label read must not read as an applied skip.
+                  # A failed label read must not read as an applied skip.
                   # The job summary keeps a durable record of every skip: the
                   # green required check then explains itself without a
                   # persistent pull request comment.
@@ -144,23 +158,15 @@ jobs:
                       echo "the files API listed $listed of $expected changed files; the scope cannot be judged from a partial list"
                       exit 1
                   fi
-                  substantive=$(printf '%s\n' "$files" | grep -Ev '\.md$' || true)
-                  in_scope_md=$(printf '%s\n' "$files" | grep -E '^(docs/specs/|\.github/|runes/[^/]+/(skills|rules)/).*\.md$' || true)
-                  if [ -z "$substantive" ] && [ -z "$in_scope_md" ]; then
-                      reason="This change modifies prose outside the executable specification, workflow, and rune instruction scope."
-                      echo "skip=true" >> "$GITHUB_OUTPUT"
-                      echo "reason=$reason" >> "$GITHUB_OUTPUT"
-                      record_skip "$reason"
-                      echo "Prose-only change; correctness lane stands down."
-                  else
-                      echo "skip=false" >> "$GITHUB_OUTPUT"
-                  fi
+                  printf '%s\n' "$files" > "$RUNNER_TEMP/pull-request-files.txt"
+                  echo "skip=false" >> "$GITHUB_OUTPUT"
 
             # Fetch trusted formatter code once, before the paid review starts.
-            # Later steps reuse this exact reusable-workflow revision.
+            # Later steps reuse this exact reusable-workflow revision. The
+            # controller needs it on a skipped round too: the ledger records
+            # the skipped lane.
             - id: formatter
               name: Fetch the review formatter
-              if: steps.scope.outputs.skip == 'false'
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
@@ -437,11 +443,177 @@ jobs:
                   retention-days: 30
                   if-no-files-found: error
 
+            # The controller owns the ledger: reviewed_sha, generation, one
+            # status per expected lane, and every review thread with its
+            # disposition. Threads come from the API by login, never from
+            # the resolved flag. The lane table is read from the protected
+            # default branch. The triage then stands the paid lane down, in
+            # order: prose-only range since the last verdict, the work
+            # item's three-round budget, the volume limit. A stand-down
+            # writes the ledger, reports the coverage state, and posts one
+            # owner-facing line. It never reports clean.
+            - id: controller
+              name: Build the ledger and triage the head
+              if: steps.ledger.outputs.base_reset != 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
+                  HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+                  PREV_SHA: ${{ steps.ledger.outputs.prev_sha }}
+                  EARLIER_ROUNDS: ${{ steps.ledger.outputs.earlier_rounds }}
+                  SCOPE_SKIPPED: ${{ steps.scope.outputs.skip }}
+                  FORCED: ${{ github.event.action == 'labeled' && github.event.label.name == 'review:runeseer' }}
+              run: |
+                  set -o pipefail
+                  work="$RUNNER_TEMP/runeseer-controller"
+                  mkdir -p "$work"
+                  gh api "repos/$REPO/contents/$LANE_TABLE_PATH?ref=$DEFAULT_BRANCH" \
+                      -H 'Accept: application/vnd.github.raw+json' > "$work/lanes.json" \
+                      || { echo "could not read the lane table from $DEFAULT_BRANCH; rerun the check"; exit 1; }
+                  thread_query='query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
+                      repository(owner: $owner, name: $repo) {
+                          pullRequest(number: $number) {
+                              reviewThreads(first: 100, after: $endCursor) {
+                                  pageInfo { hasNextPage endCursor }
+                                  nodes {
+                                      id
+                                      path
+                                      line
+                                      originalLine
+                                      comments(first: 1) { nodes { databaseId url author { login } } }
+                                  }
+                              }
+                          }
+                      }
+                  }'
+                  gh api graphql --paginate -f query="$thread_query" \
+                      -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" \
+                      --jq '[.data.repository.pullRequest.reviewThreads.nodes[]]' \
+                      | jq -s 'add // []' > "$work/threads.json" \
+                      || { echo "could not read the review threads; rerun the check"; exit 1; }
+                  gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+                      --jq '[.check_runs[]]' | jq -s 'add // []' > "$work/check-runs.json" \
+                      || { echo "could not read the check runs; rerun the check"; exit 1; }
+                  gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
+                      --jq '[.[].name]' | jq -s 'add // []' > "$work/labels.json" \
+                      || { echo "could not read the live labels; rerun the check"; exit 1; }
+                  gh api "repos/$REPO/pulls/$PR" --jq '.body // ""' > "$work/body.txt" \
+                      || { echo "could not read the pull request body; rerun the check"; exit 1; }
+                  # The previous ledger carries the generation and the
+                  # dispositions already recorded on this head.
+                  previous_args=()
+                  ledger_id=$(gh api --paginate "repos/$REPO/actions/artifacts?name=${LEDGER_PREFIX}${PR}&per_page=100" \
+                      --jq '[.artifacts[] | select(.expired == false)]' \
+                      | jq -s -r 'add // [] | sort_by(.created_at) | reverse | .[0].id // empty') \
+                      || { echo "could not list the ledger artifacts; rerun the check"; exit 1; }
+                  if [ -n "$ledger_id" ]; then
+                      if gh api "repos/$REPO/actions/artifacts/$ledger_id/zip" > "$work/ledger.zip" \
+                          && unzip -o "$work/ledger.zip" runeseer-ledger.json -d "$work/previous" >/dev/null; then
+                          previous_args=(--previous-ledger "$work/previous/runeseer-ledger.json")
+                      else
+                          echo "the previous ledger artifact could not be read; this head starts a fresh ledger"
+                      fi
+                  fi
+                  # The paid budget is keyed to the work item, so a
+                  # replacement pull request does not reset the count. This
+                  # pull request's rounds come from the round counter; the
+                  # other pull requests naming the same change contribute
+                  # their highest verdict-marker round each.
+                  work_item=$(python3 "$RUNESEER_FORMATTER" work-item --body "$work/body.txt" --pr "$PR")
+                  paid_rounds="${EARLIER_ROUNDS:-0}"
+                  case "$work_item" in
+                      docs/changes/*)
+                          siblings=$(gh api -X GET search/issues \
+                              -f q="repo:$REPO is:pr \"$work_item\" in:body" \
+                              --jq '[.items[].number]' | jq -r ".[] | select(. != $PR)") \
+                              || { siblings=""; echo "could not search the work item's other pull requests; counting this one only"; }
+                          for sibling in $siblings; do
+                              gh api --paginate "repos/$REPO/issues/$sibling/comments?per_page=100" \
+                                  --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
+                                  | jq -s -r 'add // [] | .[]' > "$work/sibling-history.txt" || continue
+                              sibling_rounds=$(python3 "$RUNESEER_FORMATTER" marker-round --history "$work/sibling-history.txt")
+                              paid_rounds=$((paid_rounds + sibling_rounds))
+                          done
+                          ;;
+                  esac
+                  status_args=()
+                  if [ "$SCOPE_SKIPPED" = "true" ]; then
+                      status_args=(--lane-status runeseer=skipped)
+                  fi
+                  python3 "$RUNESEER_FORMATTER" build-ledger \
+                      --pr "$PR" --head "$HEAD_SHA" --base "$BASE_SHA" \
+                      --lane-table "$work/lanes.json" \
+                      --threads "$work/threads.json" \
+                      --check-runs "$work/check-runs.json" \
+                      --labels "$work/labels.json" \
+                      --body "$work/body.txt" \
+                      --paid-rounds "$paid_rounds" \
+                      "${previous_args[@]}" "${status_args[@]}" \
+                      --output runeseer-ledger.json
+                  echo "generation=$(jq -r '.generation' runeseer-ledger.json)" >> "$GITHUB_OUTPUT"
+                  echo "ledger: generation $(jq -r '.generation' runeseer-ledger.json), lanes $(jq -c '.lanes' runeseer-ledger.json), threads $(jq '.threads | length' runeseer-ledger.json), paid rounds $paid_rounds"
+                  if [ "$SCOPE_SKIPPED" = "true" ]; then
+                      jq '. + {coverage: "free lanes only: the skip:runeseer label excludes this change"}' \
+                          runeseer-ledger.json > "$work/ledger.tmp" \
+                          && command mv "$work/ledger.tmp" runeseer-ledger.json
+                      echo "stand_down=true" >> "$GITHUB_OUTPUT"
+                      echo "coverage=$(jq -r '.coverage' runeseer-ledger.json)" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+                  # The range since the last recorded verdict; the whole pull
+                  # request when no verdict exists on an ancestor.
+                  if [ -n "$PREV_SHA" ]; then
+                      git diff --name-only "$PREV_SHA" HEAD > "$work/files.txt"
+                  else
+                      command cp "$RUNNER_TEMP/pull-request-files.txt" "$work/files.txt"
+                  fi
+                  issue_comments=$(gh api "repos/$REPO/pulls/$PR" --jq '.comments + .review_comments') \
+                      || { echo "could not read the comment counts; rerun the check"; exit 1; }
+                  forced_args=()
+                  [ "$FORCED" != "true" ] || forced_args=(--forced)
+                  coverage=$(python3 "$RUNESEER_FORMATTER" triage \
+                      --ledger runeseer-ledger.json --files "$work/files.txt" \
+                      --comments "$issue_comments" --volume-limit "$LANE_VOLUME_LIMIT" \
+                      --instruction-pattern "$INSTRUCTION_PATTERN" "${forced_args[@]}" \
+                      --output runeseer-ledger.json)
+                  echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
+                  if [ "$coverage" = "paid" ]; then
+                      echo "stand_down=false" >> "$GITHUB_OUTPUT"
+                      echo "the triage admits this head to the paid lane"
+                      exit 0
+                  fi
+                  echo "stand_down=true" >> "$GITHUB_OUTPUT"
+                  {
+                      echo "### review/correctness stood down"
+                      echo ""
+                      echo "$coverage"
+                      echo ""
+                      echo "This green check records the coverage state, not a clean verdict."
+                  } >> "$GITHUB_STEP_SUMMARY"
+                  # One owner-facing line per head and generation. The live
+                  # head is re-read first, and an existing line is kept.
+                  notice=$(python3 "$RUNESEER_FORMATTER" standdown-notice --ledger runeseer-ledger.json)
+                  marker=$(printf '%s\n' "$notice" | head -n 1)
+                  live=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha') || live=""
+                  if [ "$live" != "$HEAD_SHA" ]; then
+                      echo "the pull request head changed; this stand-down posts no notice"
+                      exit 0
+                  fi
+                  posted=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100" \
+                      --jq "[.[] | select(.body | contains(\"$marker\"))] | length" | jq -s 'add // 0') || posted=0
+                  if [ "$posted" = "0" ]; then
+                      gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$notice" >/dev/null \
+                          || echo "could not post the stand-down notice; the ledger and the check summary still record it"
+                  fi
+
             # Only lane bots supply finding identities. Human replies supply
             # numeric references to parsed notices, never text for the model.
             - id: lanes
               name: Fetch the other lanes' findings
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   GH_TOKEN: ${{ github.token }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -475,19 +647,21 @@ jobs:
                       "$lane_tmp/review-bodies.json" \
                       "$lane_tmp/rebuttal-context.json" \
                       "$lane_tmp/runeseer-before.json" "$RUNESEER_LANES/"
+                  # The ledger the verdict must dispose of, read-only for the model.
+                  sudo install -o root -g root -m 0444 runeseer-ledger.json "$RUNESEER_LANES/ledger.json"
                   command rm -f "$RUNNER_TEMP/lane-inline-raw.json" \
                       "$RUNNER_TEMP/lane-issues-raw.json" "$RUNNER_TEMP/lane-reviews-raw.json"
                   echo "inline: $(jq 'length' "$lane_tmp/inline-comments.json"), issue: $(jq 'length' "$lane_tmp/issue-comments.json")"
 
             - id: runeseer
-              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
               with:
                   app-id: ${{ secrets.RUNESEER_APP_ID }}
                   private-key: ${{ secrets.RUNESEER_APP_KEY }}
 
             - id: adjudicate
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
               with:
                   claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -528,6 +702,9 @@ jobs:
                       - The previous verdict SHA is `${{ steps.ledger.outputs.prev_sha }}`.
                       - This is correctness round `${{ steps.ledger.outputs.round }}`.
                       - This pull request has already completed `${{ steps.ledger.outputs.earlier_rounds }}` correctness rounds.
+                      - `/usr/local/share/runeseer-lanes/ledger.json` is the controller's ledger for this head at generation `${{ steps.controller.outputs.generation }}`. Its `threads` array lists every review thread on the pull request by lane login. A thread with `disposition: null` is open, and a clean verdict must dispose of every open thread.
+                      - The workflow derives a disposition from your lane judgment on the thread's `comment_id`: `already addressed` is `fixed`, `disputed` is `rejected` with your reason, a Low `confirmed` note is `rejected`. A `confirmed` defect stays open and the verdict is `findings`.
+                      - When a thread needs the owner's decision, or the judgment mapping does not fit, add an entry to the optional `dispositions` array: `{"comment_id": <ledger comment_id>, "disposition": "fixed|rejected|owner", "reason": "<one sentence, required for rejected>"}`. A thread with `lane: null` comes from an unknown login: dispose of it the same way, and never treat it as a review.
 
                       Severity thresholds, binding:
                       - Critical: an exploitable security flaw, data loss, or a guaranteed crash on a normal path.
@@ -603,7 +780,8 @@ jobs:
                       Verdict file:
                       - Write valid JSON to `runeseer-verdict.json` in the workspace root.
                       - Use exactly this schema:
-                        `{"sha":"<full HEAD sha>","round":${{ steps.ledger.outputs.round }},"verdict":"clean|findings","count":N,"restart":"none|macroscope","nonfinding_issue_comment_ids":[123],"findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope|coderabbit","judgment":"confirmed","severity":"medium|high|critical","source_kind":"comment|review","comment_id":<originating comment or review database id>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope|coderabbit","judgment":"confirmed|disputed|already addressed","severity":"low|medium|high|critical","reason":"<judgment sentence>","source_kind":"comment|review","comment_id":<positive id from a trusted lane entry or carried Runeseer ledger entry>}]}`
+                        `{"sha":"<full HEAD sha>","round":${{ steps.ledger.outputs.round }},"verdict":"clean|findings","count":N,"restart":"none|macroscope","nonfinding_issue_comment_ids":[123],"findings":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope|coderabbit|codex","judgment":"confirmed","severity":"medium|high|critical","source_kind":"comment|review","comment_id":<originating comment or review database id>}],"lane_judgments":[{"path":"<path>","line":<line>,"summary":"<terse title>","lane":"runeseer|cursor|macroscope|coderabbit|codex","judgment":"confirmed|disputed|already addressed","severity":"low|medium|high|critical","reason":"<judgment sentence>","source_kind":"comment|review","comment_id":<positive id from a trusted lane entry or carried Runeseer ledger entry>}],"dispositions":[{"comment_id":<ledger comment_id>,"disposition":"fixed|rejected|owner","reason":"<one sentence>"}]}`
+                      - The `dispositions` array is optional. The workflow adds `generation` after the session. Do not write it.
                       - Include every open Medium, High, or Critical finding from any lane.
                       - Include at most 50 open findings and 200 lane judgments.
                       - Keep each model-authored text field within 4,096 UTF-8 bytes.
@@ -649,20 +827,36 @@ jobs:
             # Novel Runeseer comment IDs bind after Reviewdog posts the findings.
             - id: prevalidate
               name: Validate review output before publication
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  PR: ${{ github.event.pull_request.number }}
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  GENERATION: ${{ steps.controller.outputs.generation }}
                   RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
               run: |
+                  set -o pipefail
+                  # A round binds to (reviewed_sha, generation). A push during
+                  # the round voids it: the verdict judged a head that no
+                  # longer exists, so it is discarded before validation.
+                  live=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha') \
+                      || { echo "could not re-read the live head; rerun the check"; exit 1; }
+                  if [ "$live" != "$HEAD_SHA" ]; then
+                      echo "round voided by push: the head moved from $HEAD_SHA to $live during the round"
+                      command rm -f runeseer-verdict.json
+                      exit 1
+                  fi
                   for output in runeseer-verdict.json runeseer-findings.rdjsonl; do
                       [ -f "$output" ] || {
                           echo "The review did not create the required file: $output"
                           exit 1
                       }
                   done
-                  jq --arg base "$BASE_SHA" '. + {base: $base}' \
+                  jq --arg base "$BASE_SHA" --argjson generation "$GENERATION" \
+                      '. + {base: $base, generation: $generation}' \
                       runeseer-verdict.json > "$RUNNER_TEMP/runeseer-prevalidate-verdict.json"
                   python3 "$RUNESEER_FORMATTER" format \
                       --verdict "$RUNNER_TEMP/runeseer-prevalidate-verdict.json" \
@@ -675,6 +869,7 @@ jobs:
                       --lane-comments "$RUNESEER_LANES/review-bodies.json" \
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
                       --runeseer-findings runeseer-findings.rdjsonl \
+                      --ledger "$RUNESEER_LANES/ledger.json" \
                       --output "$RUNNER_TEMP/runeseer-prevalidate-review.md"
                   command mv "$RUNNER_TEMP/runeseer-prevalidate-verdict.json" \
                       runeseer-verdict.json
@@ -683,7 +878,7 @@ jobs:
             # repeated findings by fingerprint. It removes comments for absent
             # findings. It keeps comments that have replies.
             - name: Install reviewdog
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               # The pinned setup action verifies the selected release checksum.
               uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
               with:
@@ -691,7 +886,7 @@ jobs:
 
             - id: post_findings
               name: Post findings through reviewdog
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REVIEWDOG_GITHUB_API_TOKEN: ${{ steps.runeseer.outputs.token }}
@@ -741,7 +936,7 @@ jobs:
             # The findings file then keeps the verdict blocking and visible.
             - id: fetch_findings
               name: Fetch new Runeseer findings
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REPO: ${{ github.repository }}
@@ -786,19 +981,22 @@ jobs:
             # model, so it is never misremembered.
             - id: bind
               name: Bind verdict to base
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  GENERATION: ${{ steps.controller.outputs.generation }}
               run: |
                   [ -f runeseer-verdict.json ] || exit 0
-                  jq --arg base "$BASE_SHA" '. + {base: $base}' runeseer-verdict.json > runeseer-verdict.bound.json
+                  jq --arg base "$BASE_SHA" --argjson generation "$GENERATION" \
+                      '. + {base: $base, generation: $generation}' \
+                      runeseer-verdict.json > runeseer-verdict.bound.json
                   command mv runeseer-verdict.bound.json runeseer-verdict.json
 
             # The model writes judgment only. This step validates that judgment
             # and adds head-bound markers and accounting.
             - id: prepare
               name: Prepare current review summary
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
@@ -834,13 +1032,27 @@ jobs:
                       --runeseer-comments "$RUNESEER_LANES/runeseer-new-comments.json" \
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
                       --runeseer-findings runeseer-findings.rdjsonl \
+                      --ledger "$RUNESEER_LANES/ledger.json" \
                       --output runeseer-review.md
+
+            # The validated verdict carries every thread's disposition. The
+            # ledger records them with the (reviewed_sha, generation) binding
+            # so the resolver and the mirror read one source.
+            - id: apply_ledger
+              name: Record the verdict in the ledger
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
+              run: |
+                  python3 "$RUNESEER_FORMATTER" apply-verdict \
+                      --ledger runeseer-ledger.json \
+                      --verdict runeseer-verdict.json \
+                      --output runeseer-ledger.json
+                  echo "ledger dispositions: $(jq -c '[.threads[] | {lane, disposition}]' runeseer-ledger.json)"
 
             # The publisher verifies the live head, base, comment identity,
             # and stored body after deterministic preparation succeeds.
             - id: publish
               name: Publish current review summary
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REPO: ${{ github.repository }}
@@ -881,7 +1093,7 @@ jobs:
             # defects. Confirmed findings stay open for the owner's decision.
             - id: judgments
               name: Apply lane judgments
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   GH_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REPO: ${{ github.repository }}
@@ -1010,6 +1222,13 @@ jobs:
                           "repos/$REPO/pulls/$PR/comments/$first_comment_id/replies" \
                           -f body="$reply_body" 2>&1); then
                           echo "could not reply to review thread for $path:$line; leaving it unresolved: $reply_error"
+                          continue
+                      fi
+                      # Only a fixed disposition resolves. A rejected finding
+                      # keeps its thread open with the reply as the record,
+                      # so the owner can overrule the rejection in place.
+                      if [ "$(jq -r '.judgment' <<<"$judgment")" != "already addressed" ]; then
+                          echo "replied to the review thread for $path:$line; a rejected finding stays open"
                           continue
                       fi
                       check_current_round || exit 1
@@ -1149,7 +1368,7 @@ jobs:
             # round's ledger, and the approval's evidence.
             - id: upload
               name: Upload verdict
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
               with:
                   name: runeseer-verdict-pr${{ github.event.pull_request.number }}
@@ -1159,6 +1378,19 @@ jobs:
                       runeseer-findings.rdjsonl
                   retention-days: 30
                   if-no-files-found: warn
+
+            # The ledger uploads on every controller run: a stand-down, a
+            # voided round, and a judged round all leave a record. The
+            # resolver and the mirror read the newest one.
+            - id: upload_ledger
+              name: Upload ledger
+              if: always() && !cancelled() && steps.controller.outcome == 'success'
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+              with:
+                  name: runeseer-ledger-pr${{ github.event.pull_request.number }}
+                  path: runeseer-ledger.json
+                  retention-days: 90
+                  if-no-files-found: error
 
             # A review label requests one round, even when the scope stands down:
             # consuming the labels stops a later push from re-running the
@@ -1256,7 +1488,7 @@ jobs:
             # stage the adjudicator wanted re-run, so this step fails loudly.
             - id: restart
               name: Apply requested restart
-              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   GH_TOKEN: ${{ github.token }}
                   REPO: ${{ github.repository }}
@@ -1333,7 +1565,7 @@ jobs:
             # The breaker classifies every post-publication finalizer.
             - id: breaker
               name: Runeseer circuit breaker
-              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true'
+              if: always() && !cancelled() && steps.scope.outputs.skip == 'false' && steps.ledger.outputs.base_reset != 'true' && steps.controller.outputs.stand_down != 'true'
               env:
                   GH_TOKEN: ${{ github.token }}
                   REPO: ${{ github.repository }}
@@ -1342,6 +1574,7 @@ jobs:
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
                   RUNESEER_TOKEN: ${{ steps.runeseer.outputs.token }}
                   REVIEW_ROUND: ${{ steps.ledger.outputs.round }}
+                  GENERATION: ${{ steps.controller.outputs.generation }}
                   FORMATTER_OUTCOME: ${{ steps.formatter.outcome }}
                   ADJUDICATE_OUTCOME: ${{ steps.adjudicate.outcome }}
                   PREVALIDATE_OUTCOME: ${{ steps.prevalidate.outcome }}
@@ -1569,7 +1802,8 @@ jobs:
                       --lane-comments "$RUNESEER_LANES/review-bodies.json" \
                       --runeseer-comments "$RUNESEER_LANES/runeseer-new-comments.json" \
                       --previous-verdict "$RUNESEER_LANES/previous-verdict.json" \
-                      --runeseer-findings runeseer-findings.rdjsonl >/dev/null 2>&1; then
+                      --runeseer-findings runeseer-findings.rdjsonl \
+                      --ledger "$RUNESEER_LANES/ledger.json" >/dev/null 2>&1; then
                       verdict_valid=true
                   fi
                   if ! fault_kind=$(python3 "$RUNESEER_FORMATTER" failure-kind \
@@ -1626,11 +1860,13 @@ jobs:
                           exit 1
                       fi
 
-                      if jq -e --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" '
+                      if jq -e --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" --argjson generation "${GENERATION:-0}" '
                           .verdict == "clean" and .count == 0
                           and (.findings | type == "array" and length == 0)
                           and .restart == "none"
-                          and .sha == $sha and .base == $base' runeseer-verdict.json >/dev/null; then
+                          and .sha == $sha and .base == $base
+                          and .generation == $generation
+                          and ([.thread_dispositions[]? | select(.disposition == null)] | length == 0)' runeseer-verdict.json >/dev/null; then
                           approval_status=0
                           check_current_round || approval_status=$?
                           [ "$approval_status" -ne 2 ] || exit 0
@@ -1639,7 +1875,7 @@ jobs:
                                   "repos/$REPO/pulls/$PR/reviews" \
                                   -f event=APPROVE \
                                   -f commit_id="$HEAD_SHA" \
-                                  -f body="Earned approval: review/correctness returned a clean verdict for ${HEAD_SHA}. Dismissed automatically on any new push.") \
+                                  -f body="Earned approval: review/correctness returned a clean verdict for ${HEAD_SHA} at ledger generation ${GENERATION}. Dismissed automatically on any new push or generation.") \
                               || ! jq -e --arg head "$HEAD_SHA" '
                                   .state == "APPROVED" and .commit_id == $head' <<<"$approval" >/dev/null; then
                               echo "Runeseer could not publish the earned approval."
@@ -1666,8 +1902,18 @@ jobs:
                   HEAD_SHA: ${{ github.event.pull_request.head.sha }}
                   BASE_SHA: ${{ github.event.pull_request.base.sha }}
                   BASE_RESET: ${{ steps.ledger.outputs.base_reset }}
+                  STAND_DOWN: ${{ steps.controller.outputs.stand_down }}
+                  COVERAGE: ${{ steps.controller.outputs.coverage }}
+                  GENERATION: ${{ steps.controller.outputs.generation }}
               run: |
                   set -o pipefail
+                  # A stand-down is green with its coverage state on record.
+                  # It is never a clean verdict: the ledger says free lanes
+                  # only, and the owner signs with that coverage in view.
+                  if [ "$STAND_DOWN" = "true" ]; then
+                      echo "the paid lane stood down; coverage: $COVERAGE"
+                      exit 0
+                  fi
                   # The owner override reads first: ignore:runeseer withdraws
                   # the lane's power to hold the merge in every state, a
                   # base-reset round and a missing verdict included. Any
@@ -1694,15 +1940,17 @@ jobs:
                       echo "the pull request head or base changed; this stale verdict cannot clear the check."
                       exit 1
                   fi
-                  if jq -e --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" '
+                  if jq -e --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" --argjson generation "${GENERATION:-0}" '
                       .verdict == "clean" and .count == 0
                       and (.findings | type == "array" and length == 0)
                       and .restart == "none"
-                      and .sha == $sha and .base == $base' runeseer-verdict.json >/dev/null; then
+                      and .sha == $sha and .base == $base
+                      and .generation == $generation
+                      and ([.thread_dispositions[]? | select(.disposition == null)] | length == 0)' runeseer-verdict.json >/dev/null; then
                       exit 0
                   fi
-                  echo "the verdict is not an explicit no-restart clean for this head; the check stays red."
-                  jq -c '{verdict, count, sha, restart}' runeseer-verdict.json || true
+                  echo "the verdict is not an explicit no-restart clean for this head and generation with every thread disposed; the check stays red."
+                  jq -c '{verdict, count, sha, restart, generation}' runeseer-verdict.json || true
                   exit 1
 
             # Metrics: cost, turns, and finding counts land in the job

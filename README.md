@@ -2,7 +2,7 @@
 
 > Rune review and observation bot.
 
-Seer is the review machinery behind two GitHub Apps: **runeseer**, the reviewing identity, and **runewright**, the acting one. Both must be installed on the org and configured as Apps — credentials as org secrets, permissions per identity — before any lane runs; [INSTALL.md](INSTALL.md) carries the wiring. The workflows in this repository are the hands of both: a lane minting a runewright token acts (labels, comments, patches), and a lane minting a runeseer token reviews (verdicts, the earned approval). The identity that can write content holds no approval role, and the identity that approves cannot write content.
+Seer is the review machinery behind two GitHub Apps: **runeseer**, the reviewing identity, and **runewright**, the acting one. Both must be installed on the org and configured as Apps (credentials as org secrets, permissions per identity) before any lane runs. [INSTALL.md](INSTALL.md) carries the setup. The workflows in this repository are the hands of both: a lane minting a runewright token acts (labels, comments, patches), and a lane minting a runeseer token reviews (verdicts, the earned approval). The identity that can write content holds no approval role, and the identity that approves cannot write content.
 
 ## Lanes
 
@@ -11,14 +11,15 @@ Seer is the review machinery behind two GitHub Apps: **runeseer**, the reviewing
 | `review-cascade`     | bare `review` label             | Runs Macroscope correctness, then sends its findings to Runeseer. |
 |                      |                                 | Missing reviews, provider failures, and moved heads preserve the request. |
 | `review-cursor`      | `review:cursor` label           | Dispatches optional Bugbot. A failed dispatch preserves the request. |
-| `review-correctness` | `review:runeseer` label         | Adjudicates the free lanes' findings, reviews the diff, records a          |
-|                      |                                 | machine-readable verdict, earns the approval on an explicit clean          |
-|                      |                                 | verdict for the live head, and consumes the review labels.                 |
+| `review-correctness` | ready, push to a ready pull     | The controller. Builds the ledger from the API by lane login, triages    |
+|                      | request, `review:runeseer` label | the head, adjudicates the free lanes' findings, records a verdict bound  |
+|                      |                                 | to the head and ledger generation, earns the approval on a clean verdict |
+|                      |                                 | with every thread disposed, and consumes the review labels.              |
 | `autofix-suggest`    | `review:autofix` label          | Untrusted half: runs the fixers with no secrets, uploads a patch.          |
 | `autofix-comment`    | completed `autofix-suggest`     | Trusted half: binds the artifact to its run, posts the suggestion.         |
 | `congrats`           | push to `main`                  | Greets a contributor's first merged pull request.                          |
 | `issue-dedup`        | issue opened                    | Flags probable duplicates, referencing only gathered candidates.           |
-| `thread-resolver`    | push to a pull request          | Resolves threads named by `Resolves-Thread:` trailers, same PR only.       |
+| `thread-resolver`    | push to a pull request          | Resolves exactly the threads the ledger's verdict disposed as `fixed`.   |
 | `dashboard`          | schedule, runs here             | Sweeps the org for pull requests waiting only on the owner and keeps       |
 |                      |                                 | the "Awaiting owner review" issue current.                                 |
 
@@ -35,7 +36,7 @@ Runeseer remains the adjudicating lane.
 
 ## Caller contract
 
-A repository subscribes through workflow files: GitHub triggers only what exists in a repo's own `.github/workflows/`, so each repo carries a stub per lane that delegates with `uses: runedeck/seer/.github/workflows/<lane>.yaml@main`. Callers own the triggers, the concurrency, and the permissions; bodies own the logic and declare the secrets they need explicitly. First-party references ride `@main`: the trust boundary is push access to this repository, and its rulesets and history answer for every lane.
+A repository subscribes through workflow files: GitHub triggers only what exists in a repo's own `.github/workflows/`, so each repo carries a stub per lane that delegates with `uses: runedeck/seer/.github/workflows/<lane>.yaml@main`. Callers own the triggers, the concurrency, and the permissions. Bodies own the logic and declare the secrets they need explicitly. First-party references ride `@main`: the trust boundary is push access to this repository, and its rulesets and history answer for every lane.
 
 Pass the trusted `MACROSCOPE_CORRECTNESS_CHECK` repository variable to the `macroscope_correctness_check` input.
 The value must identify the observed core correctness check, not an approvability or custom-agent check.
