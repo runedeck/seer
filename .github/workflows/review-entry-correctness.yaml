@@ -152,8 +152,8 @@ jobs:
                       found=false
                       for candidate in $candidates; do
                           artifact_id=${candidate%%|*}
-                          run_id=${candidate#*|}
-                          run=$(gh api "repos/$REPO/actions/runs/$run_id") || return 1
+                          uploader=${candidate#*|}
+                          run=$(gh api "repos/$REPO/actions/runs/$uploader") || return 1
                           jq -e --argjson pr "$PR" '
                               .event == "pull_request_target"
                               and ([.pull_requests[]?.number] | index($pr) != null)' <<<"$run" >/dev/null || continue
