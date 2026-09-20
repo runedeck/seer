@@ -15,3 +15,9 @@ paths = [
     "^\\.specstory/debug/.*",
     "^\\.jj/.*",
 ]
+# Consumer entry: the escalation key fixture in the summary tests. It is
+# base64 of {"lane":"runeseer"}, and the generic key rule reads it as a
+# credential. The exact value is allowed, nothing wider.
+regexes = [
+    "^eyJsYW5lIjoicnVuZXNlZXIifQ==$",
+]
