@@ -11,10 +11,10 @@ Seer is the review machinery behind two GitHub Apps: **runeseer**, the reviewing
 | `review-cascade`     | bare `review` label             | Runs Macroscope correctness, then sends its findings to Runeseer. |
 |                      |                                 | Missing reviews, provider failures, and moved heads preserve the request. |
 | `review-cursor`      | `review:cursor` label           | Dispatches optional Bugbot. A failed dispatch preserves the request. |
-| `review-correctness` | ready, push to a ready pull     | The controller. Builds the ledger from the API by lane login, triages    |
-|                      | request, reopen, body edit      | the head, adjudicates the free lanes' findings, records a verdict bound  |
-|                      | (ledger only), `review:runeseer` | to the head and ledger generation, resolves the threads the verdict      |
-|                      | label                           | disposed as `fixed`, earns the approval on a clean verdict with every    |
+| `review-correctness` | every push to a same-repo pull  | The controller. Builds the ledger from the API by lane login, triages    |
+|                      | request, draft or ready, reopen,| the head, adjudicates the free lanes' findings, records a verdict bound  |
+|                      | body edit (ledger only), label   | to the head and ledger generation, resolves the threads the verdict      |
+|                      | `review:runeseer`               | disposed as `fixed`, earns the approval on a clean verdict with every    |
 |                      |                                 | thread disposed, and consumes the review labels.                         |
 | `autofix-suggest`    | `review:autofix` label          | Untrusted half: runs the fixers with no secrets, uploads a patch.          |
 | `autofix-comment`    | completed `autofix-suggest`     | Trusted half: binds the artifact to its run, posts the suggestion.         |
@@ -49,7 +49,7 @@ Only a new `review` label event cancels an active cascade. An `unlabeled` event 
 
 ## Known gaps
 
-- The open-seal is verified by `owner-seal`, which lives in the skeleton track and does not exist yet. Until it does, the controller starts the funnel on any ready event of a same-repository pull request, and a contributor with push access can ready a draft by hand and spend a paid round. The nonce line `Open-Seal-Nonce:` is not checked here.
+- The green draft starts the funnel (owner decision 2026-09-21): the paid round runs on a same-repository draft before the owner's first key touch, bounded by the work item's budget, and `rune sign open` seals a reviewed head. `owner-seal` verifies the seal. It does not start anything.
 - A late review thread runs the mirror, which reports the approval stale and dismisses it. The ledger generation itself moves on the next controller run. A late lane check run (a free lane that completes after the controller ran) moves the generation only on the next pull request event. The `check_run` event carries no pull request payload, so the entry workflow cannot route it to the controller.
 - The lane table accepts an optional `check_slug` per lane for the app slug that reports its check runs. The Codex and Cursor slugs are not verified against a live head and default to the login slug.
 - The ledger has two carriers. The artifact holds the full record and is trusted by the run that uploaded it. The check run named `ledger` on `reviewed_sha`, written under the runeseer app, carries one line `ledger: {artifact_id, digest, generation, pull_request, reviewed_sha}`. `owner-seal` and `rune sign` read that line, and a reader who needs the threads fetches the artifact and proves it by the digest. The runeseer app needs `checks: write` for this, an installation change the owner accepts once.

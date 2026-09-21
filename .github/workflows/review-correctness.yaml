@@ -58,21 +58,23 @@ env:
 jobs:
     correctness:
         name: correctness
-        # The controller invites the paid lane: on the ready event, on each
-        # later push to a ready pull request, on a reopen, and on the
-        # owner's review:runeseer label, which forces a round the triage
-        # would stand down. A body edit rebuilds the ledger only: the
-        # generation moves and no paid round starts. Drafts never reach
-        # here. The triage step below stands the lane down before any model
-        # call, so a push spends nothing unless the diff, the budget, the
-        # volume, and the deterministic checks admit it. Fork pull requests
+        # The controller invites the paid lane on every green head of a
+        # same-repository pull request, draft or ready, from the first push:
+        # the paid review runs before the owner's first key touch, and the
+        # open-seal then attests a reviewed head. It also runs on a reopen,
+        # on the ready flip, and on the owner's review:runeseer label, which
+        # forces a round the triage would stand down. A body edit rebuilds
+        # the ledger only: the generation moves and no paid round starts.
+        # The triage step below stands the lane down before any model call,
+        # so a push spends nothing unless the diff, the budget, the volume,
+        # and the deterministic checks admit it. Fork pull requests
         # cannot run this lane: GitHub strips the secrets it needs from
         # fork-triggered runs, and their funnel ends at the free lanes plus
         # the owner's review.
         if: >
-            github.event.pull_request.draft == false &&
             github.event.pull_request.head.repo.full_name == github.repository &&
             (
+                github.event.action == 'opened' ||
                 github.event.action == 'ready_for_review' ||
                 github.event.action == 'synchronize' ||
                 github.event.action == 'reopened' ||
