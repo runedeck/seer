@@ -43,7 +43,12 @@ gh() {
         *'mutation('*)
             printf '%s\n' "$request" >> "$POSTED"
             response='{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}' ;;
+        *'repos/runedeck/seer/contents/.github/lanes.json'*)
+            printf '%s\n' "$LANE_TABLE"; return 0 ;;
         *'/contents/.github/lanes.json'*)
+            if [ "${MOCK_CONSUMER_LANES:-present}" = "missing" ]; then
+                echo "gh: server error (${MOCK_LANES_ERROR:-HTTP 404})" >&2; return 1
+            fi
             printf '%s\n' "$LANE_TABLE"; return 0 ;;
         *'/contents/.github/scripts/runeseer_summary.py'*)
             cat "$RUNESEER_FORMATTER"; return 0 ;;
@@ -165,7 +170,7 @@ class BlockRunner(unittest.TestCase):
                 LEDGER_ONLY="false", GH_TOKEN="workflow-fixture", REVIEWER_LOGIN="runeseer[bot]",
                 RUNESEER_FORMATTER=str(formatter), RUNESEER_LANES=str(lanes_dir),
                 LANE_VOLUME_LIMIT="40", RUNNER_TEMP=str(root), POLL_ROUNDS="2", POLL_SECONDS="0",
-                GREEN_HEAD_CHECKS="quality", GITHUB_OUTPUT=str(root / "step-output"),
+                GREEN_HEAD_CHECKS="quality", WORKFLOW_SHA="f" * 40, GITHUB_OUTPUT=str(root / "step-output"),
                 GITHUB_STEP_SUMMARY=str(root / "step-summary"), TRACE=str(root / "trace"),
                 POSTED=str(root / "posted"), LANE_TABLE=LANES, MOCK_THREADS=json.dumps(list(threads)),
                 MOCK_RUNS=json.dumps(list(runs)), MOCK_LABELS=json.dumps([{"name": label} for label in labels]),
@@ -199,12 +204,14 @@ class BlockRunner(unittest.TestCase):
             verdict_exists = verdict_path.exists()
             posted = (root / "posted").read_text(encoding="utf-8")
             summary = (root / "step-summary").read_text(encoding="utf-8")
-        return Run(result, outputs, written, posted, summary, verdict_exists)
+            trace = (root / "trace").read_text(encoding="utf-8") if (root / "trace").exists() else ""
+        return Run(result, outputs, written, posted, summary, verdict_exists, trace)
 
 
 class Run:
-    def __init__(self, result, outputs, ledger, posted, summary, verdict_exists):
+    def __init__(self, result, outputs, ledger, posted, summary, verdict_exists, trace=""):
         self.result = result
+        self.trace = trace
         self.outputs = outputs
         self.ledger = ledger
         self.posted = posted
@@ -271,6 +278,28 @@ class ControllerStepTests(BlockRunner):
         self.assertEqual(run.posted.count("-X POST"), 1)
         self.assertIn("review/correctness stood down on `01234567`", run.posted)
         self.assertIn("This green check records the coverage state, not a clean verdict.", run.summary)
+
+    def test_consumer_without_a_lane_table_uses_the_workflow_revisions_copy(self):
+        # cli #67, first live round: the consumer carried no .github/lanes.json,
+        # the 404 ended the round at triage. The body's own table, pinned by
+        # job.workflow_sha like the formatter, answers instead, and the log says so.
+        run = self.controller(
+            files=("src/lib.rs",),
+            env_extra={"MOCK_CONSUMER_LANES": "missing"},
+        )
+        self.assertEqual(run.returncode, 0, run.result.stderr)
+        self.assertIn("has no .github/lanes.json; using runedeck/seer@", run.result.stdout)
+        self.assertIn("repos/runedeck/seer/contents/.github/lanes.json?ref=" + "f" * 40, run.trace)
+        # The table was read: the ledger carries a status for every expected lane.
+        self.assertEqual(set(run.ledger["lanes"]), {"codex", "cursor", "coderabbit", "macroscope", "runeseer"})
+
+    def test_a_lane_table_read_that_is_not_a_404_still_fails_the_round(self):
+        run = self.controller(
+            files=("src/lib.rs",),
+            env_extra={"MOCK_CONSUMER_LANES": "missing", "MOCK_LANES_ERROR": "HTTP 500"},
+        )
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("could not read the lane table", run.result.stdout)
 
     def test_existing_notice_is_not_posted_twice(self):
         notice = "<!-- runeseer-standdown head=" + HEAD + " generation=1 -->\nreview/correctness stood down"

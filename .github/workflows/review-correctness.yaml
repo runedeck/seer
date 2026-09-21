@@ -493,13 +493,34 @@ jobs:
                   PAID_ROUNDS: ${{ steps.ledger.outputs.paid_rounds }}
                   SCOPE_SKIPPED: ${{ steps.scope.outputs.skip }}
                   LEDGER_ONLY: ${{ github.event.action == 'edited' }}
+                  WORKFLOW_SHA: ${{ job.workflow_sha }}
               run: |
                   set -o pipefail
                   work="$RUNNER_TEMP/runeseer-controller"
                   mkdir -p "$work"
-                  gh api "repos/$REPO/contents/$LANE_TABLE_PATH?ref=$DEFAULT_BRANCH" \
-                      -H 'Accept: application/vnd.github.raw+json' > "$work/lanes.json" \
-                      || { echo "could not read the lane table from $DEFAULT_BRANCH; rerun the check"; exit 1; }
+                  # The consumer's lane table from its protected default branch,
+                  # when it carries one. A consumer without the file uses the
+                  # table this workflow revision ships, pinned by job.workflow_sha
+                  # like the formatter above, so a missing table never ends a
+                  # round and a consumer copy still wins when present.
+                  if gh api "repos/$REPO/contents/$LANE_TABLE_PATH?ref=$DEFAULT_BRANCH" \
+                      -H 'Accept: application/vnd.github.raw+json' > "$work/lanes.json" 2>"$work/lanes.err"; then
+                      echo "lane table: $REPO@$DEFAULT_BRANCH"
+                  else
+                      case "$(cat "$work/lanes.err")" in
+                          *'HTTP 404'*)
+                              [ -n "$WORKFLOW_SHA" ] || { echo "could not resolve the reusable workflow revision for the lane table"; exit 1; }
+                              gh api "repos/runedeck/seer/contents/.github/lanes.json?ref=$WORKFLOW_SHA" \
+                                  -H 'Accept: application/vnd.github.raw+json' > "$work/lanes.json" \
+                                  || { echo "could not read the lane table from $REPO@$DEFAULT_BRANCH or runedeck/seer@$WORKFLOW_SHA; rerun the check"; exit 1; }
+                              echo "lane table: $REPO@$DEFAULT_BRANCH has no $LANE_TABLE_PATH; using runedeck/seer@${WORKFLOW_SHA:0:12}"
+                              ;;
+                          *)
+                              echo "could not read the lane table from $DEFAULT_BRANCH: $(cat "$work/lanes.err"); rerun the check"
+                              exit 1
+                              ;;
+                      esac
+                  fi
                   # Later steps read the same table: the lane logins for the
                   # evidence fetch and the formatter's lane maps.
                   sudo install -d -o root -g root -m 0555 "$RUNESEER_LANES"
