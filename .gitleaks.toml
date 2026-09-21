@@ -15,6 +15,10 @@ paths = [
     "^\\.specstory/debug/.*",
     "^\\.jj/.*",
 ]
+# An OpenPGP fingerprint is public: KEYS pins one per signer, the trusted-key
+# resolver prints it, and recorded proofs show it. gitleaks matches these
+# regexes against the captured secret, so the pattern is the bare
+# fingerprint: exactly forty hexadecimal characters, nothing else.
 # Consumer entry: the escalation key fixture in the summary tests. It is
 # base64 of {"lane":"runeseer"}, and the generic key rule reads it as a
 # credential. The exact value is allowed, nothing wider.
