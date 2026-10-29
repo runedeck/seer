@@ -1342,18 +1342,23 @@ class WorkflowSourceTests(unittest.TestCase):
         self.assertIn("github.event.action == ''synchronize''", review)
         self.assertIn("github.event.action == ''reopened''", review)
         self.assertIn("github.event.action == ''edited''", review)
-        self.assertIn("github.event.pull_request.draft == false", review)
+        # The green draft starts the funnel: a same-repository draft reaches
+        # the controller, and a fork head reaches it through a label only.
+        self.assertNotIn("github.event.pull_request.draft == false", review)
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", review)
         # A review comment runs only the mirror.
         self.assertIn("    pull_request_review_comment:\n        types:\n            - created\n", self.entry_source)
         self.assertIn("github.event_name == ''pull_request_target''", review)
-        # The body's own guard admits the same events and no draft.
+        # The body's own guard admits the same events on a same-repository
+        # head, draft or ready.
         guard = self.section("        if: >", "        runs-on:")
         self.assertIn("github.event.action == 'ready_for_review'", guard)
         self.assertIn("github.event.action == 'synchronize'", guard)
         self.assertIn("github.event.action == 'reopened'", guard)
         self.assertIn("github.event.action == 'edited'", guard)
         self.assertIn("'review:runeseer'", guard)
-        self.assertIn("github.event.pull_request.draft == false", guard)
+        self.assertNotIn("github.event.pull_request.draft == false", guard)
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", guard)
 
     def test_macroscope_label_changes_cancel_an_older_consumer(self):
         self.assertIn(
