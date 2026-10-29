@@ -3,7 +3,7 @@ adr: "https://github.com/runedeck/deck/blob/main/docs/decisions/DECK-0012%20Cons
 status: proposed
 ---
 
-# Consumers Copier
+# Retire Unused Waiver Label
 
 ## Why
 
@@ -15,7 +15,7 @@ Seer provisioned a `spec:none` label that no seer workflow reads. The other repo
 
 ## Capabilities
 
-- review-ceremony (new)
+- retire-unused-waiver-label (new)
 
 ## Impact
 
