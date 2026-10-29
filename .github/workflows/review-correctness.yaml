@@ -47,8 +47,13 @@ env:
     LANE_VOLUME_LIMIT: ${{ vars.LANE_VOLUME_LIMIT || 40 }}
     # The deterministic checks a head must pass before the paid lane is
     # invited on it. Space-separated check-run names. The controller waits
-    # for them within the poll budget and stands down when one is red.
+    # for them within its own budget and stands down when one is red.
     GREEN_HEAD_CHECKS: ${{ vars.GREEN_HEAD_CHECKS || 'quality' }}
+    # The green-head wait has its own budget, in poll rounds. The checks
+    # start beside the controller on the same push, and a consumer's
+    # quality job can outlast the five minutes the other waits poll, so the
+    # shared budget stood every such push down before its head turned green.
+    GREEN_HEAD_POLL_ROUNDS: ${{ vars.GREEN_HEAD_POLL_ROUNDS || 60 }}
     RUNESEER_FORMATTER: /usr/local/lib/runeseer_summary.py
     RUNESEER_LANES: /usr/local/share/runeseer-lanes
     INSTRUCTION_PATTERN: '(^|/)(CLAUDE|AGENTS)(\.local)?\.md$|^\.claude(/|$)|^\.cursor(/|$)|(^|/)copilot-instructions\.md$|^\.mcp\.json$|^\.rune$'
@@ -85,7 +90,8 @@ jobs:
                 )
             )
         runs-on: ubuntu-latest
-        timeout-minutes: 40
+        # The green-head wait, the Macroscope wait, and the model call.
+        timeout-minutes: 55
         steps:
             # The head commit itself, not the synthetic merge ref: the verdict
             # must record the sha the approval step compares against.
@@ -541,21 +547,28 @@ jobs:
                           }
                       }
                   }'
-                  gh api graphql --paginate -f query="$thread_query" \
-                      -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" \
-                      --jq '[.data.repository.pullRequest.reviewThreads.nodes[]]' \
-                      | jq -s 'add // []' > "$work/threads.json" \
-                      || { echo "could not read the review threads; rerun the check"; exit 1; }
+                  # The threads, the labels, and the body the ledger records.
+                  # The green-head wait reads them again: a lane thread or a
+                  # body edit that arrives during the wait must enter the
+                  # ledger the round binds to, or the mirror finds it stale.
+                  read_pull_request() {
+                      gh api graphql --paginate -f query="$thread_query" \
+                          -f owner="${REPO%/*}" -f repo="${REPO#*/}" -F number="$PR" \
+                          --jq '[.data.repository.pullRequest.reviewThreads.nodes[]]' \
+                          | jq -s 'add // []' > "$work/threads.json" \
+                          || { echo "could not read the review threads; rerun the check"; exit 1; }
+                      gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
+                          --jq '[.[].name]' | jq -s 'add // []' > "$work/labels.json" \
+                          || { echo "could not read the live labels; rerun the check"; exit 1; }
+                      gh api "repos/$REPO/pulls/$PR" --jq '.body // ""' > "$work/body.txt" \
+                          || { echo "could not read the pull request body; rerun the check"; exit 1; }
+                  }
+                  read_pull_request
                   read_check_runs() {
                       gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
                           --jq '[.check_runs[]]' | jq -s 'add // []' > "$work/check-runs.json"
                   }
                   read_check_runs || { echo "could not read the check runs; rerun the check"; exit 1; }
-                  gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
-                      --jq '[.[].name]' | jq -s 'add // []' > "$work/labels.json" \
-                      || { echo "could not read the live labels; rerun the check"; exit 1; }
-                  gh api "repos/$REPO/pulls/$PR" --jq '.body // ""' > "$work/body.txt" \
-                      || { echo "could not read the pull request body; rerun the check"; exit 1; }
                   # The owner's label forces a round whether it arrived now or
                   # while the pull request was a draft.
                   forced=$(jq -r 'index("review:runeseer") != null' "$work/labels.json")
@@ -597,29 +610,32 @@ jobs:
                   # The other pull requests naming the same change add their
                   # own. A failed search fails the step: a budget that cannot
                   # be counted admits nothing.
-                  work_item=$(python3 "$RUNESEER_FORMATTER" work-item --body "$work/body.txt" --pr "$PR")
-                  paid_rounds="${PAID_ROUNDS:-0}"
-                  case "$work_item" in
-                      docs/changes/*)
-                          siblings=$(gh api -X GET search/issues \
-                              -f q="repo:$REPO is:pr \"$work_item\" in:body" \
-                              --jq '[.items[].number]' | jq -r ".[] | select(. != $PR)") \
-                              || { echo "could not search the work item's other pull requests; rerun the check"; exit 1; }
-                          for sibling in $siblings; do
-                              gh api "repos/$REPO/pulls/$sibling" --jq '.body // ""' > "$work/sibling-body.txt" \
-                                  || { echo "could not read pull request $sibling; rerun the check"; exit 1; }
-                              sibling_item=$(python3 "$RUNESEER_FORMATTER" work-item --body "$work/sibling-body.txt" --pr "$sibling")
-                              [ "$sibling_item" = "$work_item" ] || continue
-                              gh api --paginate "repos/$REPO/issues/$sibling/comments?per_page=100" \
-                                  --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
-                                  | jq -s -r 'add // [] | .[]' > "$work/sibling-history.txt" \
-                                  || { echo "could not read the rounds of pull request $sibling; rerun the check"; exit 1; }
-                              sibling_rounds=$(python3 "$RUNESEER_FORMATTER" marker-round \
-                                  --history "$work/sibling-history.txt" --dispatches)
-                              paid_rounds=$((paid_rounds + sibling_rounds))
-                          done
-                          ;;
-                  esac
+                  count_paid_rounds() {
+                      work_item=$(python3 "$RUNESEER_FORMATTER" work-item --body "$work/body.txt" --pr "$PR")
+                      paid_rounds="${PAID_ROUNDS:-0}"
+                      case "$work_item" in
+                          docs/changes/*)
+                              siblings=$(gh api -X GET search/issues \
+                                  -f q="repo:$REPO is:pr \"$work_item\" in:body" \
+                                  --jq '[.items[].number]' | jq -r ".[] | select(. != $PR)") \
+                                  || { echo "could not search the work item's other pull requests; rerun the check"; exit 1; }
+                              for sibling in $siblings; do
+                                  gh api "repos/$REPO/pulls/$sibling" --jq '.body // ""' > "$work/sibling-body.txt" \
+                                      || { echo "could not read pull request $sibling; rerun the check"; exit 1; }
+                                  sibling_item=$(python3 "$RUNESEER_FORMATTER" work-item --body "$work/sibling-body.txt" --pr "$sibling")
+                                  [ "$sibling_item" = "$work_item" ] || continue
+                                  gh api --paginate "repos/$REPO/issues/$sibling/comments?per_page=100" \
+                                      --jq '[.[] | select(.user.login == env.REVIEWER_LOGIN) | .body]' \
+                                      | jq -s -r 'add // [] | .[]' > "$work/sibling-history.txt" \
+                                      || { echo "could not read the rounds of pull request $sibling; rerun the check"; exit 1; }
+                                  sibling_rounds=$(python3 "$RUNESEER_FORMATTER" marker-round \
+                                      --history "$work/sibling-history.txt" --dispatches)
+                                  paid_rounds=$((paid_rounds + sibling_rounds))
+                              done
+                              ;;
+                      esac
+                  }
+                  count_paid_rounds
                   status_args=()
                   if [ "$SCOPE_SKIPPED" = "true" ]; then
                       status_args=(--lane-status runeseer=skipped)
@@ -661,11 +677,12 @@ jobs:
                   # A green head: the deterministic checks on this head are
                   # complete and green before the paid lane is invited. They
                   # run beside this controller on a push, so the wait is the
-                  # poll budget. The owner's label bypasses the wait: the
-                  # spend is theirs.
+                  # green-head budget. The owner's label bypasses the wait:
+                  # the spend is theirs.
                   green_reason=""
+                  waited=false
                   if [ "$forced" != "true" ] && [ -n "$GREEN_HEAD_CHECKS" ]; then
-                      for _ in $(seq 1 "$POLL_ROUNDS"); do
+                      for _ in $(seq 1 "$GREEN_HEAD_POLL_ROUNDS"); do
                           green_reason=""
                           for name in $GREEN_HEAD_CHECKS; do
                               state=$(jq -r --arg name "$name" '
@@ -682,8 +699,17 @@ jobs:
                           done
                           [ -n "$green_reason" ] || break
                           sleep "$POLL_SECONDS"
+                          waited=true
                           read_check_runs || { echo "could not read the check runs; rerun the check"; exit 1; }
                       done
+                      # A wait can outlast a lane thread or a body edit, so the
+                      # ledger reads the pull request again, and the budget
+                      # follows the work item that body names.
+                      if [ "$waited" = "true" ]; then
+                          read_pull_request
+                          count_paid_rounds
+                          echo "read the pull request again after the green-head wait; paid rounds $paid_rounds"
+                      fi
                       # The statuses the ledger records come from the last read.
                       build_ledger || exit 1
                   fi
