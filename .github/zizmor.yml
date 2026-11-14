@@ -26,6 +26,10 @@ rules:
             - review-entry-cascade.yaml
             - review-entry-correctness.yaml
             - review-entry-cursor.yaml
+            # workflow_run of the Quality push run is how the draft opens
+            # without a second build. The job reads one markdown file from
+            # the proven head with credentials off; nothing from it runs.
+            - draft-open.yaml
     unpinned-uses:
         # runedeck/* first-party references are exempt from SHA pinning by
         # the action-pinning check in quality.yaml; zizmor cannot express
@@ -71,13 +75,6 @@ rules:
         ignore:
             - attestations.yaml
             - secret-scan.yaml
-    self-repository:
-        # The `$/` form guards against a runtime-cloned action directory. A
-        # local reusable workflow is resolved by the service at the caller's
-        # commit either way, and the Action pinning step in quality.yaml
-        # and the pinned actionlint know the `./` form.
-        ignore:
-            - draft-open.yaml
     template-injection:
         # The expansion sites are separate triage work.
         ignore:
