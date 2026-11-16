@@ -5,9 +5,12 @@ mirror under a bash `gh` mock, so a guard order or a shell error fails
 here rather than on a live pull request.
 """
 
+import hashlib
 import io
 import json
 import os
+import re
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -96,7 +99,12 @@ sudo() {
     done
     "${args[@]}"
 }
-sleep() { :; }
+# A wait never sleeps. MOCK_AFTER_SLEEP changes the fixture between polls,
+# as a check that completes or a body edit would during a real wait.
+sleep() {
+    slept=$((${slept:-0} + 1))
+    [ -z "${MOCK_AFTER_SLEEP:-}" ] || eval "$MOCK_AFTER_SLEEP"
+}
 """
 
 
@@ -170,7 +178,7 @@ class BlockRunner(unittest.TestCase):
                 LEDGER_ONLY="false", GH_TOKEN="workflow-fixture", REVIEWER_LOGIN="runeseer[bot]",
                 RUNESEER_FORMATTER=str(formatter), RUNESEER_LANES=str(lanes_dir),
                 LANE_VOLUME_LIMIT="40", RUNNER_TEMP=str(root), POLL_ROUNDS="2", POLL_SECONDS="0",
-                GREEN_HEAD_CHECKS="quality", WORKFLOW_SHA="f" * 40, GITHUB_OUTPUT=str(root / "step-output"),
+                GREEN_HEAD_CHECKS="quality", GREEN_HEAD_POLL_ROUNDS="2", WORKFLOW_SHA="f" * 40, GITHUB_OUTPUT=str(root / "step-output"),
                 GITHUB_STEP_SUMMARY=str(root / "step-summary"), TRACE=str(root / "trace"),
                 POSTED=str(root / "posted"), LANE_TABLE=LANES, MOCK_THREADS=json.dumps(list(threads)),
                 MOCK_RUNS=json.dumps(list(runs)), MOCK_LABELS=json.dumps([{"name": label} for label in labels]),
@@ -418,6 +426,53 @@ class ControllerStepTests(BlockRunner):
         self.assertEqual(forced.outputs["stand_down"], "false")
         self.assertEqual(forced.outputs["forced"], "true")
 
+    def test_green_head_wait_outlasts_the_shared_poll_budget(self):
+        # Deck pull request 83: quality ran past the shared poll budget, the
+        # push stood down as pending, and no later event triaged the head.
+        green = json.dumps([check_run("quality")])
+        run = self.controller(
+            runs=[check_run("quality", None, "in_progress")],
+            env_extra={"POLL_ROUNDS": "2", "GREEN_HEAD_POLL_ROUNDS": "4",
+                       "MOCK_AFTER_SLEEP": f"[ \"$slept\" -lt 3 ] || MOCK_RUNS='{green}'"},
+        )
+        self.assertEqual(run.returncode, 0, run.result.stderr)
+        self.assertEqual(run.outputs["stand_down"], "false")
+        self.assertEqual(run.outputs["coverage"], "paid")
+
+    def test_wait_reads_the_pull_request_again_before_the_ledger(self):
+        # A body edit and a lane thread that arrive during the wait enter the
+        # ledger the round binds to, so the mirror does not stale its verdict.
+        edited = BODY + "\n\nedited during the wait"
+        green = json.dumps([check_run("quality")])
+        late = json.dumps([thread("PRRT_late", "cursor", 31)])
+        run = self.controller(
+            runs=[check_run("quality", None, "queued")],
+            env_extra={"MOCK_AFTER_SLEEP": f"MOCK_RUNS='{green}'; MOCK_THREADS='{late}'; MOCK_BODY={shlex.quote(edited)}"},
+        )
+        self.assertEqual(run.returncode, 0, run.result.stderr)
+        self.assertEqual(run.outputs["coverage"], "paid")
+        self.assertEqual(run.ledger["body_digest"], hashlib.sha256((edited + "\n").encode()).hexdigest())
+        self.assertEqual([entry["id"] for entry in run.ledger["threads"]], ["PRRT_late"])
+        self.assertIn("read the pull request again after the green-head wait", run.stdout)
+        # A head that is green on the first read is not read twice.
+        fast = self.controller()
+        self.assertEqual(fast.trace.count("api graphql"), 1)
+
+    def test_wait_counts_the_budget_for_the_body_read_after_it(self):
+        # The body names its change only after the wait. That change's rounds
+        # on its other pull request count, and the fourth round is refused.
+        marker = "<!-- runeseer-round-start sha=" + "e" * 40 + " base=" + BASE + " round=2 -->"
+        green = json.dumps([check_run("quality")])
+        run = self.controller(
+            runs=[check_run("quality", None, "in_progress")], body="no change named\n\n## Release Notes\n- N/A",
+            search=(8,), sibling_comments=[{"user": {"login": "runeseer[bot]"}, "body": marker}],
+            env_extra={"PAID_ROUNDS": "1", "MOCK_AFTER_SLEEP": f"MOCK_RUNS='{green}'; MOCK_BODY={shlex.quote(BODY)}"},
+        )
+        self.assertEqual(run.returncode, 0, run.result.stderr)
+        self.assertEqual(run.ledger["paid_rounds"], 3)
+        self.assertEqual(run.outputs["stand_down"], "true")
+        self.assertIn("has spent 3 paid rounds", run.outputs["coverage"])
+
     def test_label_applied_in_draft_still_forces_the_round(self):
         run = self.controller(files=("README.md",), labels=("review:runeseer",))
         self.assertEqual(run.returncode, 0, run.result.stderr)
@@ -473,6 +528,21 @@ class ControllerStepTests(BlockRunner):
                               body="no change named\n\n## Release Notes\n- N/A")
         self.assertEqual(run.returncode, 1)
         self.assertIn("The work item changed from docs/changes/review-loop to pull/7", run.result.stderr)
+
+
+class GreenHeadBudgetTests(unittest.TestCase):
+    def test_default_wait_outlasts_a_slow_quality_job_inside_the_job_timeout(self):
+        # The deck's quality job ran 325 to 505 seconds on its October 2026
+        # pull request runs. The default wait allows twice the slowest, and
+        # the job timeout still leaves twenty minutes for the model call.
+        rounds = int(re.search(r"GREEN_HEAD_POLL_ROUNDS: \$\{\{ vars\.GREEN_HEAD_POLL_ROUNDS \|\| (\d+) \}\}", WORKFLOW).group(1))
+        defaults = env_defaults(WORKFLOW)
+        seconds = int(defaults["POLL_SECONDS"])
+        self.assertGreaterEqual(rounds * seconds, 2 * 505)
+        job = WORKFLOW.split("\n    correctness:\n", 1)[1]
+        timeout = int(re.search(r"timeout-minutes: (\d+)", job).group(1))
+        macroscope_wait = int(defaults["POLL_ROUNDS"]) * seconds
+        self.assertGreaterEqual(timeout * 60 - rounds * seconds - macroscope_wait, 20 * 60)
 
 
 class DispatchStepTests(BlockRunner):
