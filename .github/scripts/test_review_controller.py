@@ -547,6 +547,33 @@ class ControllerStepTests(BlockRunner):
         self.assertEqual(run.ledger["coverage"], "paid")
         self.assertEqual(run.posted, "")
 
+    def test_recorded_body_edit_keeps_the_verdict_when_a_free_lane_finishes(self):
+        # cli #84 and skeleton #58 on 2026-11-24: the edit event queued behind
+        # the round that had already read the edited body. Macroscope finished
+        # in between, the rebuild moved the generation, and an edit starts no
+        # round, so the mirror found the head unjudged. The previous ledger
+        # already records this body, so the run keeps it and its verdict.
+        artifacts, runs_by_id = trusted_artifact()
+        previous = recorded_ledger(lanes={**recorded_ledger()["lanes"], "macroscope": "pending"})
+        finished = [check_run("quality"), check_run("macroscope", slug="macroscopeapp")]
+        run = self.controller(artifacts=artifacts, runs_by_id=runs_by_id, ledger=previous, runs=finished,
+                              env_extra={"LEDGER_ONLY": "true"})
+        self.assertEqual(run.returncode, 0, run.result.stderr)
+        self.assertEqual(run.ledger, previous)
+        self.assertEqual(run.outputs["generation"], "1")
+        self.assertEqual((run.outputs["stand_down"], run.outputs["coverage"]), ("true", "paid"))
+        self.assertEqual(run.posted, "")
+        # A thread the previous ledger never saw still moves the generation
+        # and drops the verdict.
+        late = self.controller(artifacts=artifacts, runs_by_id=runs_by_id, ledger=previous, runs=finished,
+                               threads=[thread("PRRT_late", "cursor", 9)], env_extra={"LEDGER_ONLY": "true"})
+        self.assertEqual(late.returncode, 0, late.result.stderr)
+        self.assertEqual((late.ledger["generation"], late.ledger["verdict"]), (2, None))
+        # A run that can judge still records the lane change as a new generation.
+        judged = self.controller(artifacts=artifacts, runs_by_id=runs_by_id, ledger=previous, runs=finished)
+        self.assertEqual(judged.returncode, 0, judged.result.stderr)
+        self.assertEqual((judged.ledger["generation"], judged.outputs["stand_down"]), (2, "false"))
+
     def test_forced_label_reruns_a_judged_head(self):
         artifacts, runs_by_id = trusted_artifact()
         run = self.controller(artifacts=artifacts, runs_by_id=runs_by_id, ledger=recorded_ledger(),

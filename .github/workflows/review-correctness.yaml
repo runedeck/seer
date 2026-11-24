@@ -70,6 +70,7 @@ jobs:
         # on the ready flip, and on the owner's review:runeseer label, which
         # forces a round the triage would stand down. A body edit rebuilds
         # the ledger only: the generation moves and no paid round starts.
+        # An edit that the previous ledger already records keeps that ledger.
         # The triage step below stands the lane down before any model call,
         # so a push spends nothing unless the diff, the budget, the volume,
         # and the deterministic checks admit it. Fork pull requests
@@ -666,6 +667,30 @@ jobs:
                       jq '. + {coverage: "free lanes only: the skip:runeseer label excludes this change"}' \
                           runeseer-ledger.json > "$work/ledger.tmp" \
                           && command mv "$work/ledger.tmp" runeseer-ledger.json
+                      stand_down
+                      exit 0
+                  fi
+                  # A body edit starts no round, so it must not unjudge a head
+                  # that a round judged. The edit event can queue behind the
+                  # round that already read the edited body, and a free lane
+                  # can finish in between. Its new status alone would move
+                  # the generation and drop the verdict. When the previous
+                  # ledger on this head already records this body and every
+                  # live thread, the edit has nothing to record: the run keeps
+                  # that ledger byte for byte, with its generation and its
+                  # verdict. A new thread or a new body still rebuilds it.
+                  if [ "$LEDGER_ONLY" = "true" ] && [ "$forced" != "true" ] \
+                      && [ "${#previous_args[@]}" -gt 0 ] \
+                      && jq -e --slurpfile previous "$work/previous/runeseer-ledger.json" '
+                          $previous[0] as $earlier
+                          | .reviewed_sha == $earlier.reviewed_sha
+                          and .body_digest == $earlier.body_digest
+                          and ([.threads[].id] - [$earlier.threads[].id] | length == 0)' \
+                          runeseer-ledger.json >/dev/null; then
+                      command cp "$work/previous/runeseer-ledger.json" runeseer-ledger.json
+                      generation=$(jq -r '.generation' runeseer-ledger.json)
+                      echo "generation=$generation" >> "$GITHUB_OUTPUT"
+                      echo "the previous ledger already records this body and every thread; the edit keeps generation $generation"
                       stand_down
                       exit 0
                   fi
