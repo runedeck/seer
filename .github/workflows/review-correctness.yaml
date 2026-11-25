@@ -70,6 +70,7 @@ jobs:
         # on the ready flip, and on the owner's review:runeseer label, which
         # forces a round the triage would stand down. A body edit rebuilds
         # the ledger only: the generation moves and no paid round starts.
+        # An edit on a head that no ledger records acts as a push.
         # The triage step below stands the lane down before any model call,
         # so a push spends nothing unless the diff, the budget, the volume,
         # and the deterministic checks admit it. Fork pull requests
@@ -604,6 +605,20 @@ jobs:
                       echo "previous ledger: artifact $artifact_id from run $run_id"
                       break
                   done
+                  # GitHub keeps one waiting run per concurrency group and
+                  # cancels the older one. So a body edit can replace the
+                  # waiting push run of a head that no run has recorded:
+                  # the open-seal pushes the seal, flips the draft, and
+                  # writes the nonce into the body within seconds. When no
+                  # trusted ledger records this head, the edit run acts as
+                  # the push run, and the consume step reads this output.
+                  if [ "$LEDGER_ONLY" = "true" ] && { [ "${#previous_args[@]}" -eq 0 ] \
+                      || ! jq -e --arg head "$HEAD_SHA" '.reviewed_sha == $head' \
+                          "$work/previous/runeseer-ledger.json" >/dev/null; }; then
+                      LEDGER_ONLY=false
+                      echo "no ledger records this head yet; the edit run acts as the push run it may have replaced"
+                  fi
+                  echo "ledger_only=$LEDGER_ONLY" >> "$GITHUB_OUTPUT"
                   # The paid budget is keyed to the work item, so a
                   # replacement pull request does not reset the count. This
                   # pull request's rounds come from its dispatch markers.
@@ -1697,7 +1712,7 @@ jobs:
                   BASE_RESET: ${{ steps.ledger.outputs.base_reset }}
                   SUMMARY_COMMENT_ID: ${{ steps.publish.outputs.summary_comment_id }}
                   INITIAL_REVIEW_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-                  LEDGER_ONLY: ${{ github.event.action == 'edited' }}
+                  LEDGER_ONLY: ${{ steps.controller.outputs.ledger_only || github.event.action == 'edited' }}
                   FORCED: ${{ steps.controller.outputs.forced }}
               run: |
                   set -o pipefail

@@ -547,6 +547,30 @@ class ControllerStepTests(BlockRunner):
         self.assertEqual(run.ledger["coverage"], "paid")
         self.assertEqual(run.posted, "")
 
+    def test_edit_on_an_unrecorded_head_acts_as_the_push_it_replaced(self):
+        # cli #91 on 2026-11-25: the open-seal pushed the seal, flipped the
+        # draft, and wrote the nonce into the body. The edit runs replaced
+        # the push run that was still waiting, and an edit starts no round,
+        # so the sealed head never got a verdict. The newest ledger names
+        # the head before the seal, so this run acts as the push.
+        artifacts, runs_by_id = trusted_artifact()
+        earlier_head = recorded_ledger(reviewed_sha="f" * 40, verdict={**recorded_ledger()["verdict"], "sha": "f" * 40})
+        for name, kwargs in (
+            ("earlier head", {"artifacts": artifacts, "runs_by_id": runs_by_id, "ledger": earlier_head}),
+            ("no ledger", {}),
+        ):
+            with self.subTest(name):
+                run = self.controller(env_extra={"LEDGER_ONLY": "true"}, **kwargs)
+                self.assertEqual(run.returncode, 0, run.result.stderr)
+                self.assertIn("the edit run acts as the push run", run.stdout)
+                self.assertEqual(run.outputs["ledger_only"], "false")
+                self.assertEqual((run.outputs["stand_down"], run.outputs["coverage"]), ("false", "paid"))
+        # An edit on a head that a ledger records still starts no round.
+        recorded = self.controller(artifacts=artifacts, runs_by_id=runs_by_id, ledger=recorded_ledger(),
+                                   body=BODY + "\n\nedited", env_extra={"LEDGER_ONLY": "true"})
+        self.assertEqual(recorded.outputs["ledger_only"], "true")
+        self.assertEqual(recorded.outputs["stand_down"], "true")
+
     def test_forced_label_reruns_a_judged_head(self):
         artifacts, runs_by_id = trusted_artifact()
         run = self.controller(artifacts=artifacts, runs_by_id=runs_by_id, ledger=recorded_ledger(),
